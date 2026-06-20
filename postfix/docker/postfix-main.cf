@@ -1,0 +1,35 @@
+smtpd_banner = Klar-Test ESMTP
+compatibility_level = 2
+biff = no
+readme_directory = no
+
+myhostname = postfix.test
+mydomain = example.com
+mydestination =
+mynetworks = 0.0.0.0/0
+inet_interfaces = all
+inet_protocols = ipv4
+
+# Use native (glibc) DNS for Docker service name resolution
+smtp_host_lookup = native
+lmtp_host_lookup = native
+
+# Deliver to Dovecot via LMTP
+virtual_mailbox_domains = example.com
+virtual_transport = lmtp:inet:dovecot:24
+
+# Milter
+milter_default_action = accept
+milter_protocol = 6
+smtpd_milters = inet:klar-milterd:8891
+non_smtpd_milters = inet:klar-milterd:8891
+milter_data_macros = i
+milter_end_of_data_macros = i
+milter_connect_timeout = 5s
+milter_command_timeout = 30s
+milter_content_timeout = 120s
+
+# Accept all recipients for testing
+smtpd_relay_restrictions = permit_mynetworks, reject_unauth_destination
+smtpd_recipient_restrictions = permit
+maillog_file = /dev/stdout

@@ -1,0 +1,22 @@
+[Unit]
+Description=Klar Milter Daemon for Postfix
+After=network.target postfix.service
+
+[Service]
+Type=simple
+User=klarmilter
+Group=klarmilter
+ExecStart=/usr/local/bin/klar-milterd --config /etc/klar/postfix.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=35
+LimitNOFILE=65536
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/klar /var/log/klar-milter /var/spool/klar-milter
+
+[Install]
+WantedBy=multi-user.target

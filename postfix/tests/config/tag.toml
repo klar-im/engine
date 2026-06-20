@@ -1,0 +1,12 @@
+mode = "tag"
+profile = "standard"
+spam_threshold_override = -1.0
+reject_threshold = 0.995
+fail_open = false
+timeout_ms = 1500
+max_message_bytes = 5242880
+
+model_dir = "engine/model"
+model_version_file = ""
+
+event_store_path = "/tmp/klar-policy-replay-events.sqlite3"

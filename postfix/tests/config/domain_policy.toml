@@ -1,0 +1,21 @@
+listen = "inet:8891@0.0.0.0"
+mode = "tag"
+profile = "standard"
+spam_threshold_override = -1.0
+reject_threshold = 0.995
+fail_open = true
+timeout_ms = 1500
+max_message_bytes = 5242880
+
+allowlist_senders = ["ceo@trusted.example"]
+allowlist_domains = ["trusted.example"]
+blocklist_senders = ["known-spam@bad.example"]
+blocklist_domains = ["bad.example"]
+blocklist_action = "reject"
+
+[[domain_policy]]
+recipient_domain = "bank.example"
+mode = "reject"
+profile = "cautious"
+spam_threshold_override = -1.0
+reject_threshold = 0.80

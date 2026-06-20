@@ -1,0 +1,17 @@
+listen = "inet:8891@0.0.0.0"
+mode = "tag"
+profile = "standard"
+spam_threshold_override = -1.0
+reject_threshold = 0.995
+fail_open = true
+timeout_ms = 1500
+max_message_bytes = 5242880
+
+model_dir = "/opt/klar/model/current"
+model_version_file = "/opt/klar/model/current/VERSION"
+
+health_enabled = true
+health_listen = "0.0.0.0:8892"
+health_allow_public = true  # firewalled E2E container: orchestrator reads readiness
+
+event_store_path = "/var/lib/klar/events.sqlite3"

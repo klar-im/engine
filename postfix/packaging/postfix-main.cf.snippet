@@ -1,0 +1,12 @@
+# Klar Milter Integration
+# Add these lines to /etc/postfix/main.cf
+
+milter_default_action = accept
+milter_protocol = 6
+smtpd_milters = inet:127.0.0.1:8891
+non_smtpd_milters = inet:127.0.0.1:8891
+milter_data_macros = i
+milter_end_of_data_macros = i
+milter_connect_timeout = 5s
+milter_command_timeout = 30s
+milter_content_timeout = 120s

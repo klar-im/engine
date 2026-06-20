@@ -1,0 +1,14 @@
+# Build artifacts
+engine/build/
+postfix/build/
+
+# Models / weights are never committed — downloaded at runtime
+engine/model/gguf/
+engine/model/classifier_*.bin
+engine/model/ftrl_baseline.bin
+*.gguf
+*.safetensors
+
+# Secrets
+.secrets/
+*_token

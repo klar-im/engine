@@ -1,0 +1,4 @@
+module SpamEngineCAPI {
+  header "../../spam_engine_c_api.h"
+  export *
+}

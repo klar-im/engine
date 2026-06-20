@@ -1,0 +1,26 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgmime-3.0-0 \
+    libmilter1.0.1 \
+    libsqlite3-0 \
+    libgomp1 \
+    curl \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/klar/bin /opt/klar/model/current /var/lib/klar /var/log/klar-milter /var/spool/klar-milter /etc/klar
+
+# Binary and shared libs (incl. libggml-cpu-*.so plugins) live in the same dir
+# so ggml_backend_load_all() finds plugins via get_executable_path().
+COPY klar-milterd /opt/klar/bin/klar-milterd
+COPY lib/ /opt/klar/bin/
+COPY model/ /opt/klar/model/current/
+COPY runtime.toml /etc/klar/postfix.toml
+
+ENV LD_LIBRARY_PATH=/opt/klar/bin
+ENV PATH=/opt/klar/bin:$PATH
+
+EXPOSE 8891 8892
+
+ENTRYPOINT ["/opt/klar/bin/klar-milterd"]
+CMD ["--config", "/etc/klar/postfix.toml"]

@@ -1,0 +1,104 @@
+# Klar Milter — Example Production Configuration
+#
+# Copy this file to /etc/klar/postfix.toml and adjust for your setup.
+# Reload with: kill -HUP $(pidof klar-milterd)
+
+# ---------------------------------------------------------------------------
+# Milter
+# ---------------------------------------------------------------------------
+
+# libmilter listen address (Postfix connects here)
+# Format: inet:PORT@HOST
+listen = "inet:8891@127.0.0.1"
+
+# Mode: "tag" adds headers only, "reject" also rejects high-confidence spam
+# Start with "tag" until you trust the model, then switch to "reject".
+mode = "tag"
+
+# Sensitivity profile: cautious (0.70), standard (0.50), aggressive (0.30)
+# This is the spam score threshold above which mail is labeled "spam".
+profile = "standard"
+
+# Override the profile threshold with a custom value (0.0 to 1.0).
+# Set to -1 to use the profile default.
+# spam_threshold_override = -1.0
+
+# In reject mode, only reject if spam score exceeds this threshold.
+# Should be high (0.99+) to avoid false positives.
+reject_threshold = 0.995
+
+# If classification fails (engine crash, timeout), accept the message anyway.
+# Set to false to tempfail (4xx) on errors — safer but may delay mail.
+fail_open = true
+
+# Engine inference timeout in milliseconds.
+timeout_ms = 1500
+
+# Maximum message size to classify (bytes). Larger messages are truncated.
+max_message_bytes = 5242880  # 5 MB
+
+# Concurrency limits
+max_inflight_sessions = 64
+max_inflight_bytes = 536870912  # 512 MB
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+model_dir = "/opt/klar/model/current"
+model_version_file = "/opt/klar/model/current/VERSION"
+
+# ---------------------------------------------------------------------------
+# Health / Metrics
+# ---------------------------------------------------------------------------
+
+# HTTP health server for monitoring.
+# Endpoints: /livez (liveness), /readyz (readiness), /metrics (Prometheus)
+# /metrics is UNAUTHENTICATED — bind loopback (or an internal address) and front
+# it with your own auth/firewall. Binding 0.0.0.0/:: is refused unless you also
+# set health_allow_public = true (e.g. a firewalled container exposing readiness).
+health_enabled = true
+health_listen = "127.0.0.1:8892"
+# health_allow_public = false
+
+# ---------------------------------------------------------------------------
+# Event Store
+# ---------------------------------------------------------------------------
+
+# SQLite database for decision audit trail.
+event_store_path = "/var/lib/klar/events.sqlite3"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+# Log level: debug, info, warn, error
+log_level = "info"
+
+# JSON structured logging (recommended for production)
+log_json = true
+
+# ---------------------------------------------------------------------------
+# Allow/Block Lists
+# ---------------------------------------------------------------------------
+
+# Messages from these senders/domains skip classification (always delivered).
+# allowlist_senders = ["ceo@example.com"]
+# allowlist_domains = ["trusted-partner.com"]
+
+# Messages from these senders/domains are always rejected.
+# blocklist_senders = ["known-spammer@evil.com"]
+# blocklist_domains = ["spam-domain.com"]
+blocklist_action = "reject"
+
+# ---------------------------------------------------------------------------
+# Per-Domain Policies (optional)
+# ---------------------------------------------------------------------------
+# Override mode/profile/thresholds for specific recipient domains.
+# Useful for multi-tenant setups.
+
+# [[domain_policy]]
+# recipient_domain = "sensitive.example.com"
+# mode = "reject"
+# profile = "cautious"
+# reject_threshold = 0.999

@@ -1,0 +1,38 @@
+services:
+  klar-milterd:
+    build:
+      context: ../.e2e-staging
+      dockerfile: ../docker/Dockerfile.milter
+    ports:
+      - "8892:8892"
+    volumes:
+      - klar-data:/var/lib/klar
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8892/livez"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 120s
+
+  postfix:
+    build:
+      context: .
+      dockerfile: Dockerfile.postfix
+    ports:
+      - "2525:25"
+    depends_on:
+      klar-milterd:
+        condition: service_healthy
+
+  dovecot:
+    build:
+      context: .
+      dockerfile: Dockerfile.dovecot
+    ports:
+      - "1143:143"
+      - "1024:24"
+    volumes:
+      - klar-data:/var/lib/klar
+
+volumes:
+  klar-data:

@@ -1,0 +1,43 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    dovecot-core \
+    dovecot-imapd \
+    dovecot-lmtpd \
+    dovecot-sieve \
+    dovecot-managesieved \
+    libsqlite3-0 \
+    sqlite3 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Create mail user and directories
+RUN groupadd -g 5000 vmail && \
+    useradd -u 5000 -g vmail -s /usr/sbin/nologin -d /var/mail vmail && \
+    mkdir -p /var/mail/example.com/test && \
+    chown -R vmail:vmail /var/mail
+
+# Dovecot config
+COPY dovecot/dovecot.conf /etc/dovecot/dovecot.conf
+COPY dovecot/passwd /etc/dovecot/passwd
+
+# Sieve scripts
+RUN mkdir -p /etc/dovecot/sieve
+COPY dovecot/default.sieve /etc/dovecot/sieve/default.sieve
+COPY dovecot/report-spam.sieve /etc/dovecot/sieve/report-spam.sieve
+COPY dovecot/report-ham.sieve /etc/dovecot/sieve/report-ham.sieve
+COPY dovecot/klar-feedback /usr/local/bin/klar-feedback
+COPY dovecot/dovecot-entrypoint.sh /entrypoint.sh
+RUN chmod +x /usr/local/bin/klar-feedback /entrypoint.sh
+
+# Compile sieve scripts
+RUN sievec /etc/dovecot/sieve/default.sieve && \
+    sievec /etc/dovecot/sieve/report-spam.sieve && \
+    sievec /etc/dovecot/sieve/report-ham.sieve
+
+# Create run directory and klar data directory
+RUN mkdir -p /run/dovecot && chown dovecot:dovecot /run/dovecot
+RUN mkdir -p /var/lib/klar && chmod 777 /var/lib/klar
+
+EXPOSE 143 24
+
+CMD ["/entrypoint.sh"]

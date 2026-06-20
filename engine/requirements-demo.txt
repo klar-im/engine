@@ -1,0 +1,10 @@
+# Python deps for `make import-demo` (converting an HF model into engine/model/).
+# Not needed to build or run the engine — only to import/convert a model.
+# A virtualenv is recommended: python3 -m venv .venv && . .venv/bin/activate
+torch
+transformers
+huggingface_hub
+numpy
+sentencepiece
+protobuf
+gguf
