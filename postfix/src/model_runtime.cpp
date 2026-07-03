@@ -97,12 +97,15 @@ ClassifyResult ModelRuntime::classify_rfc822(const std::string& raw_email,
     // decision layer below can fold them — the milter no longer ships the raw
     // verdict alone (TASK-179).
     spam_engine_parsed_signals_t signals{};
+    // "ensemble": neural head + low-weight FTRL blend, then the structural
+    // decision layer below (TASK-219; mode is now a required C-API arg).
     spam_engine_status_t st = spam_engine_classify_rfc822(
         handle_,
         raw_email.data(),
         raw_email.size(),
         sender_name.c_str(),
         sender_email.c_str(),
+        "ensemble",
         &result,
         &signals);
 
@@ -125,23 +128,11 @@ ClassifyResult ModelRuntime::classify_rfc822(const std::string& raw_email,
     // come from `signals`; the local-state offsets (Message-ID DB, sender history)
     // aren't available to the milter, so they're zero. We read only the adjusted
     // spam-side (profile-independent); policy.cpp applies the milter's own threshold.
-    const char* ml_label = "regular";
-    float best = result.scores.regular;
-    if (result.scores.spam > best)      { best = result.scores.spam;      ml_label = "spam"; }
-    if (result.scores.gibberish > best) { best = result.scores.gibberish; ml_label = "gibberish"; }
-    if (result.scores.marketing > best) { best = result.scores.marketing; ml_label = "marketing"; }
-
+    // Shared builder fills scores + argmax label + the parsed-signal fields; the
+    // milter has no local Message-ID DB or sender history, so the caller-state
+    // counts stay zero from the value-init (TASK-231).
     spam_engine_decision_input_t din{};
-    din.scores = result.scores;
-    din.ml_label = ml_label;
-    din.ml_confidence = best;
-    din.has_in_reply_to = signals.thread.has_in_reply_to;
-    din.references_count = signals.thread.references_count;
-    din.dkim_signing_org_domain = signals.auth.dkim_signing_domain;
-    din.signer_throwaway = signals.auth.signer_throwaway;
-    din.phase2_match = 0;       // milter has no local Message-ID DB
-    din.exact_send_count = 0;   // milter has no local sender history
-    din.domain_send_count = 0;
+    spam_engine_decision_input_from_signals(&din, &result.scores, &signals);
     din.profile = SPAM_ENGINE_PROFILE_STANDARD;
 
     spam_engine_decision_result_t dout{};

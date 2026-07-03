@@ -82,6 +82,15 @@ public:
 
     // Forward pass with caching for backprop
     std::vector<float> forward(const std::vector<float>& cls_embedding, bool cache_for_backward = false) {
+        // Self-guard the sharp edge: the loops below index cls_embedding[j] for
+        // j in [0, hidden_size_). One comparison against an O(hidden_size^2) loop
+        // keeps any direct caller (not just SpamEngine's boundary check) from an
+        // OOB heap read; backward() reuses the cached copy, so it is covered too
+        // (C4, TASK-251).
+        if (cls_embedding.size() < static_cast<size_t>(hidden_size_)) {
+            throw std::invalid_argument(
+                "TrainableClassifierHead::forward: embedding shorter than hidden_size");
+        }
         if (cache_for_backward) {
             cached_input_ = cls_embedding;
             cached_hidden_pre_activation_.resize(hidden_size_);
@@ -260,6 +269,12 @@ public:
 
     void set_learning_rate(float lr) { learning_rate_ = lr; }
     float get_learning_rate() const { return learning_rate_; }
+
+    // Expected CLS-embedding length (n_embd): the public boundary validates
+    // embedding.size() == input_size() to reject a wrong-length vector before it
+    // reaches the head, and load() asserts it equals the encoder's n_embd
+    // (C4, TASK-251).
+    int input_size() const { return hidden_size_; }
 
 private:
     // Project `param` back onto the ball {w : ‖w - w0‖ <= max_drift_ * ‖w0‖}

@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "decision_layer.h"
 #include "email_preprocessor.h"
 #include "ftrl_classifier.h"
 #include "pii_scrub.h"
@@ -159,9 +160,29 @@ void SpamEngine::load(const EngineConfig& config) {
       config_.model_path, config_.learning_rate, config_.l2_lambda, config_.max_grad_norm,
       config_.max_drift);
 
+  // The neural path indexes the CLS embedding up to the head's input size, so
+  // the encoder output dim and the head's hidden size must agree. They come from
+  // independent assets (the gguf vs classifier_config.json), so assert equality
+  // here: a mismatched model package fails fast at load instead of throwing on
+  // every classify_embedding (C4, TASK-251).
+  if (impl_->encoder->n_embd() != impl_->trainable_head->input_size()) {
+    throw std::runtime_error(
+        "model mismatch: encoder n_embd (" +
+        std::to_string(impl_->encoder->n_embd()) +
+        ") != classifier head input size (" +
+        std::to_string(impl_->trainable_head->input_size()) + ")");
+  }
+
   impl_->ftrl = std::make_unique<FTRLClassifier>();
-  if (!config_.ftrl_path.empty()) {
-    impl_->ftrl->load(config_.ftrl_path);
+  if (!config_.ftrl_path.empty() && !impl_->ftrl->load(config_.ftrl_path)) {
+    // A missing/corrupt baseline must leave a genuinely COLD FTRL (learn-counts
+    // zero) so the cold-start guard bypasses it, not a half-loaded one whose
+    // bogus counts pass the guard (C3, TASK-251). load() is transactional, but
+    // rebuild to guarantee a pristine cold state.
+    std::fprintf(stderr,
+        "[spam_engine] FTRL baseline load failed for %s; starting cold\n",
+        config_.ftrl_path.c_str());
+    impl_->ftrl = std::make_unique<FTRLClassifier>();
   }
 
   loaded_ = true;
@@ -211,6 +232,17 @@ ClassScores SpamEngine::classify_embedding(
     bool cache_for_training) {
   ensure_loaded();
 
+  // forward() indexes cls_embedding[j] for j in [0, n_embd) with no internal
+  // bounds check, so a short buffer from any FFI/host caller is a silent OOB
+  // heap read. Validate the length at this single choke point (train_embedding
+  // routes through it too) before touching the head (C4, TASK-251).
+  const int expected = impl_->trainable_head->input_size();
+  if (embedding.size() != static_cast<size_t>(expected)) {
+    throw std::invalid_argument(
+        "classify_embedding: embedding size " + std::to_string(embedding.size()) +
+        " != model input size " + std::to_string(expected));
+  }
+
   const auto logits = impl_->trainable_head->forward(embedding, cache_for_training);
   const auto probabilities = impl_->trainable_head->softmax(logits);
   if (probabilities.size() != 4) {
@@ -226,24 +258,69 @@ ClassScores SpamEngine::classify_embedding(
 }
 
 ClassificationResult SpamEngine::decision_from_scores(const ClassScores& scores) const {
-  std::string class_name;
-  float confidence = 0.0f;
+  // Shared with the C-ABI decide-input builder so the binary label the fold reads
+  // as "what the model said" is identical across the engine, the C ABI, and Swift
+  // (TASK-251 C5).
+  const decision::NeuralDecision nd = decision::neural_decision(
+      {scores.gibberish, scores.marketing, scores.regular, scores.spam});
+  return ClassificationResult{nd.label, static_cast<float>(nd.confidence), scores,
+                              "neural", -1.0f};
+}
 
-  if (scores.gibberish > 0.7f) {
-    class_name = "spam";
-    confidence = scores.gibberish;
-  } else if (scores.spam < 0.2f && scores.regular > 0.5f) {
-    class_name = "regular";
-    confidence = 1.0f - scores.spam;
-  } else if (scores.spam > 0.5f) {
-    class_name = "spam";
-    confidence = scores.spam;
-  } else {
-    class_name = "regular";
-    confidence = 1.0f - scores.spam;
+namespace {
+// classify mode is a required, validated choice — no silent "auto" (TASK-219).
+void validate_mode(const std::string& mode) {
+  if (mode != "ensemble" && mode != "neural" && mode != "ftrl") {
+    throw std::invalid_argument(
+        "ClassifyOptions.mode must be \"ensemble\", \"neural\", or \"ftrl\" (got \"" +
+        mode + "\")");
+  }
+}
+}  // namespace
+
+ClassificationResult SpamEngine::combine_scores(
+    const ClassScores& neural, float ftrl_score, const std::string& mode) const {
+  if (mode == "ftrl") {
+    // FTRL-only diagnostic path; neural was not run. Cold/absent FTRL
+    // (ftrl_score < 0) degrades to a low-confidence "regular".
+    if (ftrl_score < 0.0f) {
+      return ClassificationResult{"regular", 0.0f, {}, "ftrl", ftrl_score};
+    }
+    const bool is_spam = ftrl_score >= 0.5f;
+    return ClassificationResult{
+        is_spam ? "spam" : "regular",
+        is_spam ? ftrl_score : 1.0f - ftrl_score,
+        {0.0f, 0.0f, 1.0f - ftrl_score, ftrl_score},
+        "ftrl", ftrl_score};
   }
 
-  return ClassificationResult{class_name, confidence, scores, "neural", -1.0f};
+  // "neural" and "ensemble" both start from the neural head. ENSEMBLE folds FTRL
+  // P(spam) into the spam side ESCALATE-ONLY: the blend is applied only when it
+  // RAISES the spam side (ftrl more suspicious than neural). FTRL can add
+  // suspicion (catch personalized spam the neural head missed) but never
+  // exonerate. Rationale: the FTRL baseline trains on spam-poor data, so a cold
+  // ftrl_score ≈ 0 on unseen spam is absence-of-evidence, NOT a ham vote — a
+  // symmetric blend reads it as one and drags a confident-neural spam below the
+  // 0.90 condemn threshold (blatant spam → inbox; measured 0/5 recall on the
+  // blatant slice). max(neural, blend) keeps neural's recall intact by
+  // construction. FP-trimming (FTRL's ham-ward pull) is intentionally dropped:
+  // it requires a WARM per-user FTRL and belongs in the decision layer, not a
+  // cold model's blanket downward vote. See pythonDiscovery measure_escalate_only.py.
+  ClassScores scores = neural;
+  std::string decided_by = "neural";
+  if (mode == "ensemble" && ftrl_score >= 0.0f) {
+    const float w = config_.ftrl_ensemble_weight;
+    const float blend = w * ftrl_score + (1.0f - w) * neural.spam;
+    if (blend > neural.spam) {  // FTRL escalated — only direction we trust day 0
+      scores.spam = blend;
+      decided_by = "ftrl+neural";
+    }
+  }
+  ClassificationResult result = decision_from_scores(scores);
+  result.decided_by = decided_by;
+  result.ftrl_score = ftrl_score;
+  result.neural_spam = neural.spam;  // pre-blend neural P(spam), for stage reporting
+  return result;
 }
 
 ClassificationResult SpamEngine::classify(
@@ -271,60 +348,38 @@ ClassificationResult SpamEngine::classify_rfc822(
   // can stamp the structural features (computed during the preprocess parse —
   // TASK-173) onto every result without touching each return site.
   auto result = [&]() -> ClassificationResult {
+    validate_mode(options.mode);
     if (!preprocessed.normalized_plain_text.empty() && !preprocessed.normalized_html_text.empty()) {
       // Multipart: wrap each part via the canonical builder so the embeddings
       // we feed classify_embedding() come from the same distribution the head
       // was trained on.
       const auto plain_input = build_input_text(
           {{"user", preprocessed.normalized_plain_text, "email"}}, customer);
-      const auto html_input = build_input_text(
-          {{"user", preprocessed.normalized_html_text, "email"}}, customer);
 
-      // FTRL pre-filter (same logic as classify_transcript). Use the plain
-      // body as the representative text — it's always present in multipart.
+      // FTRL P(spam) on the plain body (always present in multipart), unless
+      // mode=neural. Only contributes once warm. The bypass is gone: the score
+      // is BLENDED into the neural verdict by combine_scores, never overrides it.
       float ftrl_score = -1.0f;
-      if (impl_->ftrl && impl_->ftrl->total_learns() >= config_.ftrl_min_learns) {
+      if (options.mode != "neural" && impl_->ftrl &&
+          impl_->ftrl->total_learns() >= config_.ftrl_min_learns) {
         ftrl_score = impl_->ftrl->predict_text(plain_input.str());
       }
-      const auto& mode = options.mode;
-      if (mode == "ftrl") {
-        if (ftrl_score < 0) {
-          return ClassificationResult{"regular", 0.0f, {}, "ftrl", ftrl_score};
-        }
-        bool is_spam = ftrl_score >= 0.5f;
-        return ClassificationResult{
-            is_spam ? "spam" : "regular",
-            is_spam ? ftrl_score : 1.0f - ftrl_score,
-            {0, 0, 1.0f - ftrl_score, ftrl_score},
-            "ftrl", ftrl_score};
+      if (options.mode == "ftrl") {
+        // FTRL-only: neural never runs, so the html part is never embedded —
+        // don't pay to build/wrap it.
+        return combine_scores(/*neural=*/{}, ftrl_score, options.mode);
       }
-      if (mode == "auto" && ftrl_score >= 0) {
-        if (ftrl_score >= config_.ftrl_spam_threshold) {
-          return ClassificationResult{
-              "spam", ftrl_score, {0, 0, 1.0f - ftrl_score, ftrl_score},
-              "ftrl", ftrl_score};
-        }
-        if (ftrl_score <= config_.ftrl_ham_threshold) {
-          return ClassificationResult{
-              "regular", 1.0f - ftrl_score, {0, 0, 1.0f - ftrl_score, ftrl_score},
-              "ftrl", ftrl_score};
-        }
-      }
-
+      const auto html_input = build_input_text(
+          {{"user", preprocessed.normalized_html_text, "email"}}, customer);
       const auto embeddings = embed_batch({plain_input, html_input});
       const auto plain_scores = classify_embedding(embeddings[0], false);
       const auto html_scores = classify_embedding(embeddings[1], false);
       const auto& best_scores = (html_scores.spam > plain_scores.spam) ? html_scores : plain_scores;
-      auto multipart_result = decision_from_scores(best_scores);
-      multipart_result.ftrl_score = ftrl_score;
-      if (ftrl_score >= 0 && mode == "auto") {
-        multipart_result.decided_by = "ftrl+neural";
-      }
-      return multipart_result;
+      return combine_scores(best_scores, ftrl_score, options.mode);
     }
 
     // Single-part: pick the most informative body and route through
-    // classify_transcript so we still get FTRL pre-filtering.
+    // classify_transcript so we still get FTRL ensembling.
     const std::string& body = !preprocessed.normalized_plain_text.empty()
         ? preprocessed.normalized_plain_text
         : !preprocessed.normalized_html_text.empty()
@@ -344,47 +399,24 @@ ClassificationResult SpamEngine::classify_transcript(
     const std::vector<TranscriptMessage>& transcript,
     const CustomerInfo& customer,
     const ClassifyOptions& options) {
+  validate_mode(options.mode);
   const auto input_text = build_input_text(transcript, customer);
-  const auto& mode = options.mode;
 
+  // FTRL P(spam), unless mode=neural. Only contributes once warm
+  // (total_learns >= ftrl_min_learns); a cold baseline stays at -1 and the
+  // ensemble cleanly falls back to pure neural.
   float ftrl_score = -1.0f;
-  if (impl_->ftrl && impl_->ftrl->total_learns() >= config_.ftrl_min_learns) {
+  if (options.mode != "neural" && impl_->ftrl &&
+      impl_->ftrl->total_learns() >= config_.ftrl_min_learns) {
     ftrl_score = impl_->ftrl->predict_text(input_text.str());
   }
 
-  if (mode == "ftrl") {
-    if (ftrl_score < 0) {
-      return ClassificationResult{"regular", 0.0f, {}, "ftrl", ftrl_score};
-    }
-    bool is_spam = ftrl_score >= 0.5f;
-    return ClassificationResult{
-        is_spam ? "spam" : "regular",
-        is_spam ? ftrl_score : 1.0f - ftrl_score,
-        {0, 0, 1.0f - ftrl_score, ftrl_score},
-        "ftrl", ftrl_score};
+  // mode=ftrl skips the (expensive) neural forward pass entirely.
+  ClassScores neural{};
+  if (options.mode != "ftrl") {
+    neural = classify_embedding(embed(input_text), false);
   }
-
-  if (mode == "auto" && ftrl_score >= 0) {
-    if (ftrl_score >= config_.ftrl_spam_threshold) {
-      return ClassificationResult{
-          "spam", ftrl_score, {0, 0, 1.0f - ftrl_score, ftrl_score},
-          "ftrl", ftrl_score};
-    }
-    if (ftrl_score <= config_.ftrl_ham_threshold) {
-      return ClassificationResult{
-          "regular", 1.0f - ftrl_score, {0, 0, 1.0f - ftrl_score, ftrl_score},
-          "ftrl", ftrl_score};
-    }
-  }
-
-  const auto embedding = embed(input_text);
-  const auto scores = classify_embedding(embedding, false);
-  auto result = decision_from_scores(scores);
-  result.ftrl_score = ftrl_score;
-  if (ftrl_score >= 0 && mode == "auto") {
-    result.decided_by = "ftrl+neural";
-  }
-  return result;
+  return combine_scores(neural, ftrl_score, options.mode);
 }
 
 float SpamEngine::train(const CalibratedInputText& input, int correct_label) {
@@ -543,7 +575,7 @@ int SpamEngine::label_from_string(const std::string& label) {
   return -1;
 }
 
-std::string SpamEngine::label_to_string(int label) {
+const char* SpamEngine::label_name(int label) {
   switch (label) {
     case 0: return "gibberish";
     case 1: return "marketing";
@@ -552,5 +584,7 @@ std::string SpamEngine::label_to_string(int label) {
     default: return "unknown";
   }
 }
+
+std::string SpamEngine::label_to_string(int label) { return label_name(label); }
 
 }  // namespace spam_engine

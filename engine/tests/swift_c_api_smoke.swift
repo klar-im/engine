@@ -42,7 +42,7 @@ var result = spam_engine_result_t(
 )
 
 let preLoadStatus = "BUY VIAGRA NOW".withCString { text in
-  spam_engine_classify(handle, text, nil, nil, &result)
+  spam_engine_classify(handle, text, nil, nil, "ensemble", &result)
 }
 if statusOK(preLoadStatus) {
   fail("classify before load should fail")
@@ -65,7 +65,7 @@ if spam_engine_is_loaded(handle) != 1 {
 let classifyStatus = "Hi team, just sharing tomorrow's meeting agenda.".withCString { text in
   "Alice".withCString { sender in
     "alice@example.com".withCString { email in
-      spam_engine_classify(handle, text, sender, email, &result)
+      spam_engine_classify(handle, text, sender, email, "ensemble", &result)
     }
   }
 }
@@ -94,7 +94,7 @@ if spam_engine_is_loaded(handle) != 0 {
 }
 
 let postUnloadStatus = "BUY VIAGRA NOW".withCString { text in
-  spam_engine_classify(handle, text, nil, nil, &result)
+  spam_engine_classify(handle, text, nil, nil, "ensemble", &result)
 }
 if statusOK(postUnloadStatus) {
   fail("classify after unload should fail")

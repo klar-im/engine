@@ -21,7 +21,7 @@ void check(bool c, const char* what) {
 
 void write_bin(const char* path, const std::vector<std::string>& domains) {
   std::vector<uint64_t> h;
-  for (const auto& d : domains) h.push_back(se::fnv1a64(d));
+  for (const auto& d : domains) h.push_back(se::fnv1a_lower(d));
   std::sort(h.begin(), h.end());
   std::FILE* f = std::fopen(path, "wb");
   std::fwrite("KLARPB1\0", 1, 8, f);
@@ -35,8 +35,8 @@ void write_bin(const char* path, const std::vector<std::string>& domains) {
 
 int main() {
   // 1. FNV-1a parity with the Python builder (values computed there).
-  check(se::fnv1a64("klar.im") == 8089896514840204515ULL, "fnv1a64 parity klar.im");
-  check(se::fnv1a64("evil.example") == 10770985678317078571ULL, "fnv1a64 parity evil.example");
+  check(se::fnv1a_lower("klar.im") == 8089896514840204515ULL, "fnv1a parity klar.im");
+  check(se::fnv1a_lower("evil.example") == 10770985678317078571ULL, "fnv1a parity evil.example");
 
   // 2. round-trip a small blocklist.
   const char* p = "/tmp/klar_ublk_test.bin";
@@ -54,6 +54,21 @@ int main() {
   se::UrlBlocklist bad;
   check(!bad.load("/tmp/klar_does_not_exist.bin"), "missing file -> load returns false");
   check(!bad.loaded() && !bad.contains("evil.example"), "unloaded -> contains false");
+
+  // 4. a header count larger than the file's actual payload must be rejected BEFORE
+  //    the resize (a 4-billion count would allocate 32 GiB to OOM) (TASK-251).
+  const char* lying = "/tmp/klar_ublk_lying_count.bin";
+  std::FILE* lf = std::fopen(lying, "wb");
+  std::fwrite("KLARPB1\0", 1, 8, lf);
+  uint32_t lbits = 64, lcount = 4000000000u;  // claims 4e9 hashes...
+  std::fwrite(&lbits, 4, 1, lf);
+  std::fwrite(&lcount, 4, 1, lf);
+  const uint64_t one = se::fnv1a_lower("evil.example");
+  std::fwrite(&one, sizeof(uint64_t), 1, lf);  // ...but ships only one
+  std::fclose(lf);
+  se::UrlBlocklist lie;
+  check(!lie.load(lying), "lying count (payload too short) -> load returns false, no OOM");
+  check(!lie.loaded(), "lying count -> stays empty");
 
   std::printf("\n%d checks, %d failures\n", g_checks, g_fail);
   return g_fail == 0 ? 0 : 1;

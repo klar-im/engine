@@ -45,6 +45,12 @@ struct ExtractedAuthFeatures {
   // Measured 23/556 spam, 0/500 ham (TASK-178); kept in sync with the
   // offline reference implementation.
   bool        signer_throwaway = false;
+  // The From DISPLAY NAME claims a distinctive Tranco brand the From org-domain
+  // is NOT (e.g. display "Scaleway", From depilacionlasercanarias.com) — the
+  // display-name impersonation tell. Precision-first (dictionary-filtered brand
+  // names): measured 0/51 ham FP, catches the Scaleway/LeroyMerlin phish
+  // (TASK-214). Kept in sync with the Swift mirror.
+  bool        display_impersonation = false;
 };
 
 struct PreprocessedEmail {
@@ -111,5 +117,17 @@ std::vector<std::string> url_domains_from_bodies(const std::string& plain_body,
 
 // Convert HTML to plain text (strips tags, decodes entities).
 std::string html_to_text(const std::string& html);
+
+// Registrable href domains of every <a ...> in a raw HTML body, in document
+// order ("" for a non-http/mailto target). Exposed so tests can assert the
+// anchor parser resolves the TRUE href even when a decoy attribute (hreflang,
+// data-href) precedes it (C8, TASK-251); the classify path reads the richer
+// AnchorPair form internally.
+std::vector<std::string> anchor_href_domains(const std::string& html);
+
+// Registrable action domains of every <form> that contains a password input in
+// a raw HTML body (the credential-harvest phish signal). Exposed for tests
+// (C8, TASK-251).
+std::vector<std::string> credential_form_action_domains(const std::string& html);
 
 }  // namespace spam_engine

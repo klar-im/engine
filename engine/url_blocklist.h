@@ -24,17 +24,9 @@
 #include <string>
 #include <vector>
 
-namespace spam_engine {
+#include "fnv1a.h"
 
-// 64-bit FNV-1a. MUST match pythonDiscovery/scripts/build_phishing_blocklist.py.
-inline uint64_t fnv1a64(const std::string& s) {
-  uint64_t h = 0xCBF29CE484222325ULL;
-  for (unsigned char c : s) {
-    h ^= c;
-    h *= 0x100000001B3ULL;  // wraps mod 2^64
-  }
-  return h;
-}
+namespace spam_engine {
 
 class UrlBlocklist {
  public:
@@ -52,8 +44,23 @@ class UrlBlocklist {
               std::fread(&bits, 4, 1, f) == 1 && std::fread(&count, 4, 1, f) == 1 &&
               bits == 64;
     if (ok && count > 0) {
-      hashes_.resize(count);
-      ok = std::fread(hashes_.data(), sizeof(uint64_t), count, f) == count;
+      // Validate `count` against the bytes actually left in the file BEFORE
+      // resize(): a corrupt count (up to 4 billion * 8 = 32 GiB) would otherwise
+      // allocate to OOM before the fread that would have caught the short read
+      // (TASK-251).
+      const long payload_start = std::ftell(f);
+      ok = payload_start >= 0 && std::fseek(f, 0, SEEK_END) == 0;
+      const long file_end = ok ? std::ftell(f) : -1;
+      if (ok && (file_end < 0 ||
+                 static_cast<uint64_t>(file_end - payload_start) <
+                     static_cast<uint64_t>(count) * sizeof(uint64_t) ||
+                 std::fseek(f, payload_start, SEEK_SET) != 0)) {
+        ok = false;
+      }
+      if (ok) {
+        hashes_.resize(count);
+        ok = std::fread(hashes_.data(), sizeof(uint64_t), count, f) == count;
+      }
     }
     std::fclose(f);
     if (!ok) {
@@ -66,11 +73,11 @@ class UrlBlocklist {
   bool loaded() const { return !hashes_.empty(); }
   std::size_t size() const { return hashes_.size(); }
 
-  // Exact FQDN match (host must be lowercased by the caller). Binary search over
-  // the ascending hash array.
+  // Exact FQDN match. Binary search over the ascending hash array; fnv1a_lower
+  // lowercases so a mixed-case host still matches the lowercase-built blocklist.
   bool contains(const std::string& host) const {
     if (hashes_.empty() || host.empty()) return false;
-    const uint64_t h = fnv1a64(host);
+    const uint64_t h = fnv1a_lower(host);
     std::size_t lo = 0, hi = hashes_.size();
     while (lo < hi) {
       const std::size_t mid = lo + (hi - lo) / 2;

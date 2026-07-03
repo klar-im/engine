@@ -22,13 +22,35 @@ typedef struct spam_engine_scores {
   float spam;
 } spam_engine_scores_t;
 
+// `label`/`confidence` are the engine's DELIVERY DECISION — not the 4-class
+// argmax. `label` is only ever spam or regular: the decision layer folds the
+// neural classes into junk-vs-deliver (gibberish/marketing → deliver=regular
+// unless spam-like — see decision_from_scores), and `confidence` is that
+// decision's confidence (e.g. 1 - P(spam)), NOT scores[label]. `scores` holds
+// the 4-class prediction; take its argmax for the predicted class (which CAN be
+// marketing/gibberish, unlike label). A "show me the classifier" UI should
+// display argmax(scores); a "should this be junked" caller uses label.
+//
+// ENSEMBLE NOTE (TASK-219): in mode="ensemble", FTRL is folded ESCALATE-ONLY —
+// `scores.spam` = max(neural, w*ftrl + (1-w)*neural), i.e. FTRL can only RAISE
+// the spam side (catch personalized spam), never lower it. So scores.spam == raw
+// neural whenever FTRL was not more suspicious than the neural head (the common
+// day-0 case); it is the blended value only when FTRL escalated (decided_by then
+// = "ftrl+neural"). gibberish/marketing/regular stay raw neural, so the four
+// values are NOT a normalized softmax and do not sum to 1. That spam side is what
+// feeds spam_engine_decide. In mode="neural" (or cold FTRL) `scores` is the pure
+// neural softmax and `ftrl_score` is -1.
 typedef struct spam_engine_result {
-  int label;
-  float confidence;
-  spam_engine_scores_t scores;
+  int label;             // decision: spam or regular only (never marketing/gibberish)
+  float confidence;      // confidence in the DECISION (not scores[label])
+  spam_engine_scores_t scores;  // 4-class; scores.spam is ensemble-blended (see note)
   char decided_by[32];  // "ftrl", "neural", "ftrl+neural", etc.
   float ftrl_score;     // FTRL P(spam), -1 if FTRL not available
 } spam_engine_result_t;
+
+// Canonical name for a result label (0=gibberish, 1=marketing, 2=regular,
+// 3=spam, else "unknown"). Returns a static string literal — never free it.
+const char* spam_engine_label_name(int label);
 
 // Structural conversation-thread signals (see extract function below for the
 // full contract). Defined here because classify_rfc822 fills these from its own
@@ -49,6 +71,8 @@ typedef struct spam_engine_auth_features {
   int  dmarc_aligned;             // 0 or 1
   char dkim_signing_fqdn[256];    // full signer FQDN, pre-org-reduction
   int  signer_throwaway;          // 0 or 1 — throwaway-shaped signer (TASK-178)
+  int  display_impersonation;     // 0 or 1 — From display claims a brand the
+                                  // From org-domain isn't (TASK-214)
 } spam_engine_auth_features_t;
 
 // All structural (non-content) signals the engine extracts during
@@ -116,11 +140,23 @@ int spam_engine_is_loaded(const spam_engine_handle_t* handle);
 // per-call sizing dance.
 int spam_engine_n_embd(const spam_engine_handle_t* handle);
 
+// `mode` is REQUIRED (no silent default — TASK-219). One of:
+//   "ensemble" — neural head + FTRL P(spam) blended into the spam side (the
+//                recommended production mode). FTRL only contributes once warm;
+//                cold/absent FTRL falls back to pure neural.
+//   "neural"   — neural head only; FTRL never consulted (ftrl_score = -1).
+//   "ftrl"     — FTRL only; neural skipped (diagnostic / A-B).
+// NULL, empty, or an unknown value returns SPAM_ENGINE_STATUS_INVALID_ARGUMENT.
+//
+// Example:
+//   spam_engine_result_t r;
+//   spam_engine_classify(h, "hello", NULL, NULL, "ensemble", &r);
 spam_engine_status_t spam_engine_classify(
     spam_engine_handle_t* handle,
     const char* text,
     const char* sender_name,
     const char* sender_email,
+    const char* mode,
     spam_engine_result_t* out_result);
 
 // Extract CLS embeddings for raw RFC822 bytes via the canonical pipeline:
@@ -196,12 +232,15 @@ spam_engine_status_t spam_engine_embed_text(
 // does (TASK-173), so the caller doesn't re-parse the message to get them.
 // Zero-initialised first; pass NULL to skip. On any failure status it is left
 // zeroed (safe "no signals" default).
+//
+// `mode` is REQUIRED (see spam_engine_classify): "ensemble" | "neural" | "ftrl".
 spam_engine_status_t spam_engine_classify_rfc822(
     spam_engine_handle_t* handle,
     const char* raw_email,
     size_t raw_email_len,
     const char* sender_name,
     const char* sender_email,
+    const char* mode,
     spam_engine_result_t* out_result,
     spam_engine_parsed_signals_t* out_signals);
 
@@ -332,13 +371,15 @@ typedef enum spam_engine_profile {
 
 typedef struct spam_engine_decision_input {
   spam_engine_scores_t scores;   // 4-class softmax (from classify)
-  const char* ml_label;          // argmax label: "spam"/"gibberish"/"marketing"/"regular"/"ham"
+  const char* ml_label;          // model's spam-side DECISION: "spam" or "regular"
+                                 // (not a raw argmax; == the engine's binary label)
   double ml_confidence;          // model confidence, used on the non-spam keep path
   // Engine-derived (from the parsed message):
   int has_in_reply_to;           // 0 or 1
   int references_count;          // 0..N
   const char* dkim_signing_org_domain;  // eTLD+1; NULL/"" if none
   int signer_throwaway;          // 0 or 1
+  int display_impersonation;     // 0 or 1 — From display impersonates a brand (TASK-214)
   // Caller-state (local DBs); pass 0 if unavailable:
   int phase2_match;              // Message-ID DB hit (0 or 1)
   int exact_send_count;          // user's outbound count to this exact address
@@ -358,10 +399,73 @@ typedef struct spam_engine_decision_result {
   int condemn_offset_fired;
 } spam_engine_decision_result_t;
 
+// Fill the engine-derived fields of *din from a classification's scores and
+// parsed signals: copies scores, computes ml_label/ml_confidence (the model's
+// spam-side decision from the scores, matching the engine and Swift, not a raw
+// argmax -- TASK-251 C5), and maps the thread/auth signal fields. Leaves the caller-state
+// fields (phase2_match, exact/domain_send_count, profile) untouched; the caller
+// owns those. No-op if any pointer is NULL.
+//
+// The single place this fold is assembled, shared by every consumer of the engine
+// (milter, /demo addon, classify_full) so a new signal can't be silently dropped
+// on one surface (TASK-231). din->dkim_signing_org_domain points into *signals,
+// which must outlive the subsequent spam_engine_decide() call.
+void spam_engine_decision_input_from_signals(
+    spam_engine_decision_input_t* din,
+    const spam_engine_scores_t* scores,
+    const spam_engine_parsed_signals_t* signals);
+
 // Returns SPAM_ENGINE_STATUS_OK and fills *out, or
 // SPAM_ENGINE_STATUS_INVALID_ARGUMENT if in/out is NULL.
 int spam_engine_decide(const spam_engine_decision_input_t* in,
                        spam_engine_decision_result_t* out);
+
+// ── Single self-evident pipeline entrypoint (TASK-219) ──────────────────────
+// Runs the WHOLE verdict in one call: FTRL P(spam) → neural head → ensemble
+// blend → structural decision-layer fold. Replaces the error-prone two-call
+// dance (spam_engine_classify_rfc822 + spam_engine_decide) that let a caller
+// silently drop the structural layer (the /demo did exactly that pre-TASK-218).
+// Reports each stage so the pipeline is inspectable rather than hidden.
+//
+// Caller-state offsets (Message-ID DB hit, send-counts, profile) come from the
+// consumer's local store; pass NULL for `caller_state` (the milter / demo have
+// none) and those ham-ward offsets simply don't fire. Engine-derived offsets
+// (thread headers, DKIM signer) are extracted from the same parse and folded
+// automatically. `mode` is REQUIRED (see spam_engine_classify).
+typedef struct spam_engine_caller_state {
+  int phase2_match;        // Message-ID DB hit (0/1)
+  int exact_send_count;    // user's outbound count to this exact address
+  int domain_send_count;   // ...to this domain
+  int profile;             // spam_engine_profile_t
+} spam_engine_caller_state_t;
+
+typedef struct spam_engine_full_result {
+  // Stage 1 — FTRL pre-filter
+  float ftrl_score;                  // P(spam), -1 if FTRL unavailable/cold
+  // Stage 2 — neural head (raw 4-class; neural_spam == scores.spam here)
+  spam_engine_scores_t neural_scores;
+  // Stage 2.5 — ensemble: the spam side actually folded into the decision layer
+  // (== neural P(spam) when FTRL didn't contribute).
+  float ensemble_spam;
+  char decided_by[32];               // "ftrl+neural" | "neural" | "ftrl"
+  // Stage 3 — structural decision-layer fold: the FINAL verdict.
+  spam_engine_decision_result_t decision;
+  // Engine-derived signals that fed stage 3 (for display / audit).
+  spam_engine_parsed_signals_t signals;
+} spam_engine_full_result_t;
+
+// Returns SPAM_ENGINE_STATUS_OK and fills *out (zeroed first), or an error
+// status (INVALID_ARGUMENT on null handle/raw/out or bad mode). On any error
+// *out is left zeroed (safe "deliver, no offsets" default).
+spam_engine_status_t spam_engine_classify_full(
+    spam_engine_handle_t* handle,
+    const char* raw_email,
+    size_t raw_email_len,
+    const char* sender_name,
+    const char* sender_email,
+    const char* mode,
+    const spam_engine_caller_state_t* caller_state,
+    spam_engine_full_result_t* out);
 
 #ifdef __cplusplus
 }

@@ -159,6 +159,33 @@ void test_fold_spamward_no_condemn_when_model_already_spam() {
   check(v.fired.size() == 1 && v.fired[0].flipped_label.empty(), "no flip credit (decision unchanged)");
 }
 
+void test_fold_condemn_counterfactual_score_already_over() {
+  std::printf("[fold: spam-ward fires but raw score already over -> not an offset condemn]\n");
+  // Model kept it (label "regular") but the raw spam side is already >= threshold,
+  // AND a spam-ward offset also fires. The offset did NOT cause the condemn, so it
+  // gets no flip credit and the sample still trains (TASK-251 counterfactual).
+  dl::Scores s{0.45, 0.0, 0.10, 0.50};  // raw spam side 0.95 >= 0.90
+  std::vector<dl::Offset> offs = {spamward("sender_auth", 0.90)};
+  auto v = dl::fold(s, offs, 0.90, "regular", 0.55);
+  check(v.label == "spam", "condemned to spam (score carried it)");
+  check(v.train_ml, "train_ml TRUE (the score, not the offset, condemned it)");
+  check(v.fired.size() == 1 && v.fired[0].flipped_label.empty(),
+        "spam-ward offset gets NO flip credit (decision unchanged without it)");
+}
+
+void test_fold_rescue_counterfactual_score_already_under() {
+  std::printf("[fold: ham fires but raw score already under -> not an offset rescue]\n");
+  // Model said spam (spam 0.60) but the raw side is already below the 0.90
+  // threshold, so it delivers regardless; a small ham offset that also fires did
+  // NOT rescue it and must get no flip credit (TASK-251 counterfactual).
+  dl::Scores s{0.0, 0.0, 0.40, 0.60};  // raw spam side 0.60 < 0.90
+  std::vector<dl::Offset> offs = {ham("sender_history", 0.10)};
+  auto v = dl::fold(s, offs, 0.90, "spam", 0.60);
+  check(v.label == "ham", "delivered as ham (score already under threshold)");
+  check(v.fired.size() == 1 && v.fired[0].flipped_label.empty(),
+        "ham offset gets NO rescue credit (decision unchanged without it)");
+}
+
 void test_fold_clamp_and_zero_offsets() {
   std::printf("[fold: clamp + zero-magnitude offsets skipped]\n");
   dl::Scores s{0.0, 0.0, 0.0, 1.0};
@@ -184,6 +211,8 @@ int main() {
   test_fold_free_host_condemn();
   test_fold_ham_rescue();
   test_fold_spamward_no_condemn_when_model_already_spam();
+  test_fold_condemn_counterfactual_score_already_over();
+  test_fold_rescue_counterfactual_score_already_under();
   test_fold_clamp_and_zero_offsets();
 
   std::printf("\n%d checks, %d failures\n", g_checks, g_failures);

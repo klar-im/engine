@@ -38,7 +38,8 @@ int main(int argc, char* argv[]) {
 
     const auto result = engine.classify_transcript(
         transcript,
-        spam_engine::CustomerInfo{"Spammer", "spam@example.com", false});
+        spam_engine::CustomerInfo{"Spammer", "spam@example.com", false},
+        spam_engine::ClassifyOptions{"ensemble"});
     print_result(result);
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;

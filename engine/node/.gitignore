@@ -1,0 +1,4 @@
+# node-gyp build output and its header cache (rebuilt per-host / per-Node-ABI).
+build/
+node_modules/
+.node-gyp-cache/

@@ -98,11 +98,23 @@ struct ClassScores {
 };
 
 struct ClassificationResult {
+  // The five answer fields, disambiguated (TASK-219):
+  //  class_name   — the engine's own spam/regular call from `scores`.
+  //  confidence   — confidence in THAT call (e.g. 1 - P(spam)), not scores[class].
+  //  scores       — 4-class probabilities. In "ensemble" mode `scores.spam` is
+  //                 the ESCALATE-ONLY spam side max(neural, w*ftrl+(1-w)*neural)
+  //                 — i.e. what the structural decision layer should fold — while
+  //                 gibberish/marketing/regular stay raw neural. It equals raw
+  //                 neural unless FTRL escalated. `neural_spam` keeps the
+  //                 pre-blend neural spam so each stage stays inspectable.
+  //  decided_by   — "neural" | "ftrl" | "ftrl+neural" (which scorers ran).
+  //  ftrl_score   — FTRL P(spam), or -1 when FTRL was not consulted/cold.
   std::string class_name;
   float confidence = 0.0f;
-  ClassScores scores;               // Neural model scores (zero if neural was skipped)
-  std::string decided_by = "neural"; // Which classifier decided: "ftrl", "neural", "ftrl+neural"
+  ClassScores scores;               // 4-class; scores.spam is ensemble-blended (see above)
+  std::string decided_by = "neural"; // "ftrl", "neural", or "ftrl+neural"
   float ftrl_score = -1.0f;        // FTRL P(spam), -1 = not available
+  float neural_spam = -1.0f;       // raw neural P(spam) before the ensemble blend
   // Structural features from classify_rfc822's parse (TASK-173). Empty for the
   // text-only classify() path. Stamped after the decision so all early-return
   // paths carry them; surfaced through the C ABI's optional out-params so the
@@ -111,10 +123,20 @@ struct ClassificationResult {
   ExtractedAuthFeatures   auth_features;
 };
 
-/// Hint to force a specific classifier path. Extensible via string.
-/// "auto" (default), "ftrl", or "neural".
+/// Which scorers produce the verdict. REQUIRED — there is no silent default
+/// (TASK-219: a hidden "auto" mode let a cold FTRL bypass the neural head).
+///   "ensemble" — run neural AND fold FTRL P(spam) into the spam side
+///                ESCALATE-ONLY: scores.spam' = max(neural, w*ftrl+(1-w)*neural).
+///                FTRL can only RAISE the spam side (catch personalized spam),
+///                never exonerate. The recommended production mode. FTRL only
+///                contributes once it is warm (total_learns >= ftrl_min_learns)
+///                AND more suspicious than neural; otherwise the verdict is pure
+///                neural.
+///   "neural"   — neural head only; FTRL is never consulted (ftrl_score = -1).
+///   "ftrl"     — FTRL P(spam) only; neural is skipped. Diagnostic / A-B use.
+/// Unknown or empty mode throws std::invalid_argument.
 struct ClassifyOptions {
-  std::string mode = "auto";
+  std::string mode;  // no default — callers MUST choose (see C API `mode` param)
 };
 
 struct EngineConfig {
@@ -125,10 +147,18 @@ struct EngineConfig {
   float max_drift = 0.015f;       // Trust-region radius around frozen origin weights
                                   // (‖w-w0‖ <= max_drift*‖w0‖). Stops a one-sided
                                   // correction stream from collapsing a class (TASK-193).
-  // FTRL statistical pre-filter
+  // FTRL statistical pre-filter (ENSEMBLE, not a bypass — TASK-219).
   std::string ftrl_path = "";          // Path to FTRL weights file. Empty = start fresh.
-  float ftrl_spam_threshold = 0.95f;   // Above this: skip neural, return spam
-  float ftrl_ham_threshold = 0.05f;    // Below this: skip neural, return ham
+  // Weight of FTRL P(spam) in the ESCALATE-ONLY "ensemble" fold of the spam side:
+  //   scores.spam' = max(neural.spam, w*ftrl + (1-w)*neural.spam)
+  // The blend is applied only when it RAISES the spam side, so FTRL can add
+  // suspicion but never exonerate. FTRL trains only on the founder's small,
+  // spam-poor personal mbox, so a cold ftrl≈0 is absence-of-evidence, not a ham
+  // vote — a SYMMETRIC blend at this weight dragged confident-neural spam below
+  // the condemn threshold (0/5 recall on the blatant slice, measure_escalate_only.py
+  // 2026-06-25). Escalate-only keeps neural's recall while still letting a warm
+  // FTRL catch personalized spam. Revisit the weight only with new data.
+  float ftrl_ensemble_weight = 0.2f;
   uint32_t ftrl_min_learns = 10;       // FTRL only contributes once total_learns >= this
                                         // (cold-start guard against a freshly-loaded,
                                         // not-yet-warm FTRL routing weird verdicts).
@@ -167,22 +197,23 @@ class SpamEngine {
   // model, so C-ABI callers size embed() output buffers from this once.
   int n_embd() const noexcept;
 
+  // `options.mode` is REQUIRED (ensemble|neural|ftrl) — no silent default.
   ClassificationResult classify(
       const std::string& text,
-      const std::string& sender_name = "",
-      const std::string& sender_email = "",
-      const ClassifyOptions& options = {});
+      const std::string& sender_name,
+      const std::string& sender_email,
+      const ClassifyOptions& options);
 
   ClassificationResult classify_rfc822(
       const std::string& raw_rfc822,
-      const std::string& sender_name = "",
-      const std::string& sender_email = "",
-      const ClassifyOptions& options = {});
+      const std::string& sender_name,
+      const std::string& sender_email,
+      const ClassifyOptions& options);
 
   ClassificationResult classify_transcript(
       const std::vector<TranscriptMessage>& transcript,
-      const CustomerInfo& customer = {},
-      const ClassifyOptions& options = {});
+      const CustomerInfo& customer,
+      const ClassifyOptions& options);
 
   // Encoder API. The string types here are CalibratedInputText, NOT
   // std::string — the compiler enforces that anything fed to the head
@@ -230,11 +261,20 @@ class SpamEngine {
 
   static int label_from_string(const std::string& label);
   static std::string label_to_string(int label);
+  // Canonical int->name mapping as a static string literal (single source of
+  // truth for label_to_string and the C API's spam_engine_label_name).
+  static const char* label_name(int label);
 
  private:
   class Impl;
 
   ClassificationResult decision_from_scores(const ClassScores& scores) const;
+  // Fold FTRL P(spam) + neural scores into one pre-structural verdict per `mode`
+  // (ensemble|neural|ftrl). `ftrl_score` < 0 means FTRL unavailable/cold. The
+  // single place the bypass-vs-ensemble policy lives, shared by every classify
+  // entry point so they cannot drift.
+  ClassificationResult combine_scores(
+      const ClassScores& neural, float ftrl_score, const std::string& mode) const;
   void ensure_loaded() const;
 
   EngineConfig config_;

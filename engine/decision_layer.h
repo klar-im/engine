@@ -39,6 +39,14 @@ inline constexpr double kSenderHistorySingle = 0.10;  // exact send_count == 1
 inline constexpr double kSenderHistoryDomain = 0.05;  // domain-only prior send
 inline constexpr double kSenderAuthFreeHost = 0.90;   // free-host DKIM signer
 inline constexpr double kSenderAuthThrowawaySigner = 0.90;  // throwaway-shape signer
+inline constexpr double kDisplayImpersonation = 0.90;  // spam-ward: From display
+                                  // claims a distinctive brand the domain isn't
+                                  // (TASK-214) — strong, precision-first (0 ham FP)
+inline constexpr double kSenderAuthEstablishedBrand = 0.15;  // ham-ward: Tranco
+                                  // brand / clean-ESP DKIM signer (TASK-170)
+inline constexpr double kBrandReputationCeiling = 0.97;  // don't rescue a spam-side
+                                  // at/above this (a near-certain spam from a
+                                  // popular-but-abused domain must not be exonerated)
 
 // ── Filtering-profile thresholds — mirror FilteringProfileSetting.swift ─────
 inline constexpr double kThresholdStandard = 0.90;
@@ -60,6 +68,23 @@ inline bool is_free_host_signed(const std::string& dkim_signing_org_domain) {
   if (dkim_signing_org_domain.empty()) return false;
   const auto& set = free_host_signing_domains();
   return set.find(dkim_signing_org_domain) != set.end();
+}
+
+// Shared sender platforms: free webmail + publishing/newsletter hosts. These are
+// "established" domains (popular, DMARC-aligned to themselves) yet ANY third party
+// can send brand-looking mail from them, so aligning to one is NOT evidence the
+// sender owns a brand. Used to exclude them from the impersonation auth-reputation
+// exemption ("PayPal" from a gmail.com / blogspot.com account is still a spoof).
+inline bool is_shared_sender_platform(const std::string& org_domain) {
+  static const std::set<std::string> kShared = {
+      "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+      "msn.com", "yahoo.com", "yahoo.fr", "yahoo.co.uk", "ymail.com", "aol.com",
+      "icloud.com", "me.com", "mac.com", "proton.me", "protonmail.com", "gmx.com",
+      "gmx.net", "mail.com", "zoho.com", "yandex.com", "yandex.ru", "qq.com",
+      "blogspot.com", "wordpress.com", "medium.com", "substack.com", "beehiiv.com",
+      "ghost.io", "tumblr.com",
+  };
+  return kShared.find(org_domain) != kShared.end();
 }
 
 // ── Derived offset magnitudes (from the engine's own parse) ─────────────────
@@ -156,23 +181,49 @@ inline std::string refine_non_spam_label(const Scores& s) {
   return s.marketing > s.regular ? "marketing" : "ham";
 }
 
+// The model's OWN pre-offset decision from the 4-class scores: the binary label
+// ("spam"/"regular") and confidence the fold treats as "what the model said". It
+// is NOT a raw argmax: a high gibberish is a spam-side call, and a low-spam
+// high-regular carve-out is a deliver. This is the single source of truth that
+// SpamEngine::decision_from_scores, the C-ABI decide-input builder, and Swift's
+// mlResult.label all reduce to, so ml_said_spam can't drift across the three
+// (TASK-251 C5). The old C-ABI builder used argmax, which fired ml_said_spam on
+// gibberish-argmax mail the engine and Swift scored as a deliver.
+struct NeuralDecision { const char* label; double confidence; };
+inline NeuralDecision neural_decision(const Scores& s) {
+  // Float literals: the source scores are float, so comparing against 0.7f/0.2f/
+  // 0.5f (promoted to double) reproduces the old float comparison exactly, with no
+  // boundary drift from a double 0.7 sitting one ULP above 0.7f (TASK-251 C5).
+  if (s.gibberish > 0.7f) return {"spam", s.gibberish};
+  if (s.spam < 0.2f && s.regular > 0.5f) return {"regular", 1.0 - s.spam};
+  if (s.spam > 0.5f) return {"spam", s.spam};
+  return {"regular", 1.0 - s.spam};
+}
+
 // Fold the signed offsets onto the spam side and threshold. `ml_label` is the
-// engine's argmax label for the 4-class scores ("spam"/"gibberish" mean the
-// model itself said spam-side). Faithful port of ClassificationService steps
-// 6–7: same arithmetic, same clamp, same flip attribution, same train_ml rule.
+// model's own spam-side DECISION (neural_decision above / Swift mlResult.label):
+// "spam" (incl. a "gibberish" sub-label a caller may still pass) means the model
+// itself said spam-side; not a raw 4-class argmax (TASK-251 C5). Faithful port of
+// ClassificationService steps 6-7: same arithmetic, same clamp, same flip
+// attribution, same train_ml rule.
 inline Verdict fold(const Scores& scores,
                     const std::vector<Offset>& offsets,
                     double threshold,
                     const std::string& ml_label,
                     double ml_confidence) {
   const double raw_spam_side = scores.spam + scores.gibberish;
-  double signed_total = 0.0;
+  double spam_ward_sum = 0.0, ham_ward_sum = 0.0;
   for (const auto& o : offsets) {
-    if (o.fired()) signed_total += o.signed_value();
+    if (!o.fired()) continue;
+    if (o.direction == Direction::Spam) spam_ward_sum += o.signed_value();  // >= 0
+    else ham_ward_sum += o.signed_value();                                  // <= 0
   }
-  double adjusted = raw_spam_side + signed_total;
-  if (adjusted < 0.0) adjusted = 0.0;
-  if (adjusted > 1.0) adjusted = 1.0;
+  auto clamp01 = [](double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); };
+  const double adjusted = clamp01(raw_spam_side + spam_ward_sum + ham_ward_sum);
+  // Counterfactuals: the spam side with each direction's offsets removed, used to
+  // test whether the offsets ACTUALLY flipped the outcome (TASK-251).
+  const double without_ham_ward = clamp01(raw_spam_side + spam_ward_sum);
+  const double without_spam_ward = clamp01(raw_spam_side + ham_ward_sum);
 
   const bool ml_said_spam = (ml_label == "spam" || ml_label == "gibberish");
 
@@ -194,13 +245,17 @@ inline Verdict fold(const Scores& scores,
     v.confidence = ml_confidence;
   }
 
-  const bool rescued = ml_said_spam && v.label == "ham";
-  bool has_spam_ward = false;
-  for (const auto& o : offsets) {
-    if (o.fired() && o.direction == Direction::Spam) { has_spam_ward = true; break; }
-  }
-  const bool condemned = has_spam_ward && !ml_said_spam && v.label == "spam";
-  v.train_ml = !condemned;  // don't feed a header-only condemn back into ML
+  // Counterfactual flip attribution: credit the offsets only when they ACTUALLY
+  // changed the side. A rescue counts only if the ham-ward offsets are what pulled
+  // an otherwise-spam score under the threshold (without them it would still
+  // condemn); a condemn only if the spam-ward offsets are what pushed an otherwise
+  // -delivered score over it (without them it would deliver). Without this check a
+  // ham offset that fired but didn't move the side got "ham" credit, and a
+  // score-driven condemn (raw already over the threshold) wrongly set train_ml=0
+  // and suppressed a correct ML sample (TASK-251).
+  const bool rescued = ml_said_spam && v.label == "ham" && without_ham_ward >= threshold;
+  const bool condemned = !ml_said_spam && v.label == "spam" && without_spam_ward < threshold;
+  v.train_ml = !condemned;  // don't feed a header-only (offset-driven) condemn back into ML
 
   for (const auto& o : offsets) {
     if (!o.fired()) continue;

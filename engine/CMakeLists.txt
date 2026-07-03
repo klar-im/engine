@@ -42,12 +42,42 @@ endif()
 # nlohmann/json (header-only, used by trainable_classifier.h)
 find_package(nlohmann_json REQUIRED)
 
+# brand_kb_data.h (TASK-232) is generated from in-repo committed inputs only: the curated
+# registry inline in gen_brand_kb.py, the auto-resolved brand_authdomains.json, and the
+# shared FNV-1a in gen_brand_names.py. Wire it into the build graph so editing any of those
+# regenerates the header and recompiles dependents -- no separate `make engine/brand-kb`
+# step to forget (the stale-data hazard). Unlike brand_names_data.h / brand_reputation_data.h,
+# this has NO external Tranco CSV input, so it is safe to regenerate at build time. The output
+# stays committed (reviewable); CMake re-runs the command only when an input is newer. The
+# regen rule is wired only when the generator is present: a source-only checkout (the /demo
+# server ships engine/ but not pythonDiscovery/) builds from the committed header instead.
+set(SCRIPTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../pythonDiscovery/scripts)
+if(EXISTS ${SCRIPTS_DIR}/gen_brand_kb.py)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/brand_kb_data.h
+        COMMAND python3 ${SCRIPTS_DIR}/gen_brand_kb.py
+        DEPENDS ${SCRIPTS_DIR}/gen_brand_kb.py
+                ${SCRIPTS_DIR}/brand_authdomains.json
+                ${SCRIPTS_DIR}/gen_brand_names.py
+        COMMENT "Regenerating brand_kb_data.h from gen_brand_kb.py + brand_authdomains.json"
+        VERBATIM
+    )
+    add_custom_target(brand_kb_data DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/brand_kb_data.h)
+else()
+    # Source-only checkouts (the /demo server gets engine/ but not pythonDiscovery/)
+    # build from the committed brand_kb_data.h, exactly like the sibling
+    # brand_names_data.h / brand_reputation_data.h headers. CI builds with the
+    # scripts present, so a stale committed header is caught upstream, not here.
+    add_custom_target(brand_kb_data)
+endif()
+
 # Shared engine library.
 add_library(spam_engine SHARED
     spam_engine.cpp
     email_preprocessor.cpp
     pii_scrub.cpp
 )
+add_dependencies(spam_engine brand_kb_data)
 
 target_include_directories(spam_engine
     PUBLIC
@@ -162,6 +192,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/spam_engine_c_api_tests.cpp")
             spam_engine
             spam_engine_c_api
     )
+    # The test TU #includes brand_kb.h -> brand_kb_data.h directly, so it must also wait
+    # for the generator (linking spam_engine is not enough -- the header is compiled into
+    # this TU, not just the library). Without this an incremental build can compile the
+    # test against a stale committed brand_kb_data.h after an input change.
+    add_dependencies(spam_engine_c_api_tests brand_kb_data)
     if(KLAR_HAVE_TRAINING)
         target_link_libraries(spam_engine_c_api_tests PRIVATE spam_engine_training_c_api)
         target_compile_definitions(spam_engine_c_api_tests PRIVATE KLAR_HAVE_TRAINING)

@@ -19,6 +19,7 @@
 //   exceeding the model's training context triggers an unrecoverable ggml_abort
 //   at encode time, so we throw early instead.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -38,6 +39,40 @@ namespace spam_engine {
 // compiled into (libspam_engine), which is where the engine cmake stages the
 // ggml backend plugins. Used by GgmlEncoder's backend-loading fallback below.
 inline void backend_plugin_dir_anchor() {}
+
+// Bounded capture of ggml/llama native log output. ggml logs to stderr, which
+// the Mail-extension sandbox discards, so a backend-load failure there surfaces
+// as a silent status. Capturing it lets load() attach the real reason (e.g.
+// "no backends are loaded") to the exception the C ABI hands back to Swift.
+inline std::mutex& native_log_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+inline std::string& native_log_buffer() {
+  static std::string buffer;
+  return buffer;
+}
+
+inline void native_log_callback(ggml_log_level /*level*/, const char* text, void* /*user*/) {
+  if (text == nullptr) return;
+  // Keep dev/CLI behaviour unchanged: ggml normally prints to stderr.
+  std::fputs(text, stderr);
+  std::lock_guard<std::mutex> lock(native_log_mutex());
+  std::string& buffer = native_log_buffer();
+  buffer.append(text);
+  constexpr size_t kMaxNativeLog = 4096;  // keep only the recent tail
+  if (buffer.size() > kMaxNativeLog) {
+    buffer.erase(0, buffer.size() - kMaxNativeLog);
+  }
+}
+
+inline std::string drain_native_log() {
+  std::lock_guard<std::mutex> lock(native_log_mutex());
+  std::string out = native_log_buffer();
+  native_log_buffer().clear();
+  return out;
+}
 
 class GgmlEncoder {
  public:
@@ -68,25 +103,48 @@ class GgmlEncoder {
     // Guard with call_once so tests that create multiple engines don't abort.
     static std::once_flag init_flag;
     std::call_once(init_flag, []() {
+      // Route ggml/llama logs through our capture so a backend-load failure can
+      // report why (installed before load_all so the backend-registration log
+      // is captured too).
+      ggml_log_set(native_log_callback, nullptr);
+      llama_log_set(native_log_callback, nullptr);
+
       ggml_backend_load_all();
       // ggml_backend_load_all() searches the EXECUTABLE's directory (and CWD)
       // for dynamic backend plugins. When this library is dlopen'd by a host
       // we don't control — python ctypes, the Mail extension — the executable
       // is python/Mail itself, so on dynamic-backend ggml builds (the Linux
-      // release tarball) nothing loads and model load fails with "no backends
-      // are loaded". Fall back to the directory this code was loaded from:
-      // the engine cmake stages libggml-cpu-*.so next to the engine libs
-      // (postfix relies on the same staging). Skipped when load_all already
-      // found backends (macOS brew ggml resolves its own via its compiled-in
+      // release tarball, and Homebrew ggml on macOS) nothing loads and model
+      // load fails with "no backends are loaded". Fall back to the directory
+      // this code was loaded from: the engine cmake / the app bundler stages the
+      // ggml backend plugins next to the engine libs (postfix + the Mail
+      // extension rely on the same staging). Skipped when load_all already found
+      // backends (a dev macOS brew ggml resolves its own via its compiled-in
       // GGML_BACKEND_DIR; static-backend builds register at link time).
+      std::string searched_dir;
       if (ggml_backend_dev_count() == 0) {
         Dl_info info{};
         if (dladdr(reinterpret_cast<const void*>(&backend_plugin_dir_anchor), &info) != 0
             && info.dli_fname != nullptr) {
-          const auto dir = std::filesystem::path(info.dli_fname).parent_path();
-          ggml_backend_load_all_from_path(dir.string().c_str());
+          searched_dir = std::filesystem::path(info.dli_fname).parent_path().string();
+          ggml_backend_load_all_from_path(searched_dir.c_str());
         }
       }
+
+      // Hard-fail with a descriptive, Swift-visible reason if still no backend.
+      // This is the failure that silently no-op'd the Mail extension for weeks:
+      // the appex ships no ggml backend plugins, so the model never loaded and
+      // the C ABI returned an empty "Unknown error". Turn it into a real error.
+      if (ggml_backend_dev_count() == 0) {
+        throw std::runtime_error(
+            std::string("ggml registered no compute backends (searched the "
+                        "executable directory") +
+            (searched_dir.empty() ? std::string()
+                                  : std::string(" and '") + searched_dir + "'") +
+            "); the ggml backend plugin libraries are missing next to the engine "
+            "library. Native log: " + drain_native_log());
+      }
+
       llama_backend_init();
     });
     // SPAM_ENGINE_NO_GPU forces CPU (n_gpu=0) — lets the backend-parity probe
@@ -148,8 +206,27 @@ class GgmlEncoder {
                            token_buf_.data(), (int32_t)token_buf_.size(),
                            /*add_special=*/true, /*parse_special=*/false);
     if (n < 0) {
-      // Text exceeds even the large buffer — cap at buffer size.
-      n = (int32_t)token_buf_.size();
+      // Buffer too small: llama_tokenize wrote NOTHING and returns -(required
+      // count). Re-tokenize into a local exactly-sized scratch so we keep the
+      // real leading tokens. Setting n = buffer size here (the old behaviour)
+      // would encode a buffer full of zeroed BOS ids: a content-free CLS
+      // embedding for any email over kTokenBufSize tokens (long digests). The
+      // scratch is local (freed at scope exit) so the persistent token_buf_
+      // doesn't ratchet up to a huge email's token count for the process life.
+      const int needed = -n;
+      std::vector<llama_token> scratch(needed, 0);
+      int cnt = llama_tokenize(vocab_, text.c_str(), (int32_t)text.size(),
+                               scratch.data(), (int32_t)scratch.size(),
+                               /*add_special=*/true, /*parse_special=*/false);
+      if (cnt < 0) {
+        // Exact-size buffer should always succeed; guard defensively.
+        cnt = needed;
+      }
+      // Only the leading max_tokens_ survive truncation below, so copy just
+      // those back into the persistent buffer.
+      const int keep = std::min(cnt, max_tokens_);
+      token_buf_.assign(scratch.begin(), scratch.begin() + keep);
+      n = cnt;
     }
     if (n > max_tokens_) {
       // Truncate and restore EOS at the last position (mirrors CT2 path).

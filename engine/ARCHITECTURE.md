@@ -92,9 +92,33 @@ The C ABI in [spam_engine_c_api.h](spam_engine_c_api.h) is the integration bound
 - Engine is the serving/training core.
 - Offline evaluation and optional fine-tuning live outside the engine. The shipped classifier head is extracted from a HuggingFace model via `engine/export_classifier_weights.py`; an offline head-retrain path is also available (see `docs/TRAINING_AND_DEMO.md`).
 - Host integrations consume the engine via the C ABI in `spam_engine_c_api.h`.
+- The structural decision layer (`decision_layer.h`) folds non-content signals onto the model score: thread-reply headers, sender-auth (`Authentication-Results` DKIM/DMARC parse), and the brand-impersonation / reputation signals (`brand_kb.h`, `brand_names.h`, `brand_reputation.h`). The brand and reputation tables ship as code plus committed data snapshots (Tranco-derived reputation + a curated brand KB); the data-generation pipeline is maintained out-of-tree, so the snapshots are regenerated upstream, not from this repo.
 
 ## Current Constraints
 
 - Decision thresholds and learning hyperparameters are exposed via `EngineConfig` but not yet config-file-driven.
 - Online learning is single-sample SGD-style updates on the head only; the encoder is always frozen.
 - No formal model versioning around saved head weights yet — `save()` overwrites in place.
+
+## Trust boundary: the sender-auth layer reads, it does not verify
+
+The sender-auth signals (`extract_auth_features`) are PARSED from the message's
+own `Authentication-Results` header; the engine does not itself verify DKIM or
+DMARC. Two consequences follow, and they are safe or unsafe depending on where the
+engine runs:
+
+- With NO `Authentication-Results` header, `DmarcVerdict` is `Unknown`, and the
+  brand layer exonerates a sender that IS on a KB-canonical domain (it assumes the
+  MTA would have caught a forgery). So a direct From-forgery of a canonical brand
+  domain passes the brand layer on an un-authenticated message.
+- The topmost `Authentication-Results` header is trusted. An attacker who can
+  inject headers (i.e. the message reaches the engine before a trusted MTA has
+  stamped and sanitized AR) can supply a forged `dkim=pass; dmarc=pass`.
+
+This is FINE behind iCloud Mail or Gmail (the Apple Mail / companion deployments):
+the provider has already authenticated and rewritten `Authentication-Results`
+before the engine ever sees the message, and strips client-supplied ones. It is
+NOT fine for the Postfix milter on its own: the milter must run AFTER an
+authenticating filter (e.g. OpenDMARC/OpenDKIM stamping a trusted AR and removing
+inbound forgeries), or the engine's auth signals must be treated as advisory. See
+`postfix/README.md` for the milter ordering requirement.

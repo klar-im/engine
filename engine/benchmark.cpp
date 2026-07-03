@@ -69,7 +69,7 @@ int main(int argc, char* argv[]) {
   for (const auto& [name, text] : samples) {
     // warmup
     for (int i = 0; i < warmup; ++i) {
-      engine.classify(text);
+      engine.classify(text, "", "", spam_engine::ClassifyOptions{"ensemble"});
     }
 
     std::vector<double> times;
@@ -77,7 +77,7 @@ int main(int argc, char* argv[]) {
     std::string last_class;
     for (int i = 0; i < iters; ++i) {
       auto s = std::chrono::high_resolution_clock::now();
-      auto result = engine.classify(text);
+      auto result = engine.classify(text, "", "", spam_engine::ClassifyOptions{"ensemble"});
       auto e = std::chrono::high_resolution_clock::now();
       times.push_back(
           std::chrono::duration<double, std::milli>(e - s).count());

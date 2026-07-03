@@ -455,19 +455,32 @@ public:
         {
             for (size_t i = 0; i < body.size(); ++i) {
                 char c = body[i];
+                // '€' is U+20AC = E2 82 AC. Match the FULL 3-byte sequence, not just
+                // the 0xE2 lead byte: 0xE2 also leads dashes/quotes/bullets (any
+                // U+2xxx), and the old lead-only match left 0x82 0xAC in the stream,
+                // which broke the digit scan before the amount ("€99" captured
+                // nothing) (TASK-251).
+                const bool is_euro = c == '\xe2' && i + 2 < body.size() &&
+                                     body[i + 1] == '\x82' && body[i + 2] == '\xac';
                 if (std::isdigit(static_cast<unsigned char>(c)) ||
-                    c == '$' || c == '\xe2') {  // € starts with 0xe2 in UTF-8
+                    c == '$' || is_euro) {
                     // Found start of a potential number. Collect the pattern.
+                    const bool has_symbol = c == '$' || is_euro;
                     std::string pattern = "n:";
                     size_t j = i;
-                    if (c == '$' || c == '\xe2') { pattern += c; j++; }
+                    if (c == '$') { pattern += c; j++; }
+                    else if (is_euro) { pattern += "\xe2\x82\xac"; j += 3; }
+                    size_t amount_chars = 0;  // digit/separator chars after the "n:"[symbol]
                     while (j < body.size()) {
                         char d = body[j];
-                        if (std::isdigit(static_cast<unsigned char>(d))) { pattern += 'D'; j++; }
-                        else if (d == '.' || d == ',' || d == '%') { pattern += d; j++; }
+                        if (std::isdigit(static_cast<unsigned char>(d))) { pattern += 'D'; j++; ++amount_chars; }
+                        else if (d == '.' || d == ',' || d == '%') { pattern += d; j++; ++amount_chars; }
                         else break;
                     }
-                    if (pattern.size() > 3) {  // At least "n:DD"
+                    // Require a real amount: >=1 char after a currency symbol, >=2 for a
+                    // bare number. Counting the amount chars (not pattern.size()) keeps a
+                    // bare multi-byte '€' from passing the gate (TASK-251).
+                    if (amount_chars >= (has_symbol ? 1u : 2u)) {
                         add("", pattern);
                         i = j - 1;  // Skip past the number
                     }
@@ -650,16 +663,25 @@ public:
         return f.good();
     }
 
+    // Transactional load: read the whole file into locals and validate before
+    // touching ANY member. The old code wrote spam_learns_/ham_learns_ (and
+    // resized z_/n_) before the magic check, so a corrupt or truncated
+    // ftrl_baseline.bin left garbage learn-counts even though it returned false;
+    // the caller ignored the return and the cold-start guard (total_learns >=
+    // ftrl_min_learns) was then defeated by the bogus counts, blending a
+    // content-free sigmoid(0)=0.5 into every score (C3, TASK-251). On any
+    // failure this returns false with the classifier state unchanged.
     bool load(const std::string& path) {
         std::ifstream f(path, std::ios::binary);
         if (!f) return false;
 
-        uint32_t magic, version, hash_bits;
+        uint32_t magic = 0, version = 0, hash_bits = 0, spam_learns = 0, ham_learns = 0;
         f.read(reinterpret_cast<char*>(&magic), 4);
         f.read(reinterpret_cast<char*>(&version), 4);
         f.read(reinterpret_cast<char*>(&hash_bits), 4);
-        f.read(reinterpret_cast<char*>(&spam_learns_), 4);
-        f.read(reinterpret_cast<char*>(&ham_learns_), 4);
+        f.read(reinterpret_cast<char*>(&spam_learns), 4);
+        f.read(reinterpret_cast<char*>(&ham_learns), 4);
+        if (!f) return false;                       // header short-read
 
         if (magic != 0x4654524Cu) return false;
 
@@ -668,26 +690,37 @@ public:
         // values request multi-GB allocations below — bound it (default is 20).
         if (hash_bits < 4 || hash_bits > 26) return false;
 
-        if (hash_bits != config_.hash_bits) {
-            config_.hash_bits = hash_bits;
-            num_features_ = 1u << hash_bits;
-            z_.resize(num_features_);
-            n_.resize(num_features_);
-        }
+        Config cfg = config_;
+        cfg.hash_bits = hash_bits;
+        const uint32_t num_features = 1u << hash_bits;
 
-        f.read(reinterpret_cast<char*>(&config_.alpha), 4);
-        f.read(reinterpret_cast<char*>(&config_.beta), 4);
-        f.read(reinterpret_cast<char*>(&config_.lambda1), 4);
-        f.read(reinterpret_cast<char*>(&config_.lambda2), 4);
+        f.read(reinterpret_cast<char*>(&cfg.alpha), 4);
+        f.read(reinterpret_cast<char*>(&cfg.beta), 4);
+        f.read(reinterpret_cast<char*>(&cfg.lambda1), 4);
+        f.read(reinterpret_cast<char*>(&cfg.lambda2), 4);
 
+        float bias_z = 0.0f, bias_n = 0.0f;
         if (version >= 2) {
-            f.read(reinterpret_cast<char*>(&bias_z_), 4);
-            f.read(reinterpret_cast<char*>(&bias_n_), 4);
+            f.read(reinterpret_cast<char*>(&bias_z), 4);
+            f.read(reinterpret_cast<char*>(&bias_n), 4);
         }
+        if (!f) return false;                       // config/bias short-read
 
-        f.read(reinterpret_cast<char*>(z_.data()), num_features_ * sizeof(float));
-        f.read(reinterpret_cast<char*>(n_.data()), num_features_ * sizeof(float));
-        return f.good();
+        std::vector<float> z(num_features), n(num_features);
+        f.read(reinterpret_cast<char*>(z.data()), num_features * sizeof(float));
+        f.read(reinterpret_cast<char*>(n.data()), num_features * sizeof(float));
+        if (!f) return false;                       // weight data short-read
+
+        // Validated end to end. Commit to member state.
+        config_ = cfg;
+        num_features_ = num_features;
+        spam_learns_ = spam_learns;
+        ham_learns_ = ham_learns;
+        bias_z_ = bias_z;
+        bias_n_ = bias_n;
+        z_ = std::move(z);
+        n_ = std::move(n);
+        return true;
     }
 
     // --- Stats ---

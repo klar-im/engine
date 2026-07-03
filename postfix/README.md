@@ -44,6 +44,25 @@ Inbound SMTP filter for Postfix that classifies RFC822 messages using the Klar s
 - **tag** (default): Accept all mail, add headers. Dovecot Sieve handles filing.
 - **reject**: Also reject high-confidence spam at SMTP time (550).
 
+### Required ordering: authenticate BEFORE this milter
+
+The engine's sender-auth signals (DKIM/DMARC alignment, the brand-impersonation
+exoneration) are PARSED from the message's `Authentication-Results` header; the
+engine does not verify DKIM/DMARC itself. So this milter MUST run after a filter
+that authenticates the message and stamps a trusted `Authentication-Results`,
+and strips client-supplied ones (in practice OpenDMARC/OpenDKIM ahead of
+`klar-milterd` in `smtpd_milters`). Two failure modes if you don't:
+
+- A message with NO `Authentication-Results` leaves DMARC `Unknown`, and the brand
+  layer then exonerates a direct From-forgery of a KB-canonical brand domain (it
+  assumes an upstream MTA already rejected the forgery).
+- The topmost `Authentication-Results` is trusted, so an attacker who reaches this
+  milter first can inject a forged `dkim=pass; dmarc=pass`.
+
+Behind iCloud/Gmail (the Apple Mail deployment) the provider has already done this;
+a standalone Postfix relay has not. See `engine/ARCHITECTURE.md` ("Trust boundary:
+the sender-auth layer reads, it does not verify").
+
 ## Quick Start
 
 ```bash

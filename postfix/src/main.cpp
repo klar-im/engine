@@ -124,10 +124,17 @@ int main(int argc, char* argv[]) {
                     "smoke inference failed: " + result.error);
             if (!cfg->fail_open) return 1;
         } else {
-            float sum = result.spam + result.regular + result.marketing + result.gibberish;
-            if (!std::isfinite(result.spam) || !std::isfinite(result.regular) ||
-                !std::isfinite(result.marketing) || !std::isfinite(result.gibberish) ||
-                std::fabs(sum - 1.0f) > 0.05f) {
+            // Per-score [0,1] sanity + a sum LOWER bound. NOT sum≈1: in ensemble
+            // mode scores.spam is the escalate-only spam side (max of neural and
+            // the FTRL blend), so the four values are intentionally not a
+            // normalized softmax and can sum above 1 when a warm FTRL escalates
+            // (TASK-38). But the non-spam classes stay a raw-neural softmax, so a
+            // valid result always sums to >= ~1; the `sum < 0.5` floor catches a
+            // dead/zeroed model ({0,0,0,0}) that the per-score bounds would pass.
+            const float sum = result.spam + result.regular + result.marketing + result.gibberish;
+            auto bad = [](float x) { return !std::isfinite(x) || x < -0.01f || x > 1.01f; };
+            if (bad(result.spam) || bad(result.regular) ||
+                bad(result.marketing) || bad(result.gibberish) || sum < 0.5f) {
                 char buf[256];
                 snprintf(buf, sizeof(buf),
                          "smoke inference scores not sane: spam=%.4f regular=%.4f "
