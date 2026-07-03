@@ -56,10 +56,11 @@ classify:
   over the same ABI.
 - `engine/node/` ([`@klar/engine`](engine/node/README.md)) — a Node.js N-API
   binding: `classifyText` / `classifyEml` for Electron/Node clients.
-- On-device learning: the classifier personalizes from user corrections ("mark as
-  spam") on the same machine, with no external call.
 
 `postfix/` is a full worked example: the same C ABI embedded in a Postfix milter.
+
+This repo is classification only. On-device learning from user corrections
+(the training C ABI) is a separate commercial component, not included here.
 
 ## Licence
 
