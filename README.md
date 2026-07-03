@@ -44,6 +44,23 @@ macOS). Use a virtualenv if your distro marks the system Python externally-manag
 extracts the classifier head into `engine/model/`. Point `MODEL=` at any
 XLM-RoBERTa spam model to convert your own.
 
+## Embed it
+
+The engine is a C ABI you link into a client or server. Load a model once, then
+classify:
+
+- `engine/spam_engine_c_api.h` — `classify(text, sender_name, sender_email, mode)`
+  for plain text (short/social messages included), or `classify_rfc822(...)` for a
+  full `.eml`, which handles the MIME parse, multipart part-selection, and
+  sender-auth extraction. From Swift, C#, Rust, etc. it is a P/Invoke or FFI call
+  over the same ABI.
+- `engine/node/` ([`@klar/engine`](engine/node/README.md)) — a Node.js N-API
+  binding: `classifyText` / `classifyEml` for Electron/Node clients.
+- On-device learning: the classifier personalizes from user corrections ("mark as
+  spam") on the same machine, with no external call.
+
+`postfix/` is a full worked example: the same C ABI embedded in a Postfix milter.
+
 ## Licence
 
 - **Code:** AGPLv3 (`LICENSE`). The network-use copyleft means if you offer this
