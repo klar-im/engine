@@ -67,7 +67,7 @@ jobs:
       - name: Set up C/C++ deps (llama.cpp, cmake configure)
         run: make setup
 
-      - name: "Install GGUF tooling (Linux: not provided by setup.sh)"
+      - name: Install GGUF tooling (Linux only, not provided by setup.sh)
         run: |
           # llama-quantize binary from the pinned prebuilt release.
           curl -sL "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_PIN}/llama-${LLAMA_PIN}-bin-ubuntu-x64.tar.gz" \
