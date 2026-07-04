@@ -56,11 +56,13 @@ classify:
   over the same ABI.
 - `engine/node/` ([`@klar/engine`](engine/node/README.md)) — a Node.js N-API
   binding: `classifyText` / `classifyEml` for Electron/Node clients.
+- `engine/spam_engine_training_c_api.h` — on-device learning: `train_rfc822` /
+  `add_training_sample` / `train_incremental` learn from user corrections ("mark
+  as spam") locally. Nothing leaves the machine; centralized/flywheel retraining
+  is separate and not in this repo.
 
-`postfix/` is a full worked example: the same C ABI embedded in a Postfix milter.
-
-This repo is classification only. On-device learning from user corrections
-(the training C ABI) is a separate commercial component, not included here.
+`postfix/` is a full worked example: the same C ABI embedded in a Postfix milter
+(`postfix/scripts/train_from_imap.py` shows the training loop over an IMAP folder).
 
 ## Licence
 
