@@ -19,15 +19,13 @@ This repo is the **open-core** of [Klar](https://klar.im). It is AGPLv3 (see
   event store, health endpoint, CLI) plus a Docker E2E stack (Postfix + Dovecot),
   showing how to embed the engine.
 
-## Models are separate from the code
+## The model is separate from the code
 
-The engine ships **no weights**. You load a model directory at runtime. Two options:
-
-| | Production model (default) | Demo model |
-|---|---|---|
-| Source | [`icosha/spam-xlmr-v1`](https://huggingface.co/icosha/spam-xlmr-v1) (public, **CC-BY-NC-4.0**) + Klar S3/CDN (see `LICENSE-MODEL.md`) | [`icosha/klar-spam-demo`](https://huggingface.co/icosha/klar-spam-demo) (public, AGPLv3) |
-| Quality | the shipping classifier | toy, proves the pipeline, ~0.79 binary acc |
-| Use | real filtering / self-hosting at quality (free for non-commercial use) | a lighter smoke-test download |
+The engine ships **no weights**. You load a model directory at runtime. The
+default is the production model, the same classifier the Klar apps ship:
+[`icosha/spam-xlmr-v1`](https://huggingface.co/icosha/spam-xlmr-v1) (public,
+**CC-BY-NC-4.0**: free for non-commercial use with attribution; commercial use
+needs a paid licence, see `LICENSE-MODEL.md`).
 
 ```bash
 make setup                                   # C/C++ deps (llama.cpp, gmime, xxhash, json)
@@ -36,14 +34,13 @@ make build
 ./engine/build/spam_classifier ./engine/model   # classify a built-in sample
 ```
 
-`import` installs the Python conversion deps (`engine/requirements-demo.txt`)
+`import` installs the Python conversion deps (`engine/requirements-import.txt`)
 and needs `convert_hf_to_gguf.py` from llama.cpp (on PATH after `make setup` on
 macOS). Use a virtualenv if your distro marks the system Python externally-managed.
 
-`make import` defaults to the production model (`icosha/spam-xlmr-v1`), converts
-the encoder to GGUF, and extracts the classifier head into `engine/model/`. Point
-`MODEL=` at any XLM-RoBERTa spam model (e.g. `MODEL=icosha/klar-spam-demo` for the
-lighter toy) to convert your own.
+`make import` downloads the model, converts the encoder to GGUF, and extracts
+the classifier head into `engine/model/`. Point `MODEL=` at any XLM-RoBERTa
+spam model to convert your own.
 
 ## Embed it
 
@@ -70,6 +67,5 @@ classify:
 - **Code:** AGPLv3 (`LICENSE`). The network-use copyleft means if you offer this
   as a service, your modifications must be shared. Commercial licences without the
   AGPL obligations are available — contact hello@klar.im.
-- **Models:** separately licensed (`LICENSE-MODEL.md`). The demo model is AGPLv3
-  (runs this repo out of the box); the production model is CC-BY-NC-4.0 (free for
-  non-commercial use with attribution, paid licence for commercial use).
+- **Model:** separately licensed (`LICENSE-MODEL.md`): CC-BY-NC-4.0, free for
+  non-commercial use with attribution, paid licence for commercial use.

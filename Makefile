@@ -18,7 +18,7 @@ setup:
 # Python deps for model conversion only (kept separate from the C/C++ build).
 # Use a virtualenv if your distro marks the system Python externally-managed.
 import-deps:
-	@$(PYTHON) -m pip install -r engine/requirements-demo.txt
+	@$(PYTHON) -m pip install -r engine/requirements-import.txt
 
 build:
 	@engine/scripts/build.sh
@@ -30,8 +30,8 @@ test: build
 
 # Download an HF model and convert it into engine/model/ (encoder GGUF + head).
 # Defaults to the public production model (icosha/spam-xlmr-v1, CC-BY-NC-4.0) so
-# the repo runs out of the box at real quality. Point MODEL= at the toy demo
-# (icosha/klar-spam-demo) for a lighter smoke-test download.
+# the repo runs out of the box at real quality. Point MODEL= at any XLM-R spam
+# model to convert your own.
 # Requires `make import-deps` (Python) and the llama.cpp converter (from `make setup`).
 import: import-deps
 	@command -v convert_hf_to_gguf.py >/dev/null 2>&1 || { \
