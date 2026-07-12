@@ -75,6 +75,13 @@ typedef struct spam_engine_auth_features {
                                   // From org-domain isn't (TASK-214)
 } spam_engine_auth_features_t;
 
+// Structural body-URL signals (TASK-257). Only raw_ip_url is surfaced: its two
+// siblings (url_shortener, shared_bare_cdn) were ablated and NOT wired (see the
+// block comment in decision_layer.h).
+typedef struct spam_engine_url_features {
+  int raw_ip_url;                 // 0 or 1: a body link's host is a bare IP literal
+} spam_engine_url_features_t;
+
 // All structural (non-content) signals the engine extracts during
 // classify_rfc822's single parse (TASK-173). Bundled into one optional out-param
 // rather than one-per-signal so adding the Nth signal (e.g. TASK-170's
@@ -82,6 +89,7 @@ typedef struct spam_engine_auth_features {
 typedef struct spam_engine_parsed_signals {
   spam_engine_thread_features_t thread;
   spam_engine_auth_features_t   auth;
+  spam_engine_url_features_t    url;
 } spam_engine_parsed_signals_t;
 
 // Thread-safety: functions serialize access per handle for classify/load/unload/error state.
@@ -380,6 +388,7 @@ typedef struct spam_engine_decision_input {
   const char* dkim_signing_org_domain;  // eTLD+1; NULL/"" if none
   int signer_throwaway;          // 0 or 1
   int display_impersonation;     // 0 or 1 — From display impersonates a brand (TASK-214)
+  int raw_ip_url;                // 0 or 1: a body link's host is a bare IP literal (TASK-257)
   // Caller-state (local DBs); pass 0 if unavailable:
   int phase2_match;              // Message-ID DB hit (0 or 1)
   int exact_send_count;          // user's outbound count to this exact address
@@ -392,10 +401,12 @@ typedef struct spam_engine_decision_result {
   double confidence;
   double adjusted_spam_side;     // spam-side after the signed fold (clamped 0..1)
   int train_ml;                  // 0 on a header-only (offset) condemn, else 1
-  // 1 if a spam-WARD structural offset fired (free-host / throwaway DKIM signer
-  // today; URL reputation later). An independent strong signal a consumer can
-  // require as corroboration before a destructive REJECT/bounce — so no single
-  // scorer's blind spot can bounce legitimate mail.
+  // 1 if an AUTHORITATIVE spam-WARD structural offset fired (free-host / throwaway
+  // DKIM signer or display-name impersonation, each >= the standard gate). An
+  // independent strong signal a consumer can require as corroboration before a
+  // destructive REJECT/bounce, so no single scorer's blind spot bounces legit mail.
+  // The 0.30 raw-IP corroborator (TASK-257) fires but deliberately does NOT set
+  // this: it must never authorize a bounce on its own.
   int condemn_offset_fired;
 } spam_engine_decision_result_t;
 

@@ -53,6 +53,21 @@ struct ExtractedAuthFeatures {
   bool        display_impersonation = false;
 };
 
+// Structural body-URL signals for the decision layer (TASK-257). Only the
+// freshness-independent, structurally-safe one is surfaced: raw_ip_url. Its
+// two siblings (url_shortener, shared_bare_cdn) were built + ablated and NOT
+// wired: a bare-IP host is ~never legit (0/56 ham, structural), whereas
+// shortener wrappers (t.co/lnkd.in) and shared CDNs (S3/imgur/googleapis) carry
+// real legit mail, so their clean corpus rate was sample-luck. See the block in
+// decision_layer.h and pythonDiscovery/scripts/measure_url_structure.py.
+struct ExtractedUrlFeatures {
+  // A body link whose host is a bare IPv4 (or IPv6) literal: legit senders use
+  // domain names, so this is a textbook phishing tell. IPv4 is the covered case;
+  // IPv6 literals are rare and best-effort (the shared host_from_url port-strip
+  // mangles bracketed forms).
+  bool raw_ip_url = false;
+};
+
 struct PreprocessedEmail {
   std::string subject;
   std::string from;
@@ -78,6 +93,7 @@ struct PreprocessedEmail {
   // re-parsing the message two more times.
   ExtractedThreadFeatures thread_features;
   ExtractedAuthFeatures   auth_features;
+  ExtractedUrlFeatures    url_features;
 };
 
 // For ML classification: extracts and normalizes text content.
@@ -101,6 +117,12 @@ ExtractedEmailBody extract_email_body(const std::string& raw_rfc822);
 // *_from_message cores so the extraction logic stays single-sourced.
 ExtractedThreadFeatures extract_thread_features(const std::string& raw_rfc822);
 ExtractedAuthFeatures extract_auth_features(const std::string& raw_rfc822);
+ExtractedUrlFeatures extract_url_features(const std::string& raw_rfc822);
+
+// True if `host` is a bare IP literal: an IPv4 dotted quad (each octet 0-255) or
+// an IPv6 literal (contains ':' and only hex/':'). Exposed for the offset unit
+// test. Not for a hostname that merely contains digits (192.example.com is false).
+bool host_is_ip_literal(const std::string& host);
 
 // Distinct eTLD+1 domains of every http(s) URL in the message body (plain +
 // HTML), lowercased + deduped. Foundation for the link/domain reputation

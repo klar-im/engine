@@ -27,6 +27,7 @@ namespace {
 // standalone extractors, which re-parse, appear in the file.
 ExtractedThreadFeatures extract_thread_features_from_message(GMimeMessage* message);
 ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message);
+ExtractedUrlFeatures extract_url_features_from_message(GMimeMessage* message);
 
 void ensure_gmime_initialized() {
   static std::once_flag once;
@@ -649,6 +650,7 @@ PreprocessedEmail preprocess_rfc822(const std::string& raw_rfc822) {
   // the Swift decision layer used to trigger two more GMime parses for these.
   out.thread_features = extract_thread_features_from_message(message);
   out.auth_features = extract_auth_features_from_message(message);
+  out.url_features = extract_url_features_from_message(message);
 
   // Recipient identifiers, for PII-scrubbing the contribution body (TASK-135):
   // the recipient's own address/name must not leak even when it appears IN the
@@ -1446,6 +1448,18 @@ std::vector<std::string> link_hosts_from_message(GMimeMessage* message) {
   return out;
 }
 
+// Structural body-URL features (TASK-257). Reuses the full-host link scan (no
+// extra parse) and flags a bare-IP host: a link to a raw IP is a textbook
+// phishing tell that legit domain-named senders don't produce.
+ExtractedUrlFeatures extract_url_features_from_message(GMimeMessage* message) {
+  ExtractedUrlFeatures out;
+  if (message == nullptr) return out;
+  for (const std::string& h : link_hosts_from_message(message)) {
+    if (host_is_ip_literal(h)) { out.raw_ip_url = true; break; }
+  }
+  return out;
+}
+
 // A FULL host deceptively presents a brand its registrable owner is not (TASK-242), the
 // dominant real-phish pattern doc-14 measured that org-domain reduction misses:
 //  - subdomain deception: a curated canonical brand domain appears as labels in the host
@@ -2127,6 +2141,53 @@ std::vector<std::string> credential_form_action_domains(const std::string& html)
 ExtractedAuthFeatures extract_auth_features(const std::string& raw_rfc822) {
   GMimeMessage* message = parse_rfc822_message(raw_rfc822);
   ExtractedAuthFeatures out = extract_auth_features_from_message(message);
+  if (message != nullptr) {
+    g_object_unref(message);
+  }
+  return out;
+}
+
+bool host_is_ip_literal(const std::string& host) {
+  if (host.empty()) return false;
+  // IPv6 literal (possibly bracketed): only hex digits and ':', >= 2 colons.
+  // Rare in practice, and the shared host_from_url port-strip mangles bracketed
+  // forms upstream, so this mainly serves the direct/unit path (best-effort).
+  std::string h = host;
+  if (h.size() >= 2 && h.front() == '[' && h.back() == ']') {
+    h = h.substr(1, h.size() - 2);
+  }
+  if (h.find(':') != std::string::npos) {
+    if (std::count(h.begin(), h.end(), ':') < 2) return false;
+    for (char c : h) {
+      if (std::isxdigit(static_cast<unsigned char>(c)) == 0 && c != ':') return false;
+    }
+    return true;
+  }
+  // IPv4 dotted quad: exactly four 1-3 digit octets, each 0-255. A non-digit
+  // label (example.com, 192.example.com) fails on the first non-digit octet.
+  int octets = 0;
+  size_t i = 0;
+  while (true) {
+    int val = 0, digits = 0;
+    while (i < host.size() && std::isdigit(static_cast<unsigned char>(host[i])) != 0) {
+      val = val * 10 + (host[i] - '0');
+      if (val > 255) return false;
+      ++digits;
+      ++i;
+    }
+    if (digits == 0 || digits > 3) return false;
+    ++octets;
+    if (i == host.size()) break;
+    if (host[i] != '.') return false;   // a non-dot separator => not an IPv4
+    ++i;
+    if (i == host.size()) return false;  // trailing dot => malformed
+  }
+  return octets == 4;
+}
+
+ExtractedUrlFeatures extract_url_features(const std::string& raw_rfc822) {
+  GMimeMessage* message = parse_rfc822_message(raw_rfc822);
+  ExtractedUrlFeatures out = extract_url_features_from_message(message);
   if (message != nullptr) {
     g_object_unref(message);
   }

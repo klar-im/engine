@@ -9,11 +9,17 @@
 // The brand set (brand_names_data.h, generated) is split into two tiers (doc-12):
 //   Tier-1, distinctive coined stems (NOT dictionary words: Scaleway, PayPal).
 //            A match is high-confidence, so it condemns standalone (TASK-214).
-//   Tier-2, stems that ARE dictionary words (Decathlon, Orange, Apple). The word
-//            has a large legit non-brand population ("Orange County"), so a match
-//            is low-confidence: it only counts when the display has the
-//            impersonation SHAPE (brand + role words, nothing distinctive left)
-//            AND the caller corroborates it with an independent spam signal.
+//   Tier-2, stems that ARE dictionary words (Decathlon, Orange, Apple) or common
+//            FR/DE/EN surnames (Dupont, Mueller, Williams; TASK-266). The word
+//            has a large legit non-brand population ("Orange County",
+//            "Marie Dupont"), so a match is low-confidence: it only counts when
+//            the display has the impersonation SHAPE (brand + role words, nothing
+//            distinctive left) AND the caller corroborates it with an independent
+//            spam signal.
+//   Between the two sit the AMBIGUOUS Tier-1 brands (is_ambiguous_brand,
+//   TASK-268): heavily-phished brands that are also common surnames (Boulanger,
+//   Norton). Display claims condemn standalone but only with the impersonation
+//   shape; a personal-name display passes.
 // Membership is exact (FNV-1a + binary search). No Swift copy, Swift reads the
 // engine-computed `display_impersonation` boolean over the C ABI.
 
@@ -42,6 +48,24 @@ inline bool in_word_list(const std::string& t, const char* const* list, std::siz
 inline bool is_short_brand(const std::string& t) {
   static const char* const kShort[] = {"dhl", "sfr"};
   return in_word_list(t, kShort, sizeof(kShort) / sizeof(kShort[0]));
+}
+
+// Ambiguous Tier-1 brands (TASK-268): heavily-phished brands that are ALSO common
+// FR surnames (or, for boulanger, a French profession word), kept out of the
+// surname demotion (TASK-266) on phish volume: Boulanger gift-card / order scams,
+// Norton subscription-renewal invoices. Policy is the middle of the two tiers: a
+// display claim condemns STANDALONE (Tier-1 strength, no corroborating signal
+// needed) but only WITH the impersonation shape (Tier-2 gate), so "Boulanger
+// Support" and bare "Norton" fire while a personal name ("Edmond Boulanger") has
+// a distinctive leftover, breaks the shape, and passes. Domain-shaped paths
+// (combosquat, homoglyph, subdomain) treat them as plain Tier-1: no person owns
+// b0ulanger.com. NB: E.Leclerc, the other Leclerc-class dual, is NOT here
+// because "leclerc" is not a Tranco stem at all (the retailer's domain is
+// e.leclerc, stem "e"), so no string match exists to gate; its coverage needs
+// the brand KB (TASK-267).
+inline bool is_ambiguous_brand(const std::string& t) {
+  static const char* const kAmbiguous[] = {"boulanger", "norton"};
+  return in_word_list(t, kAmbiguous, sizeof(kAmbiguous) / sizeof(kAmbiguous[0]));
 }
 
 // 0 = not a brand, 1 = Tier-1 (distinctive), 2 = Tier-2 (dictionary word / curated
@@ -75,19 +99,31 @@ inline bool is_role_word(const std::string& t) {
       "help", "info", "customer", "care", "update", "updates", "login", "signin",
       "verification", "verify", "payment", "payments", "order", "orders", "noreply",
       "official", "online", "store", "shop", "group", "mail", "email", "news",
+      // Subscription/renewal-scam vocabulary (TASK-268): the Norton-class fake
+      // invoice display is "Brand Renewal" / "Brand Invoice"; antivirus is the
+      // product noun of that same scam family.
+      "invoice", "invoices", "renewal", "renewals", "subscription",
+      "subscriptions", "receipt", "receipts", "antivirus",
       // French role words (primary market): compte=account, securite=security,
       // paiement=payment, commande=order, facture=invoice, livraison=delivery,
-      // commentaires=reviews, assistance/aide=support, alerte=alert.
+      // commentaires=reviews, assistance/aide=support, alerte=alert,
+      // carte/cadeau=gift-card (the Leclerc/Boulanger scam shape, TASK-268).
       "compte", "comptes", "securite", "paiement", "paiements", "commande",
       "commandes", "facture", "factures", "livraison", "commentaires",
       "assistance", "aide", "alerte", "alertes", "confidentialite", "abonnement",
+      "carte", "cartes", "cadeau", "cadeaux", "renouvellement", "abonnements",
+      // electromenager: Boulanger's own product tagline, the order-scam shape
+      "electromenager",
       // German role words: konto=account, sicherheit=security, zahlung=payment,
       // bestellung=order, rechnung=invoice, lieferung/versand=delivery,
       // kundendienst=support, benachrichtigung=notification, anmeldung=login.
       "konto", "konten", "sicherheit", "zahlung", "zahlungen", "bestellung",
       "bestellungen", "rechnung", "rechnungen", "lieferung", "versand",
       "kundendienst", "kundenservice", "benachrichtigung", "anmeldung", "passwort",
-      "bestaetigung", "aktualisierung", "hilfe"};
+      "bestaetigung", "aktualisierung", "hilfe",
+      // Verlaengerung=renewal (both the ASCII spelling and the a-umlaut fold the
+      // display tokenizer produces).
+      "verlaengerung", "verlangerung"};
   return in_word_list(t, kRoles, sizeof(kRoles) / sizeof(kRoles[0]));
 }
 
@@ -280,19 +316,21 @@ inline std::vector<DisplayToken> tokenize_display(const std::string& display_nam
   return tokens;
 }
 
-// Fold common ASCII homoglyph substitutions toward the canonical letter so a
-// look-alike domain stem maps onto the brand stem it imitates (paypa1->paypal,
-// g00gle->google, arnazon->amazon). The rn->m digraph is handled first. Only the
-// unambiguous swaps are mapped (1->l, 0->o, ...); this is detection-only.
-inline std::string confusable_fold(const std::string& s) {
+// Fold common ASCII homoglyph substitutions toward the canonical letter. The
+// leet map lives HERE only; both readings of the ambiguous '1' share it via
+// `one_as` ('l' for brand stems: paypa1->paypal; 'i' for role words:
+// serv1ce->service, TASK-268). `fold_rn` additionally folds the rn->m digraph
+// (arnazon->amazon), wanted for brand stems, not for the role reading. Only
+// the unambiguous swaps are mapped; this is detection-only.
+inline std::string leet_fold(const std::string& s, char one_as, bool fold_rn) {
   std::string t;
   t.reserve(s.size());
   for (std::size_t i = 0; i < s.size(); ++i) {
-    if (s[i] == 'r' && i + 1 < s.size() && s[i + 1] == 'n') { t.push_back('m'); ++i; continue; }
+    if (fold_rn && s[i] == 'r' && i + 1 < s.size() && s[i + 1] == 'n') { t.push_back('m'); ++i; continue; }
     char c = s[i];
     switch (c) {
       case '0': c = 'o'; break;
-      case '1': c = 'l'; break;
+      case '1': c = one_as; break;
       case '3': c = 'e'; break;
       case '4': c = 'a'; break;
       case '5': c = 's'; break;
@@ -304,6 +342,10 @@ inline std::string confusable_fold(const std::string& s) {
   }
   return t;
 }
+
+// The brand-stem reading: a look-alike domain stem maps onto the brand it
+// imitates (paypa1->paypal, g00gle->google, arnazon->amazon).
+inline std::string confusable_fold(const std::string& s) { return leet_fold(s, 'l', true); }
 
 // Decode an IDNA `xn--` label (RFC 3492 punycode) into Unicode code points. Returns
 // false (leaving `out` partial) on malformed input or overflow, so the caller fails
@@ -481,6 +523,15 @@ inline BrandMatch display_impersonates_brand(const std::string& display_name,
   auto token_owned = [&](const DisplayToken& t) {
     return owns_prefix(t.plain) || (t.perturbed && owns_prefix(t.conf));
   };
+  // A digit-obfuscated role word must not break the impersonation shape
+  // (TASK-268): '1' reads as BOTH 'l' and 'i', so try the shared conf_hg fold
+  // (1->l, rn->m: "A1ert") and the 1->i leet reading ("Serv1ce", "B1ll1ng").
+  // The digit guard skips the second fold for the common all-letter token.
+  auto digit_obfuscated_role = [](const DisplayToken& t) {
+    if (t.conf_hg != t.plain && is_role_word(t.conf_hg)) return true;
+    if (t.plain.find_first_of("013457") == std::string::npos) return false;
+    return is_role_word(leet_fold(t.plain, 'i', /*fold_rn=*/false));
+  };
 
   const std::vector<DisplayToken> tokens = tokenize_display(display_name);
   // Whole-display self-exemption when the sender is genuinely on the brand's own
@@ -513,16 +564,38 @@ inline BrandMatch display_impersonates_brand(const std::string& display_name,
     if (lead_plain.size() >= fstem.size()) break;  // == lead_conf.size() (conf fold is 1:1)
   }
 
-  bool tier2_present = false, distinctive_leftover = false;
-  std::string tier1_brand, tier2_brand;
+  bool tier2_present = false, ambiguous_present = false, distinctive_leftover = false;
+  std::string tier1_brand, tier2_brand, ambiguous_brand;
   for (const DisplayToken& t : tokens) {
     if (token_owned(t)) continue;              // an owned look-alike token is a different signal
     const Match mt = match_brand(t);
-    if (mt.tier == 1) { m.tier1 = true; if (tier1_brand.empty()) tier1_brand = *mt.form; }
-    else if (mt.tier == 2) { tier2_present = true; if (tier2_brand.empty()) tier2_brand = *mt.form; }
-    else if (t.plain.size() >= 4 && !is_role_word(t.plain) && !is_brand_continuation(t.plain)) {
-      distinctive_leftover = true;             // a non-brand, non-role, non-corporate word breaks the shape
+    if (mt.tier == 1 && mt.form == &t.plain && is_ambiguous_brand(t.plain)) {
+      // Ambiguous Tier-1 (surname-brand, TASK-268): Tier-1 strength but only with
+      // the impersonation shape, resolved after the loop. ONLY the unperturbed
+      // spelling qualifies: a homoglyph fold ("B0ulanger" -> boulanger) has no
+      // personal-name population, so it stays plain Tier-1 below.
+      ambiguous_present = true;
+      if (ambiguous_brand.empty()) ambiguous_brand = t.plain;
     }
+    else if (mt.tier == 1) { m.tier1 = true; if (tier1_brand.empty()) tier1_brand = *mt.form; }
+    else if (mt.tier == 2) { tier2_present = true; if (tier2_brand.empty()) tier2_brand = *mt.form; }
+    else if (t.plain.size() >= 4 && t.plain.find_first_not_of("0123456789") != std::string::npos &&
+             !is_role_word(t.plain) && !is_brand_continuation(t.plain) &&
+             !digit_obfuscated_role(t)) {
+      // A non-brand, non-role, non-corporate word breaks the shape. An all-digit
+      // token (an order number) and a digit-obfuscated role word ("Serv1ce",
+      // "A1ert") are attacker-typical filler, not a person's distinctive name,
+      // so they do NOT break it (TASK-268).
+      distinctive_leftover = true;
+    }
+  }
+  // An ambiguous brand with the shape intact condemns standalone ("Boulanger
+  // Support", bare "Norton"); a distinctive leftover is a personal name
+  // ("Edmond Boulanger") and the claim is dropped entirely, it does not even
+  // count as Tier-2 (no corroborated condemn on a person's surname).
+  if (ambiguous_present && !distinctive_leftover && !m.tier1) {
+    m.tier1 = true;
+    tier1_brand = ambiguous_brand;
   }
   m.tier2 = tier2_present && !distinctive_leftover;
   m.brand = m.tier1 ? tier1_brand : (m.tier2 ? tier2_brand : std::string());

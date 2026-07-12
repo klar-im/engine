@@ -50,12 +50,12 @@ jobs:
           path: engine/deps/llama-install
           key: ${{ runner.os }}-llama-${{ hashFiles('engine/scripts/setup.sh') }}
 
-      - name: Cache converted demo model
+      - name: Cache converted model
         uses: actions/cache@v5
         with:
           path: engine/model
           # Bust when the conversion path changes (Makefile/converter/deps).
-          key: engine-demo-model-${{ env.LLAMA_PIN }}-${{ hashFiles('Makefile', 'engine/export_classifier_weights.py', 'engine/requirements-demo.txt') }}
+          key: engine-model-${{ env.LLAMA_PIN }}-${{ hashFiles('Makefile', 'engine/export_classifier_weights.py', 'engine/requirements-demo.txt') }}
 
       - name: Install system dependencies
         run: |
@@ -74,19 +74,19 @@ jobs:
             | tar -xz -C /tmp --wildcards '*llama-quantize'
           sudo install -m 0755 "$(find /tmp -type f -name llama-quantize | head -1)" /usr/local/bin/llama-quantize
           # convert_hf_to_gguf.py from the matching source tag (imports the pip
-          # `gguf` module installed by `make import-demo` / requirements-demo.txt).
+          # `gguf` module installed by `make import` / requirements-demo.txt).
           sudo curl -sL "https://raw.githubusercontent.com/ggml-org/llama.cpp/${LLAMA_PIN}/convert_hf_to_gguf.py" \
             -o /usr/local/bin/convert_hf_to_gguf.py
           sudo chmod 0755 /usr/local/bin/convert_hf_to_gguf.py
 
-      - name: Import the public demo model
+      - name: Import the public production model
         run: |
           python3 -m venv .venv
           # Skips cleanly if the model cache already populated engine/model.
           if [ ! -f engine/model/gguf/encoder-q4_k_m.gguf ]; then
-            make import-demo PYTHON="$PWD/.venv/bin/python"
+            make import PYTHON="$PWD/.venv/bin/python"
           else
-            echo "[ci] demo model restored from cache — skipping import"
+            echo "[ci] model restored from cache; skipping import"
           fi
 
       - name: Build engine + reference milter

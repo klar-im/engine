@@ -7,8 +7,10 @@
 #endif
 #include "test_support.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <new>
 #include <set>
@@ -18,6 +20,7 @@
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -85,6 +88,64 @@ void test_load_classify_unload_flow() {
       &result);
   test_support::check(status != SPAM_ENGINE_STATUS_OK, "classify after unload should fail");
 
+  spam_engine_destroy(handle);
+}
+
+// Create + load an engine with the FTRL baseline when present (the demo/addon
+// load shape, learning_rate 0). Reports FTRL presence via *have_ftrl for tests
+// that branch on it. Caller owns the handle (spam_engine_destroy).
+spam_engine_handle_t* create_loaded_engine(const std::string& label,
+                                           bool* have_ftrl = nullptr) {
+  const auto paths = test_support::model_paths();
+  test_support::ensure_model_assets(paths, label);
+  const std::string ftrl_path = (paths.model_path / "ftrl_baseline.bin").string();
+  const bool ftrl = std::ifstream(ftrl_path, std::ios::binary).good();
+  if (have_ftrl != nullptr) *have_ftrl = ftrl;
+  spam_engine_handle_t* handle = spam_engine_create();
+  test_support::check(handle != nullptr, label + ": spam_engine_create should return a handle");
+  const int status = spam_engine_load(handle, paths.model_path.string().c_str(), 0.0f,
+                                      ftrl ? ftrl_path.c_str() : nullptr);
+  test_support::check(status == SPAM_ENGINE_STATUS_OK, label + ": load should succeed");
+  return handle;
+}
+
+// The /demo canned samples (TASK-266): the exact bytes the website's demo page
+// serves (engine/tests/data/demo-samples/, imported by the page as ?raw), run
+// through the same pipeline the demo addon runs: ensemble classify_rfc822 +
+// structural decision fold at the standard profile (classify_full is that in
+// one call). Filenames carry the expected decision label (<label>.<slug>.eml,
+// decision vocabulary: spam | gibberish | marketing | ham). A regression here
+// is a public wrong verdict on klar.im/demo: the Ham EN sample ("Marie
+// Dupont") shipped misclassified as spam for two weeks because nothing checked
+// these.
+void test_demo_samples_decision() {
+  const auto paths = test_support::model_paths();
+  spam_engine_handle_t* handle = create_loaded_engine("demo samples decision");
+  int status;
+
+  const std::filesystem::path dir = paths.source_dir / "tests" / "data" / "demo-samples";
+  std::vector<std::filesystem::path> files;
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    if (entry.path().extension() == ".eml") files.push_back(entry.path());
+  }
+  std::sort(files.begin(), files.end());
+  test_support::check(files.size() == 7,
+      "all 7 demo samples present (keep in sync with the /demo SAMPLES list)");
+
+  for (const auto& f : files) {
+    const std::string name = f.filename().string();
+    const std::string expected = name.substr(0, name.find('.'));
+    std::ifstream in(f, std::ios::binary);
+    std::string eml((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    test_support::check(!eml.empty(), "demo sample readable: " + name);
+    spam_engine_full_result_t full{};
+    status = spam_engine_classify_full(handle, eml.data(), eml.size(), nullptr, nullptr,
+                                       "ensemble", nullptr, &full);
+    test_support::check(status == SPAM_ENGINE_STATUS_OK, "classify_full ok: " + name);
+    test_support::check(std::string(full.decision.label) == expected,
+        "demo sample '" + name + "' must decide '" + expected + "' (got '" +
+        std::string(full.decision.label) + "')");
+  }
   spam_engine_destroy(handle);
 }
 
@@ -179,15 +240,24 @@ void test_rfc822_picks_spammy_html_when_plain_and_html_drift_via_c_api() {
   // plain.spam ? html : plain). A multipart/alternative is scored as the MORE
   // spammy of its parts, so classify_rfc822(drift) == max(plain, html). This is
   // model-independent: it tests the max-selection MECHANISM through the C ABI,
-  // not accuracy. The production-accuracy guarantee (spammy html scores > 0.90)
-  // lives in the private spam_engine_tests suite, which runs with the real
-  // weights — the public CI runs only the toy demo model.
+  // not accuracy.
   const float expected = (plain > html) ? plain : html;
   const float eps = 1e-2f;
   test_support::check(drift >= plain - eps,
       "classify_rfc822 drift must not be dragged down to the benign plain part");
   test_support::check(std::fabs(drift - expected) <= eps,
       "classify_rfc822 drift must equal the most-spammy part (max-selection)");
+
+  // Accuracy guarantee: the spammy html part ("BUY VIAGRA NOW!!!") must score as
+  // high spam, so drift-selection actually surfaces spam and not just the higher
+  // of two low scores. The public build imports the production model, so this
+  // runs in CI (the deeper accuracy suite is the private spam_engine_tests).
+  test_support::check(html > 0.90f,
+      "spammy html part must score as high spam (> 0.90)");
+  test_support::check(plain < 0.10f,
+      "benign plain part must score as low spam (< 0.10)");
+  test_support::check(drift > 0.90f,
+      "drift selection must surface the spammy html part as high spam (> 0.90)");
 
   spam_engine_destroy(handle);
 }
@@ -196,17 +266,10 @@ void test_rfc822_picks_spammy_html_when_plain_and_html_drift_via_c_api() {
 // the neural verdict without overriding it, and classify_full reports every
 // stage in one call.
 void test_mode_required_ensemble_and_classify_full() {
-  const auto paths = test_support::model_paths();
-  test_support::ensure_model_assets(paths, "mode + ensemble + classify_full");
-
-  const std::string ftrl_path = (paths.model_path / "ftrl_baseline.bin").string();
-  const bool have_ftrl = std::ifstream(ftrl_path, std::ios::binary).good();
-
-  spam_engine_handle_t* handle = spam_engine_create();
-  test_support::check(handle != nullptr, "spam_engine_create should return a handle");
-  int status = spam_engine_load(handle, paths.model_path.string().c_str(), 0.0f,
-                                have_ftrl ? ftrl_path.c_str() : nullptr);
-  test_support::check(status == SPAM_ENGINE_STATUS_OK, "load (with FTRL baseline) should succeed");
+  bool have_ftrl = false;
+  spam_engine_handle_t* handle =
+      create_loaded_engine("mode + ensemble + classify_full", &have_ftrl);
+  int status;
 
   const std::string spam =
       "From: Promo <promo@example.com>\r\n"
@@ -964,6 +1027,64 @@ void test_display_brand_homoglyph_and_owns() {
       "'Amazon PayPal Support' from amazon-offers.xyz still condemns PayPal (FN3)");
 }
 
+// TASK-268: the ambiguous Tier-1 brands (Boulanger, Norton) are heavily-phished
+// brands that are also common surnames. They condemn standalone like Tier-1, but
+// only WITH the impersonation shape, so a personal-name display passes instead
+// of repeating the Marie Dupont FP (TASK-266) for these names. (Leclerc, the
+// other Leclerc-class dual, is not a Tranco stem at all: e.leclerc reduces to
+// stem "e". Its coverage needs the brand KB, TASK-267.)
+void test_ambiguous_surname_brands() {
+  using spam_engine::brand_names::display_impersonates_brand;
+
+  // Personal-name shape: the first name is a distinctive leftover, breaks the
+  // shape, and the claim is dropped entirely (not even Tier-2).
+  const auto person = display_impersonates_brand("Edmond Boulanger", "gmail.com");
+  test_support::check(!person.tier1 && !person.tier2,
+      "'Edmond Boulanger' is a person, not a Boulanger claim (shape broken)");
+  const auto person2 = display_impersonates_brand("Sophie Norton", "orange.fr");
+  test_support::check(!person2.tier1 && !person2.tier2,
+      "'Sophie Norton' is a person, not a Norton claim (shape broken)");
+
+  // Brand + role words (or the bare brand) keeps the shape and condemns
+  // STANDALONE from a non-owned domain: Tier-1 strength, no corroboration.
+  const auto role = display_impersonates_brand("Boulanger Livraison", "colis-suivi.example");
+  test_support::check(role.tier1 && role.brand == "boulanger",
+      "'Boulanger Livraison' from a foreign domain IS a standalone Boulanger claim");
+  const auto card = display_impersonates_brand("Carte Cadeau Boulanger", "offres-promo.example");
+  test_support::check(card.tier1 && card.brand == "boulanger",
+      "'Carte Cadeau Boulanger' (gift-card scam shape) IS a standalone Boulanger claim");
+  const auto bare = display_impersonates_brand("Norton", "renewal-invoice.example");
+  test_support::check(bare.tier1 && bare.brand == "norton",
+      "bare 'Norton' from a foreign domain IS a standalone Norton claim");
+
+  // The named scam shapes hold the shape via the renewal/product vocabulary:
+  // the fake-invoice family ("Norton Renewal") and the order scam with a digit
+  // filler ("Commande 12345", all-digit tokens are not distinctive leftovers).
+  const auto renew = display_impersonates_brand("Norton Subscription Renewal", "billing-alerts.example");
+  test_support::check(renew.tier1 && renew.brand == "norton",
+      "'Norton Subscription Renewal' (fake-invoice scam shape) condemns standalone");
+  const auto av = display_impersonates_brand("Norton Antivirus", "billing-alerts.example");
+  test_support::check(av.tier1 && av.brand == "norton",
+      "'Norton Antivirus' condemns standalone");
+  const auto num = display_impersonates_brand("Boulanger Commande 12345", "suivi-colis.example");
+  test_support::check(num.tier1 && num.brand == "boulanger",
+      "'Boulanger Commande 12345' condemns (an order number is not a distinctive leftover)");
+  const auto leet = display_impersonates_brand("Boulanger Serv1ce", "suivi-colis.example");
+  test_support::check(leet.tier1 && leet.brand == "boulanger",
+      "'Boulanger Serv1ce' condemns (digit-obfuscated role word does not break the shape)");
+
+  // A homoglyph spelling has no personal-name population, so it bypasses the
+  // ambiguous gate and stays plain Tier-1 even beside a first name.
+  const auto homo = display_impersonates_brand("Edmond B0ulanger", "gmail.com");
+  test_support::check(homo.tier1 && homo.brand == "boulanger",
+      "'Edmond B0ulanger' (digit homoglyph) stays a plain Tier-1 condemn");
+
+  // The brand on its own domain stays exempt (whole-display self-exemption).
+  const auto own = display_impersonates_brand("Boulanger Livraison", "boulanger.com");
+  test_support::check(!own.tier1 && !own.tier2,
+      "'Boulanger Livraison' from boulanger.com is the brand itself");
+}
+
 void test_display_impersonation() {
   // Extraction (TASK-214): the From display claims a distinctive brand the From
   // org-domain isn't, the Scaleway phish shape.
@@ -1113,6 +1234,40 @@ void test_display_impersonation() {
   spam_engine_extract_auth_features(surname_rt.data(), surname_rt.size(), &f15);
   test_support::check(f15.display_impersonation == 0,
       "common-surname display + free-webmail Reply-To must NOT impersonate (no Tier-2 reply-hijack)");
+
+  // Non-English surnames are Tier-2 too (TASK-266): "dupont" is a Tranco stem
+  // (dupont.com) the English dict misses, so it used to land Tier-1 and condemn
+  // every "Marie Dupont" standalone (the /demo Ham EN sample). A personal name
+  // has a distinctive leftover (the first name), so the Tier-2 shape breaks and
+  // nothing fires.
+  const std::string surname_fr =
+      "From: Marie Dupont <marie@example.com>\r\n"
+      "Subject: Re: Thursday call\r\n\r\nHi Tom, could we move our call?";
+  spam_engine_auth_features_t f15b{};
+  spam_engine_extract_auth_features(surname_fr.data(), surname_fr.size(), &f15b);
+  test_support::check(f15b.display_impersonation == 0,
+      "'Marie Dupont' from example.com must NOT impersonate (surname is Tier-2, shape broken)");
+
+  // Same for an EN surname on a shared platform: aligned gmail is never
+  // reputable_aligned, so before TASK-266 'John Williams' condemned even with
+  // dmarc=pass ("williams" was Tier-1 via williams.com).
+  const std::string surname_en =
+      "From: John Williams <jwilliams@gmail.com>\r\n"
+      "Authentication-Results: mx; dkim=pass header.d=gmail.com; dmarc=pass\r\n\r\nbody";
+  spam_engine_auth_features_t f15c{};
+  spam_engine_extract_auth_features(surname_en.data(), surname_en.size(), &f15c);
+  test_support::check(f15c.display_impersonation == 0,
+      "'John Williams' aligned from gmail must NOT impersonate (surname is Tier-2)");
+
+  // The demotion keeps the surname-brand catchable: brand + role word holds the
+  // Tier-2 impersonation shape, and a free-host DKIM signer corroborates -> fires.
+  const std::string surname_phish =
+      "From: Dupont Billing <billing@dupont-notify.web.app>\r\n"
+      "Authentication-Results: mx; dkim=pass header.d=dupont-notify.web.app; dmarc=pass\r\n\r\nbody";
+  spam_engine_auth_features_t f15d{};
+  spam_engine_extract_auth_features(surname_phish.data(), surname_phish.size(), &f15d);
+  test_support::check(f15d.display_impersonation == 1,
+      "'Dupont Billing' free-host-signed IS impersonation (Tier-2 shape + corroboration)");
 
   // Regional precision preserved: a tld-swap aligned to itself WITHOUT a reply-hijack
   // stays clean (a header-only signal cannot tell paypal.co from legit paypal.de).
@@ -2406,6 +2561,34 @@ void test_decide_c_api() {
   test_support::check(std::string(bcout.label) == "spam",
         "brand offset does not exonerate a >=0.97 spam-side (ceiling)");
 
+  // Raw-IP body link (TASK-257): a 0.30 corroborator. It carries a borderline
+  // spam the model kept (spam-side 0.65) over the gate, but as a weak offset it
+  // must NOT set condemn_offset_fired (it never solo-condemns / can't authorize a
+  // destructive bounce on its own).
+  spam_engine_decision_input_t ip{};
+  ip.scores = {0.0f, 0.35f, 0.0f, 0.65f};
+  ip.ml_label = "marketing";
+  ip.ml_confidence = 0.65;
+  ip.raw_ip_url = 1;
+  ip.profile = SPAM_ENGINE_PROFILE_STANDARD;
+  spam_engine_decision_result_t ipout{};
+  spam_engine_decide(&ip, &ipout);
+  test_support::check(std::string(ipout.label) == "spam", "raw-IP link carries a 0.65 borderline over the gate");
+  test_support::check(ipout.adjusted_spam_side > 0.90, "0.65 + 0.30 clears the threshold");
+  test_support::check(ipout.condemn_offset_fired == 0,
+        "the weak 0.30 raw-IP offset must NOT set the bounce-authorizing flag");
+
+  // Raw-IP alone cannot condemn a clean message: spam-side 0.30 + 0.30 = 0.60 < 0.90.
+  spam_engine_decision_input_t ipc{};
+  ipc.scores = {0.0f, 0.70f, 0.0f, 0.30f};
+  ipc.ml_label = "marketing";
+  ipc.ml_confidence = 0.70;
+  ipc.raw_ip_url = 1;
+  ipc.profile = SPAM_ENGINE_PROFILE_STANDARD;
+  spam_engine_decision_result_t ipcout{};
+  spam_engine_decide(&ipc, &ipcout);
+  test_support::check(std::string(ipcout.label) != "spam", "raw-IP alone does not junk a clean message");
+
   // NULL args are rejected.
   test_support::check(spam_engine_decide(nullptr, &out) == SPAM_ENGINE_STATUS_INVALID_ARGUMENT,
         "null input rejected");
@@ -2518,6 +2701,12 @@ int main() {
   failures += test_support::run_test(
       "mode required + ensemble + classify_full (TASK-219)",
       test_mode_required_ensemble_and_classify_full);
+  failures += test_support::run_test(
+      "demo samples hold their decision class (TASK-266)",
+      test_demo_samples_decision);
+  failures += test_support::run_test(
+      "ambiguous surname-brands are shape-gated (TASK-268)",
+      test_ambiguous_surname_brands);
   failures += test_support::run_test(
       "RFC822 preprocessing fixes false-positive via C API",
       test_rfc822_preprocessing_fixes_false_positive_via_c_api);

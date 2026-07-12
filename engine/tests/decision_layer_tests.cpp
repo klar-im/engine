@@ -51,6 +51,7 @@ void test_constants() {
   check(near(dl::kSenderHistoryDomain, 0.05), "senderHistoryDomain == 0.05");
   check(near(dl::kSenderAuthFreeHost, 0.90), "senderAuthFreeHost == 0.90");
   check(near(dl::kSenderAuthThrowawaySigner, 0.90), "senderAuthThrowaway == 0.90");
+  check(near(dl::kUrlRawIp, 0.30), "urlRawIp == 0.30");
   check(near(dl::kThresholdStandard, 0.90), "threshold standard == 0.90");
   check(near(dl::kThresholdCautious, 0.95), "threshold cautious == 0.95");
 }
@@ -136,6 +137,32 @@ void test_fold_free_host_condemn() {
   check(v.fired[0].flipped_label == "spam", "sender_auth credited with the flip");
 }
 
+void test_fold_raw_ip_corroborates() {
+  std::printf("[fold: raw-IP link corroborates a borderline spam over the gate]\n");
+  // Model kept it just under the gate (spam-side 0.65, label "regular"); a bare-IP
+  // body link pushes it over. The 0.30 offset is what causes the condemn.
+  dl::Scores s{0.0, 0.10, 0.25, 0.65};
+  std::vector<dl::Offset> offs = {spamward("url_raw_ip", dl::kUrlRawIp)};
+  auto v = dl::fold(s, offs, 0.90, "regular", 0.55);
+  check(near(v.adjusted_spam_side, 0.95), "0.65 + 0.30 = 0.95");
+  check(v.label == "spam", "condemned to spam");
+  check(!v.train_ml, "train_ml FALSE on offset-driven condemn");
+  check(v.fired.size() == 1 && v.fired[0].flipped_label == "spam", "url_raw_ip credited with the flip");
+}
+
+void test_fold_raw_ip_cannot_solo_condemn_clean() {
+  std::printf("[fold: raw-IP alone can't flip a clean score over the gate]\n");
+  // A clean-ish message (spam-side 0.30) with a lone bare-IP link stays delivered:
+  // 0.30 + 0.30 = 0.60 < 0.90. Proves the modest magnitude corroborates only.
+  dl::Scores s{0.0, 0.20, 0.50, 0.30};
+  std::vector<dl::Offset> offs = {spamward("url_raw_ip", dl::kUrlRawIp)};
+  auto v = dl::fold(s, offs, 0.90, "regular", 0.70);
+  check(near(v.adjusted_spam_side, 0.60), "0.30 + 0.30 = 0.60");
+  check(v.label != "spam", "not condemned");
+  check(v.train_ml, "train_ml true (no offset-driven condemn)");
+  check(v.fired.size() == 1 && v.fired[0].flipped_label.empty(), "no flip credit (decision unchanged)");
+}
+
 void test_fold_ham_rescue() {
   std::printf("[fold: ham rescue by sender history]\n");
   // Model says spam (spam-side 0.95) but the user has emailed this sender a lot.
@@ -209,6 +236,8 @@ int main() {
   test_fold_clean_keep();
   test_fold_model_spam_kept();
   test_fold_free_host_condemn();
+  test_fold_raw_ip_corroborates();
+  test_fold_raw_ip_cannot_solo_condemn_clean();
   test_fold_ham_rescue();
   test_fold_spamward_no_condemn_when_model_already_spam();
   test_fold_condemn_counterfactual_score_already_over();

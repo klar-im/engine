@@ -42,11 +42,42 @@ inline constexpr double kSenderAuthThrowawaySigner = 0.90;  // throwaway-shape s
 inline constexpr double kDisplayImpersonation = 0.90;  // spam-ward: From display
                                   // claims a distinctive brand the domain isn't
                                   // (TASK-214) — strong, precision-first (0 ham FP)
+inline constexpr double kUrlRawIp = 0.30;  // spam-ward: a body link to a bare IP
+                                  // literal (TASK-257). Modest: corroborates, does
+                                  // not solo-condemn a clean score. See the URL-
+                                  // signals block below for why only this one wired.
 inline constexpr double kSenderAuthEstablishedBrand = 0.15;  // ham-ward: Tranco
                                   // brand / clean-ESP DKIM signer (TASK-170)
 inline constexpr double kBrandReputationCeiling = 0.97;  // don't rescue a spam-side
                                   // at/above this (a near-certain spam from a
                                   // popular-but-abused domain must not be exonerated)
+
+// ── Structural URL signals (TASK-257): only raw_ip_url wired ────────────────
+// Three candidates were built + ablated against this model on the real 739-spam /
+// 56-ham corpus, both gates (0.90 standard, 0.95 learning) x both modes (neural,
+// ensemble), rule-of-three CIs (pythonDiscovery/scripts/measure_url_structure.py).
+// Standalone rates look discriminative (shortener 7.2% spam / 0% ham, raw_ip
+// 3.1% / 0%, shared_bare_cdn 25.2% / 7.1%), but on THIS corpus none flips a
+// model-wrong verdict: shortener + raw-IP fire only on spam already condemned,
+// shared_bare_cdn's only rescues need a magnitude that would also FP legit mail.
+//   - raw_ip_url (kUrlRawIp above): WIRED as a modest 0.30 corroborator despite 0
+//     measured lift, on a priors argument the corpus can't test: a bare-IP host is
+//     ~never legitimate (real senders use domain names), so its 0/56 ham is
+//     STRUCTURAL, not sample-luck: it is provably inert on the eval set (fires
+//     on 0 ham) while adding cheap insurance against the out-of-sample raw-IP phish
+//     the model misses. 0.30 corroborates, never solo-condemns a clean score.
+//   - url_shortener: NOT wired. Its 0/56 ham is sample-luck: the set's natural
+//     members t.co / lnkd.in carry legit Twitter / LinkedIn mail absent from n=56,
+//     so a condemn-capable magnitude would FP on common legit mail. Zero lift too.
+//   - shared_bare_cdn: NOT wired. At the 0.95 gate a soft 0.10 push rescues 2-3
+//     real phish (googleapis / imgur) with 0 measured FP, but it ALSO fires on
+//     legit marketing hosting images on those same stores (a "Mudi 7" launch mail
+//     on storage.googleapis.com scores 0.992). 0 FP is luck on n=56; a soft push on
+//     such marketing in [0.85, gate) regresses the legit-marketing boundary
+//     (TASK-169) this product protects. Revisit only with a larger near-gate ham
+//     corpus proving 0 FP holds; the harness sweeps gates/modes/CIs to re-check.
+// Also measured non-discriminative, do not re-attempt: free-host-link (0.9% spam /
+// 3.6% ham, ham-ward) and many-link-domains (39% ham / 2% spam, a HAM signal).
 
 // ── Filtering-profile thresholds — mirror FilteringProfileSetting.swift ─────
 inline constexpr double kThresholdStandard = 0.90;

@@ -121,6 +121,7 @@ struct ClassificationResult {
   // Swift decision layer reads them off this result instead of re-parsing.
   ExtractedThreadFeatures thread_features;
   ExtractedAuthFeatures   auth_features;
+  ExtractedUrlFeatures    url_features;
 };
 
 /// Which scorers produce the verdict. REQUIRED — there is no silent default

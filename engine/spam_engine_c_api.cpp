@@ -86,6 +86,13 @@ void fill_auth_features(
   out->display_impersonation = features.display_impersonation ? 1 : 0;
 }
 
+void fill_url_features(
+    const spam_engine::ExtractedUrlFeatures& features,
+    spam_engine_url_features_t* out) {
+  std::memset(out, 0, sizeof(*out));
+  out->raw_ip_url = features.raw_ip_url ? 1 : 0;
+}
+
 }  // namespace
 
 extern "C" {
@@ -499,6 +506,7 @@ spam_engine_status_t spam_engine_classify_rfc822(
     if (out_signals != nullptr) {
       fill_thread_features(result.thread_features, &out_signals->thread);
       fill_auth_features(result.auth_features, &out_signals->auth);
+      fill_url_features(result.url_features, &out_signals->url);
     }
     return SPAM_ENGINE_STATUS_OK;
   } catch (const std::system_error&) {
@@ -783,6 +791,7 @@ void spam_engine_decision_input_from_signals(
   din->dkim_signing_org_domain = signals->auth.dkim_signing_domain;
   din->signer_throwaway = signals->auth.signer_throwaway;
   din->display_impersonation = signals->auth.display_impersonation;
+  din->raw_ip_url = signals->url.raw_ip_url;
   // Caller-state fields (phase2_match, exact/domain_send_count, profile) left as is.
 }
 
@@ -827,6 +836,14 @@ int spam_engine_decide(const spam_engine_decision_input_t* in,
   offsets.push_back({"display_impersonation",
                      in->display_impersonation != 0 ? dl::kDisplayImpersonation : 0.0,
                      dl::Direction::Spam});
+  // Bare-IP body link (TASK-257): a structural phishing tell. Modest magnitude,
+  // it corroborates rather than solo-condemns a clean message (a lone raw-IP link
+  // on an otherwise-ham score won't cross the gate), and the ablation showed no
+  // measured lift on the corpus, so this is precision-first insurance for the
+  // out-of-sample raw-IP phish the model misses, not a corpus-tuned catch.
+  offsets.push_back({"url_raw_ip",
+                     in->raw_ip_url != 0 ? dl::kUrlRawIp : 0.0,
+                     dl::Direction::Spam});
   // Established-brand / clean-ESP ham rescue (TASK-170): the ham-ward mirror of
   // the sender_auth spam push. Gating + short-circuit live in the named helper
   // (brand_reputation.h), mirrored by AuthFeatures.hamConfidenceOffset in Swift.
@@ -857,9 +874,19 @@ int spam_engine_decide(const spam_engine_decision_input_t* in,
   out->confidence = v.confidence;
   out->adjusted_spam_side = v.adjusted_spam_side;
   out->train_ml = v.train_ml ? 1 : 0;
+  // condemn_offset_fired is the "independent strong signal" a consumer (the
+  // milter) requires before a destructive REJECT/bounce, so it must reflect only
+  // AUTHORITATIVE spam-ward offsets, ones whose magnitude alone can carry a
+  // zero-neural message over the standard gate (free-host / throwaway / display-
+  // impersonation, all 0.90). The 0.30 raw-IP corroborator (TASK-257) fires but
+  // deliberately never solo-condemns, so it must NOT authorize a bounce on its
+  // own (a legit bare-IP link the model FPs would otherwise get bounced).
   out->condemn_offset_fired = 0;
   for (const auto& f : v.fired) {
-    if (f.direction == dl::Direction::Spam) { out->condemn_offset_fired = 1; break; }
+    if (f.direction == dl::Direction::Spam && f.magnitude >= dl::kThresholdStandard) {
+      out->condemn_offset_fired = 1;
+      break;
+    }
   }
   return SPAM_ENGINE_STATUS_OK;
 }
@@ -910,6 +937,7 @@ spam_engine_status_t spam_engine_classify_full(
     out->decided_by[sizeof(out->decided_by) - 1] = '\0';
     fill_thread_features(r.thread_features, &out->signals.thread);
     fill_auth_features(r.auth_features, &out->signals.auth);
+    fill_url_features(r.url_features, &out->signals.url);
 
     // Stage 3: fold the structural offsets onto the ENSEMBLE spam side. Reuse
     // spam_engine_decide so the fold can never drift from the standalone path.

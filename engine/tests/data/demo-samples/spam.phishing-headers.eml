@@ -1,0 +1,8 @@
+From: Account Security <no-reply@account-verify.example>
+To: you@example.com
+Subject: Urgent: your account will be suspended
+Authentication-Results: mx.example.com; dkim=pass header.d=login-secure-app.web.app; spf=pass; dmarc=fail
+Content-Type: text/plain; charset=utf-8
+
+We detected unusual sign-in activity on your account. To avoid permanent suspension, verify your identity within 24 hours: http://account-verify-secure.example/login
+Failure to confirm will result in loss of access to your photos and files.

@@ -392,6 +392,7 @@ ClassificationResult SpamEngine::classify_rfc822(
   // than copy them (the lambda above already consumed its normalized text).
   result.thread_features = std::move(preprocessed.thread_features);
   result.auth_features = std::move(preprocessed.auth_features);
+  result.url_features = preprocessed.url_features;
   return result;
 }
 

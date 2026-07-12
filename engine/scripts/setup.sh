@@ -89,11 +89,11 @@ fi
 echo "[setup] Downloading models..."
 # infra/scripts/download-models.sh fetches the canonical (closed) weights and is
 # NOT part of the open-core publish set. In the public repo it is absent, so we
-# skip it: open-core builds get a model via `make import-demo` instead.
+# skip it: open-core builds get a model via `make import` instead.
 if [ -x "$REPO_ROOT/infra/scripts/download-models.sh" ]; then
     "$REPO_ROOT/infra/scripts/download-models.sh" "$ENGINE_DIR/model"
 else
-    echo "[setup] download-models.sh absent (open-core build) — skipping canonical weights; run 'make import-demo' to fetch the demo model."
+    echo "[setup] download-models.sh absent (open-core build); skipping canonical weights. Run 'make import' to fetch the model."
 fi
 
 # =============================================================================
