@@ -15,7 +15,7 @@
 // search over these hashes has no such error.
 //
 // Constants are the canonical FNV-1a 64-bit offset basis / prime. Cross-language
-// parity is pinned by pythonDiscovery/test_decision_layer_sync.py (brand data)
+// parity is pinned by model-lab/test_decision_layer_sync.py (brand data)
 // and engine/tests/url_blocklist_tests.cpp (host hashes).
 
 #include <cstdint>
@@ -26,7 +26,9 @@ namespace spam_engine {
 inline std::uint64_t fnv1a_lower(const std::string& s) {
   std::uint64_t h = 0xCBF29CE484222325ULL;
   for (unsigned char c : s) {
-    if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c - 'A' + 'a');
+    if (c >= 'A' && c <= 'Z') { { c = static_cast<unsigned char>(c - 'A' + 'a');
+}
+}
     h ^= c;
     h *= 0x100000001B3ULL;  // wraps mod 2^64
   }

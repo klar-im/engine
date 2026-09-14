@@ -1,5 +1,7 @@
+#include "auth_results.h"
 #include "config.h"
 #include "model_runtime.h"
+#include "origin_ip_blocklist.h"
 #include "policy.h"
 #include <fstream>
 #include <sstream>
@@ -18,10 +20,14 @@
 static void print_usage(const char* argv0) {
     fprintf(stderr,
         "Usage:\n"
-        "  %s --config <path> --eml <path> --json\n"
+        "  %s --config <path> --eml <path> --json [--connect-ip <addr>]\n"
         "    Classify an .eml file and output JSON.\n"
         "\n"
         "Options:\n"
+        "  --connect-ip      IP the message was received from, as the MTA observed\n"
+        "                    it. Checked against the DROP list (TASK-113); this is\n"
+        "                    how the milter's per-connection signal is reproduced\n"
+        "                    offline, since klar-milterd needs Linux to build.\n"
         "  --version         Print version and exit\n"
         "  --help            Print this help and exit\n",
         argv0);
@@ -79,6 +85,7 @@ static std::string escape_json_string(const std::string& s) {
 static int cmd_classify(int argc, char* argv[]) {
     std::string config_path;
     std::string eml_path;
+    std::string connect_ip;
     bool json_output = false;
 
     for (int i = 0; i < argc; ++i) {
@@ -86,6 +93,14 @@ static int cmd_classify(int argc, char* argv[]) {
             config_path = argv[++i];
         } else if (strcmp(argv[i], "--eml") == 0 && i + 1 < argc) {
             eml_path = argv[++i];
+        } else if (strcmp(argv[i], "--connect-ip") == 0) {
+            // A bare --connect-ip would otherwise classify with no address and
+            // report connect_ip_blocked:false, i.e. a typo reads as "clean".
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --connect-ip requires an address argument\n");
+                return 2;
+            }
+            connect_ip = argv[++i];
         } else if (strcmp(argv[i], "--json") == 0) {
             json_output = true;
         }
@@ -143,13 +158,38 @@ static int cmd_classify(int argc, char* argv[]) {
         fprintf(stderr, "error: eml file is empty: %s\n", eml_path.c_str());
         return 2;
     }
+    // Same bytes the milter would hand the engine under this config: with
+    // auth_results = "ignore" the daemon drops these headers as libmilter
+    // delivers them (milter_server.cpp xxfi_header); a whole .eml gets the
+    // equivalent strip here, so a replay reproduces the daemon's verdict.
+    if (klar::ignores_auth_results(cfg)) {
+        raw_email = klar::strip_authentication_results(raw_email);
+    }
+
+    // Origin-IP reputation, resolved exactly as the milter resolves it (TASK-113).
+    klar::OriginIpBlocklist ip_blocklist;
+    ip_blocklist.load(cfg);
+    // A --connect-ip against no list always answers "clean", which is the wrong
+    // answer to give the tool the README names as the way to verify this feature
+    // (the default path does not exist on a dev machine). Say so rather than
+    // print a false negative.
+    if (!connect_ip.empty() && ip_blocklist.size() == 0) {
+        fprintf(stderr,
+                "warning: --connect-ip given but no IP blocklist loaded from '%s'; "
+                "connect_ip_blocked will be false for every address. "
+                "Build one with `make model-lab/build-ip-blocklist`.\n",
+                cfg.ip_blocklist_path.c_str());
+    }
+    const bool connect_ip_blocked = ip_blocklist.contains(connect_ip);
 
     // Extract From header for policy evaluation
     std::string sender_email = extract_from_email(raw_email);
 
     // Classify
     auto t0 = std::chrono::steady_clock::now();
-    klar::ClassifyResult cr = runtime.classify_rfc822(raw_email, "", sender_email);
+    klar::ClassifyResult cr = runtime.classify_rfc822(raw_email, "", sender_email,
+                                                      connect_ip_blocked,
+                                                      /*header_ip_blocked=*/false);
     auto t1 = std::chrono::steady_clock::now();
     double latency_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -182,8 +222,12 @@ static int cmd_classify(int argc, char* argv[]) {
            "  \"score_gibberish\": %s,\n"
            "  \"score_spam_adjusted\": %s,\n"
            "  \"label\": \"%s\",\n"
+           "  \"class\": \"%s\",\n"
            "  \"action\": \"%s\",\n"
            "  \"latency_ms\": %s,\n"
+           "  \"connect_ip_blocked\": %s,\n"
+           "  \"policy_reason\": \"%s\",\n"
+           "  \"fired_offsets\": \"%s\",\n"
            "  \"status\": \"%s\",\n"
            "  \"error\": \"%s\"\n"
            "}\n",
@@ -192,8 +236,12 @@ static int cmd_classify(int argc, char* argv[]) {
            escape_json_string(cfg.profile).c_str(),
            score_spam, score_regular, score_marketing, score_gibberish, score_spam_adjusted,
            escape_json_string(pr.label).c_str(),
+           escape_json_string(pr.klass).c_str(),
            escape_json_string(action_str).c_str(),
            latency_buf,
+           connect_ip_blocked ? "true" : "false",
+           escape_json_string(pr.policy_reason).c_str(),
+           escape_json_string(cr.fired_offsets).c_str(),
            escape_json_string(pr.status).c_str(),
            escape_json_string(error_str).c_str());
 

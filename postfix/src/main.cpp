@@ -46,14 +46,14 @@ static void print_usage(const char* argv0) {
         "Usage: %s [OPTIONS]\n"
         "\n"
         "Options:\n"
-        "  --config <path>   Config file (default: /etc/klar/postfix.toml)\n"
+        "  --config <path>   Config file (default: /etc/klar/klar-milterd.toml)\n"
         "  --version         Print version and exit\n"
         "  --help            Print this help and exit\n",
         argv0);
 }
 
 int main(int argc, char* argv[]) {
-    std::string config_path = "/etc/klar/postfix.toml";
+    std::string config_path = "/etc/klar/klar-milterd.toml";
 
     // --- Parse CLI args ---
     for (int i = 1; i < argc; ++i) {
@@ -109,6 +109,26 @@ int main(int argc, char* argv[]) {
                 "model loaded, version=" + runtime.loaded_model_version());
     }
 
+    // Origin-IP reputation (TASK-113). Loaded independently of the model: a cron
+    // refreshes it, model releases do not, and a model failure must not disable
+    // an unrelated signal. Say out loud which of the three states we are in —
+    // "off by config" and "off because the artifact was never provisioned" look
+    // identical at runtime otherwise, and the second is a degraded filter.
+    klar::OriginIpBlocklist ip_blocklist;
+    switch (ip_blocklist.load(*cfg)) {
+        case klar::OriginIpBlocklist::Reload::Disabled:
+            log_msg(cfg->log_json, "info", "ip blocklist not configured, origin-IP signal off");
+            break;
+        case klar::OriginIpBlocklist::Reload::Failed:
+            log_msg(cfg->log_json, "warn",
+                    "ip blocklist configured but not loaded, origin-IP signal off: " +
+                    cfg->ip_blocklist_path);
+            break;
+        case klar::OriginIpBlocklist::Reload::Loaded:
+            log_msg(cfg->log_json, "info", "ip blocklist loaded, " + ip_blocklist.status());
+            break;
+    }
+
     // --- Smoke inference ---
     if (runtime.is_loaded()) {
         const char* smoke_email =
@@ -118,7 +138,9 @@ int main(int argc, char* argv[]) {
             "\r\n"
             "This is a smoke test email.\r\n";
 
-        auto result = runtime.classify_rfc822(smoke_email, "", "smoke@test.local");
+        auto result = runtime.classify_rfc822(smoke_email, "", "smoke@test.local",
+                                              /*connect_ip_blocked=*/false,
+                                              /*header_ip_blocked=*/false);
         if (!result.ok) {
             log_msg(cfg->log_json, "error",
                     "smoke inference failed: " + result.error);
@@ -161,7 +183,22 @@ int main(int argc, char* argv[]) {
 
     // --- Set global state for milter callbacks ---
     klar::ServerState state;
-    klar::set_global_state(cfg, &runtime, &store, &state);
+    // Trusted relays (TASK-387). validate_config already proved these parse, so a
+    // failure here would be a bug, not operator error.
+    klar::TrustedRelays relays;
+    std::string relay_err;
+    if (!relays.load(cfg->trusted_relay_cidrs, &relay_err)) {
+        log_msg(cfg->log_json, "error", "trusted relays: " + relay_err);
+        return 2;
+    }
+    klar::set_trusted_relays(relays);
+    if (!cfg->trusted_relay_cidrs.empty()) {
+        log_msg(cfg->log_json, "info",
+                "behind " + std::to_string(relays.size()) +
+                " trusted relay range(s): origin IP read from the Received chain");
+    }
+
+    klar::set_global_state(cfg, &runtime, &store, &state, &ip_blocklist);
 
     // --- Start health server ---
     klar::HealthServer health;
@@ -169,8 +206,8 @@ int main(int argc, char* argv[]) {
         bool ok = health.start(
             cfg->health_listen,
             [&runtime]() -> bool { return runtime.is_loaded(); },
-            [&state, &runtime]() -> std::string {
-                return klar::generate_metrics(state, runtime);
+            [&state, &runtime, &ip_blocklist]() -> std::string {
+                return klar::generate_metrics(state, runtime, ip_blocklist);
             });
         if (ok) {
             log_msg(cfg->log_json, "info",
@@ -198,7 +235,8 @@ int main(int argc, char* argv[]) {
     // --- SIGHUP reload watcher thread ---
     // Capture listen address — changing it requires restart, not reload.
     std::string frozen_listen = cfg->listen;
-    std::thread reload_thread([&cfg, &runtime, &config_path, frozen_listen]() {
+    std::thread reload_thread([&cfg, &runtime, &ip_blocklist, &config_path,
+                               frozen_listen]() {
         while (!g_shutdown_requested) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (g_reload_requested) {
@@ -218,6 +256,38 @@ int main(int argc, char* argv[]) {
                     if (runtime.reload_if_needed(*new_cfg)) {
                         log_msg(cfg->log_json, "info",
                                 "model reloaded, version=" + runtime.loaded_model_version());
+                    }
+                    // Trusted relays can change with the deployment topology, so
+                    // they reload with the config rather than needing a restart.
+                    klar::TrustedRelays new_relays;
+                    std::string new_relay_err;
+                    if (new_relays.load(new_cfg->trusted_relay_cidrs, &new_relay_err)) {
+                        klar::set_trusted_relays(new_relays);
+                    } else {
+                        // validate_config already rejected this, so reaching here
+                        // means a bug; keep the previous set rather than silently
+                        // trusting nothing.
+                        log_msg(cfg->log_json, "error",
+                                "reload: " + new_relay_err + " (keeping previous relays)");
+                    }
+                    // The DROP list is refreshed by a cron, not by a model
+                    // release, so it reloads on every SIGHUP rather than riding
+                    // reload_if_needed's version check (TASK-113).
+                    switch (ip_blocklist.load(*new_cfg)) {
+                        case klar::OriginIpBlocklist::Reload::Loaded:
+                            log_msg(cfg->log_json, "info",
+                                    "ip blocklist reloaded, " + ip_blocklist.status());
+                            break;
+                        case klar::OriginIpBlocklist::Reload::Failed:
+                            // Kept the previous list. Say so loudly: this is what
+                            // a cron writing a truncated artifact looks like, and
+                            // it would otherwise pass for a healthy refresh.
+                            log_msg(cfg->log_json, "error",
+                                    "ip blocklist reload FAILED, keeping previous "
+                                    "list: " + new_cfg->ip_blocklist_path);
+                            break;
+                        case klar::OriginIpBlocklist::Reload::Disabled:
+                            break;
                     }
                     // Preserve listen address (requires restart to change)
                     // const_cast is safe: we own this object and haven't published it yet

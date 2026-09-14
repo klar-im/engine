@@ -55,10 +55,11 @@ inline std::string& native_log_buffer() {
 }
 
 inline void native_log_callback(ggml_log_level /*level*/, const char* text, void* /*user*/) {
-  if (text == nullptr) return;
+  if (text == nullptr) { return;
+}
   // Keep dev/CLI behaviour unchanged: ggml normally prints to stderr.
   std::fputs(text, stderr);
-  std::lock_guard<std::mutex> lock(native_log_mutex());
+  std::scoped_lock const lock(native_log_mutex());
   std::string& buffer = native_log_buffer();
   buffer.append(text);
   constexpr size_t kMaxNativeLog = 4096;  // keep only the recent tail
@@ -68,10 +69,63 @@ inline void native_log_callback(ggml_log_level /*level*/, const char* text, void
 }
 
 inline std::string drain_native_log() {
-  std::lock_guard<std::mutex> lock(native_log_mutex());
+  std::scoped_lock const lock(native_log_mutex());
   std::string out = native_log_buffer();
   native_log_buffer().clear();
   return out;
+}
+
+// True once process exit has torn down, or is about to tear down, ggml's own
+// statics. See install_exit_teardown_guard() for why this exists and why the
+// flag is set where it is.
+inline bool& ggml_exit_teardown_started() {
+  static bool started = false;
+  return started;
+}
+
+// Freeing a llama_context after ggml's backend statics are gone is a wild jump
+// through a dangling function pointer, not a clean no-op: the process dies in
+// llama_context::~llama_context with SIGBUS/SIGSEGV. That is reachable whenever
+// teardown is deferred to an atexit handler, because handlers run in reverse
+// registration order and the ggml backend plugins are dlopen'd LAZILY on the
+// first load — so a handler a caller registered at startup (the natural place)
+// always runs AFTER ggml has already torn itself down.
+//
+// This guard makes that ordering safe for every binding instead of asking each
+// one to get the rule right. Registering here, immediately after the first
+// successful load, is what makes it work: everything ggml registers it
+// registers during that load, so this handler runs BEFORE all of it. Callers
+// that tear down properly (explicitly, or from a handler registered after a
+// load) run earlier still and see the flag clear, so they do the real work.
+// Anything running after this point deliberately leaks the model instead: the
+// process is exiting, and GGML_METAL_NO_RESIDENCY=1 (set below) means an
+// undestroyed handle no longer trips libggml-metal's residency-set assert.
+inline void install_exit_teardown_guard() {
+  static std::once_flag guard_flag;
+  std::call_once(guard_flag, [] {
+    std::atexit([] { ggml_exit_teardown_started() = true; });
+  });
+}
+
+// Disable ggml's Metal residency-set optimization (ggml 0.17+). It has a
+// teardown-tracking bug that aborts on model UNLOAD for some models
+// (GGML_ASSERT([rsets->data count] == 0), ggml-metal-device.m). Production
+// reloads models (SpamTrainer night-training, SpamEngineClient swap), so it
+// would crash. Validated 2026-07-28: eliminates the abort with no memory leak
+// (RSS plateaus across 12 load/unload cycles) and no latency change (residency
+// sets help batched work, not per-email classify). Must run before the Metal
+// device is created, and before any getenv() anywhere in the process can
+// observe a partial write to environ — hence its own call_once, called both
+// from GgmlEncoder::load() and from SpamEngine::load() before that function's
+// own getenv() calls, so two SpamEngine instances loading concurrently for
+// the first time serialize on it instead of racing (codex review, TASK-478).
+// overwrite=0 respects an explicit override.
+inline void ensure_ggml_env_configured() {
+  static std::once_flag flag;
+  std::call_once(flag, [] {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe) — call_once makes this race-free.
+    setenv("GGML_METAL_NO_RESIDENCY", "1", 0);
+  });
 }
 
 class GgmlEncoder {
@@ -79,12 +133,19 @@ class GgmlEncoder {
   GgmlEncoder() = default;
 
   ~GgmlEncoder() {
-    if (ctx_) llama_free(ctx_);
-    if (model_) llama_model_free(model_);
+    // Leak deliberately rather than crash; see install_exit_teardown_guard().
+    if (ggml_exit_teardown_started()) { return;
+}
+    if (ctx_) { llama_free(ctx_);
+}
+    if (model_) { llama_model_free(model_);
+}
   }
 
   GgmlEncoder(const GgmlEncoder&) = delete;
   GgmlEncoder& operator=(const GgmlEncoder&) = delete;
+  GgmlEncoder(GgmlEncoder&&) = delete;
+  GgmlEncoder& operator=(GgmlEncoder&&) = delete;
 
   // Smallest cap that produces a sensible encoding: BOS + a handful of content
   // tokens + EOS. Below this the head sees almost nothing useful and CLS
@@ -98,37 +159,55 @@ class GgmlEncoder {
           " below minimum " + std::to_string(kMinMaxTokens));
     }
     max_tokens_ = max_tokens;
+    // Must happen before the Metal device is created (TASK-367); its own
+    // call_once (see ensure_ggml_env_configured) is what makes it race-free
+    // against SpamEngine::load()'s getenv() calls, not this one below.
+    ensure_ggml_env_configured();
     // ggml_backend_load_all() registers backends from shared libs; calling it
     // multiple times within a process exceeds GGML_SCHED_MAX_BACKENDS.
     // Guard with call_once so tests that create multiple engines don't abort.
     static std::once_flag init_flag;
-    std::call_once(init_flag, []() {
+    std::call_once(init_flag, [] {
       // Route ggml/llama logs through our capture so a backend-load failure can
       // report why (installed before load_all so the backend-registration log
       // is captured too).
       ggml_log_set(native_log_callback, nullptr);
       llama_log_set(native_log_callback, nullptr);
 
-      ggml_backend_load_all();
-      // ggml_backend_load_all() searches the EXECUTABLE's directory (and CWD)
-      // for dynamic backend plugins. When this library is dlopen'd by a host
-      // we don't control — python ctypes, the Mail extension — the executable
-      // is python/Mail itself, so on dynamic-backend ggml builds (the Linux
-      // release tarball, and Homebrew ggml on macOS) nothing loads and model
-      // load fails with "no backends are loaded". Fall back to the directory
-      // this code was loaded from: the engine cmake / the app bundler stages the
-      // ggml backend plugins next to the engine libs (postfix + the Mail
-      // extension rely on the same staging). Skipped when load_all already found
-      // backends (a dev macOS brew ggml resolves its own via its compiled-in
-      // GGML_BACKEND_DIR; static-backend builds register at link time).
+      // OUR plugins first. The engine cmake and the app bundler both stage the
+      // ggml backend plugins next to the engine libs, so the directory this
+      // code was loaded from holds the exact plugins we ship, sign and test.
+      // Loading them by path is deterministic and needs no other directory to
+      // be readable.
+      //
+      // ggml_backend_load_all() is the fallback, and it must stay a fallback:
+      // besides the executable directory and CWD it enumerates the
+      // GGML_BACKEND_DIR compiled into libggml, which for the Homebrew build we
+      // ship is /opt/homebrew/Cellar/ggml/<v>/libexec. On a developer Mac that
+      // path EXISTS but is unreadable from inside the Mail-extension sandbox,
+      // and fs::directory_iterator throws rather than skipping it. Running it
+      // first therefore killed model load before our own plugins were ever
+      // tried, and the appex silently classified nothing. Both calls are
+      // wrapped: an unreadable search path is not a reason to fail.
       std::string searched_dir;
-      if (ggml_backend_dev_count() == 0) {
-        Dl_info info{};
-        if (dladdr(reinterpret_cast<const void*>(&backend_plugin_dir_anchor), &info) != 0
-            && info.dli_fname != nullptr) {
-          searched_dir = std::filesystem::path(info.dli_fname).parent_path().string();
-          ggml_backend_load_all_from_path(searched_dir.c_str());
+      std::string load_error;
+      auto const try_load = [&load_error](auto&& fn) {
+        try {
+          fn();
+        } catch (const std::exception& e) {
+          if (load_error.empty()) { load_error = e.what();
+}
         }
+      };
+
+      Dl_info info{};
+      if (dladdr(reinterpret_cast<const void*>(&backend_plugin_dir_anchor), &info) != 0
+          && info.dli_fname != nullptr) {
+        searched_dir = std::filesystem::path(info.dli_fname).parent_path().string();
+        try_load([&] { ggml_backend_load_all_from_path(searched_dir.c_str()); });
+      }
+      if (ggml_backend_dev_count() == 0) {
+        try_load([] { ggml_backend_load_all(); });
       }
 
       // Hard-fail with a descriptive, Swift-visible reason if still no backend.
@@ -137,21 +216,30 @@ class GgmlEncoder {
       // the C ABI returned an empty "Unknown error". Turn it into a real error.
       if (ggml_backend_dev_count() == 0) {
         throw std::runtime_error(
-            std::string("ggml registered no compute backends (searched the "
-                        "executable directory") +
-            (searched_dir.empty() ? std::string()
-                                  : std::string(" and '") + searched_dir + "'") +
+            std::string("ggml registered no compute backends (searched ") +
+            (searched_dir.empty() ? std::string("the executable directory")
+                                  : "'" + searched_dir + "' and the executable "
+                                                         "directory") +
             "); the ggml backend plugin libraries are missing next to the engine "
-            "library. Native log: " + drain_native_log());
+            "library. " +
+            (load_error.empty() ? std::string()
+                                : "Loader error: " + load_error + ". ") +
+            "Native log: " + drain_native_log());
       }
 
       llama_backend_init();
     });
     // SPAM_ENGINE_NO_GPU forces CPU (n_gpu=0) — lets the backend-parity probe
     // measure CI-CPU vs prod-Metal divergence on the same model (TASK-204).
+    // the only setenv() in this class runs inside the call_once above, so by
+    // this point env mutation is done.
     const int default_gpu_layers =
+        // NOLINTNEXTLINE(concurrency-mt-unsafe)
         std::getenv("SPAM_ENGINE_NO_GPU") != nullptr ? 0 : 99;
     load_with_gpu_layers(gguf_path, default_gpu_layers);
+    // After the load, never before: ggml's device statics are constructed
+    // lazily during it, and this must be registered later than all of them.
+    install_exit_teardown_guard();
   }
 
   std::vector<std::vector<float>> embed_batch(const std::vector<std::string>& texts) {
@@ -165,7 +253,11 @@ class GgmlEncoder {
 
   // Embedding dimension of the loaded model (0 before load). Fixed for the
   // model's lifetime, so callers size output buffers from this exactly once.
-  int n_embd() const noexcept { return n_embd_; }
+  [[nodiscard]] int n_embd() const noexcept { return n_embd_; }
+
+  // True only when this loaded instance requested offload, a GPU backend was
+  // registered, and context creation succeeded without the CPU fallback.
+  [[nodiscard]] bool uses_gpu() const noexcept { return uses_gpu_; }
 
  private:
   // Pre-truncation tokenize buffer. Large enough to absorb any realistic email
@@ -177,6 +269,7 @@ class GgmlEncoder {
   llama_context*     ctx_   = nullptr;
   const llama_vocab* vocab_ = nullptr;
   int                n_embd_ = 0;
+  bool               uses_gpu_ = false;
   // Persistent buffer to avoid per-call allocation churn during batch
   // embedding (training processes hundreds/thousands of samples).
   std::vector<llama_token> token_buf_;
@@ -202,8 +295,8 @@ class GgmlEncoder {
     // (buffer-too-small) return — without this, the persistent buffer
     // could expose stale tokens from the previous email.
     token_buf_.assign(kTokenBufSize, 0);
-    int n = llama_tokenize(vocab_, text.c_str(), (int32_t)text.size(),
-                           token_buf_.data(), (int32_t)token_buf_.size(),
+    int n = llama_tokenize(vocab_, text.c_str(), static_cast<int32_t>(text.size()),
+                           token_buf_.data(), static_cast<int32_t>(token_buf_.size()),
                            /*add_special=*/true, /*parse_special=*/false);
     if (n < 0) {
       // Buffer too small: llama_tokenize wrote NOTHING and returns -(required
@@ -215,8 +308,8 @@ class GgmlEncoder {
       // doesn't ratchet up to a huge email's token count for the process life.
       const int needed = -n;
       std::vector<llama_token> scratch(needed, 0);
-      int cnt = llama_tokenize(vocab_, text.c_str(), (int32_t)text.size(),
-                               scratch.data(), (int32_t)scratch.size(),
+      int cnt = llama_tokenize(vocab_, text.c_str(), static_cast<int32_t>(text.size()),
+                               scratch.data(), static_cast<int32_t>(scratch.size()),
                                /*add_special=*/true, /*parse_special=*/false);
       if (cnt < 0) {
         // Exact-size buffer should always succeed; guard defensively.
@@ -250,7 +343,7 @@ class GgmlEncoder {
     llama_memory_clear(llama_get_memory(ctx_), /*data=*/false);
 
     // Encode as a single sequence (seq_id = 0 via batch_get_one).
-    auto batch = llama_batch_get_one(token_buf_.data(), (int32_t)token_buf_.size());
+    auto const batch = llama_batch_get_one(token_buf_.data(), static_cast<int32_t>(token_buf_.size()));
     if (llama_encode(ctx_, batch) != 0) {
       throw std::runtime_error("GgmlEncoder: llama_encode failed");
     }
@@ -260,7 +353,7 @@ class GgmlEncoder {
     if (!emb) {
       throw std::runtime_error("GgmlEncoder: embedding extraction returned null (pooling misconfigured?)");
     }
-    return std::vector<float>(emb, emb + n_embd_);
+    return {emb, emb + n_embd_};
   }
 
   // Try to load with the given GPU layer count. If context creation fails
@@ -273,6 +366,17 @@ class GgmlEncoder {
   // rather than repeating the failed init. The backend registry is
   // process-global and initialized once via call_once above.
   void load_with_gpu_layers(const std::string& gguf_path, int n_gpu_layers) {
+    // ggml 0.17 may still choose an initialized Metal backend for context work
+    // when model layers and KQV are CPU-only. That breaks the documented
+    // SPAM_ENGINE_NO_GPU contract in sandboxes/VMs where Metal is present but
+    // cannot create a command queue. Explicit CPU mode is process-wide, so unload
+    // MTL before model/context creation just as the GPU-failure fallback does.
+    if (n_gpu_layers == 0) {
+      auto *metal_reg = ggml_backend_reg_by_name("MTL");
+      if (metal_reg) { ggml_backend_unload(metal_reg);
+}
+    }
+
     auto mparams = llama_model_default_params();
     mparams.n_gpu_layers = n_gpu_layers;
 
@@ -299,7 +403,15 @@ class GgmlEncoder {
     cparams.n_ctx = max_tokens_;
     cparams.n_batch = max_tokens_;
     cparams.embeddings = true;
+    // Pooling defaults to CLS (XLM-RoBERTa). ModernBERT-family bases (e.g. mmBERT)
+    // train with MEAN pooling; override per-model with SPAM_ENGINE_POOLING=mean.
+    // (Measurement hook for the base-model bake-off; TASK-364 makes it manifest-driven.)
     cparams.pooling_type = LLAMA_POOLING_TYPE_CLS;
+    // NOLINTNEXTLINE(concurrency-mt-unsafe) — see the getenv() note above.
+    if (const char* pool = std::getenv("SPAM_ENGINE_POOLING"); pool && (std::string(pool) == "mean")) {
+      cparams.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+}
+
     // Encoder-only model: no autoregressive decoding, KV offload irrelevant.
     // Disabling avoids Metal init when n_gpu_layers=0 (e.g. sandbox/CPU fallback).
     cparams.offload_kqv = (n_gpu_layers > 0);
@@ -308,8 +420,9 @@ class GgmlEncoder {
     if (!ctx_ && n_gpu_layers > 0) {
       // GPU init failed (e.g. Metal blocked in sandbox) — retry CPU-only.
       // Unload MTL so context init doesn't try to init it again on retry.
-      auto metal_reg = ggml_backend_reg_by_name("MTL");
-      if (metal_reg) ggml_backend_unload(metal_reg);
+      auto *metal_reg = ggml_backend_reg_by_name("MTL");
+      if (metal_reg) { ggml_backend_unload(metal_reg);
+}
       llama_model_free(model_);
       model_ = nullptr;
       load_with_gpu_layers(gguf_path, 0);
@@ -320,6 +433,10 @@ class GgmlEncoder {
       model_ = nullptr;
       throw std::runtime_error("GgmlEncoder: failed to create context");
     }
+
+    uses_gpu_ = n_gpu_layers > 0 &&
+        (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr ||
+         ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr);
 
     n_embd_ = llama_model_n_embd(model_);
     vocab_ = llama_model_get_vocab(model_);

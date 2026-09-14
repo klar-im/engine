@@ -1,0 +1,7 @@
+{
+  "_comment": "Patch for the SenderAuth singleton. The engine reads Authentication-Results and Stalwart writes its own AFTER the milters have run (data.rs :504 vs :602), so klar-milterd runs with auth_results = ignore and never sees a DMARC result. Stalwart itself still verifies; strict makes it refuse a message that fails DMARC under a p=reject policy at SMTP time (data.rs :388), which is the one AR-derived condemn the engine gives up. Kept to port 25 like the default: submission is authenticated and never DMARC-checked.",
+  "dmarcVerify": {
+    "match": { "0": { "if": "local_port == 25", "then": "strict" } },
+    "else": "disable"
+  }
+}

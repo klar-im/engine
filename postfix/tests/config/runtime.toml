@@ -15,3 +15,7 @@ health_listen = "0.0.0.0:8892"
 health_allow_public = true  # firewalled E2E container: orchestrator reads readiness
 
 event_store_path = "/var/lib/klar/events.sqlite3"
+
+# Staging probe's reject leg: exercises the live 550 path hourly
+# (blocklist REJECT applies in tag mode too; see policy.cpp).
+blocklist_senders = ["reject-probe@blocklisted.example"]

@@ -1,0 +1,23 @@
+Authentication-Results: mail.example; dkim=pass header.d=paypal.com header.i=@paypal.com header.s=pp-dkim1 header.b=Zm9yZ2Vk; spf=pass smtp.mailfrom=paypal.com; dmarc=pass header.from=paypal.com
+Received: from mail-out.evil-relay.example ([203.0.113.45]) by mail.example with ESMTP id forged001 for <victim@example.com>; Mon, 08 Sep 2026 09:00:00 +0000
+From: PayPal <service@paypal.com>
+To: victim@example.com
+Subject: Your account has been limited - verify now to avoid permanent suspension
+Date: Mon, 08 Sep 2026 09:00:00 +0000
+Message-ID: <forged-ar-brand-001@paypal.com>
+Content-Type: text/plain; charset=UTF-8
+
+Dear Customer,
+
+We detected unusual activity and your PayPal account access has been LIMITED.
+
+To restore full access you must confirm your identity within 24 hours or your
+account will be permanently suspended and your funds withheld.
+
+Verify your account now: http://paypal-secure-verify.example/restore?id=88213
+
+Enter your login, password, card number and CVV to complete verification.
+
+Failure to act immediately will result in permanent closure.
+
+PayPal Security Department

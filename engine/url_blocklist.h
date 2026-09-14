@@ -3,7 +3,7 @@
 // Phishing-domain blocklist lookup (TASK-201 — URL/link reputation).
 //
 // Loads the bundled sorted-hash artifact built by
-// pythonDiscovery/scripts/build_phishing_blocklist.py (the MIT Phishing.Database
+// model-lab/scripts/build_phishing_blocklist.py (the MIT Phishing.Database
 // ACTIVE list) and answers contains(host) by FNV-1a hash + binary search — fully
 // offline, no per-message network (the SURBL/URIBL privacy constraint).
 //
@@ -36,9 +36,11 @@ class UrlBlocklist {
   bool load(const std::string& path) {
     hashes_.clear();
     std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) return false;
+    if (f == nullptr) { return false;
+}
     char magic[8];
-    uint32_t bits = 0, count = 0;
+    uint32_t bits = 0;
+    uint32_t count = 0;
     bool ok = std::fread(magic, 1, 8, f) == 8 &&
               std::memcmp(magic, "KLARPB1\0", 8) == 0 &&
               std::fread(&bits, 4, 1, f) == 1 && std::fread(&count, 4, 1, f) == 1 &&
@@ -70,19 +72,22 @@ class UrlBlocklist {
     return true;
   }
 
-  bool loaded() const { return !hashes_.empty(); }
-  std::size_t size() const { return hashes_.size(); }
+  [[nodiscard]] bool loaded() const { return !hashes_.empty(); }
+  [[nodiscard]] std::size_t size() const { return hashes_.size(); }
 
   // Exact FQDN match. Binary search over the ascending hash array; fnv1a_lower
   // lowercases so a mixed-case host still matches the lowercase-built blocklist.
-  bool contains(const std::string& host) const {
-    if (hashes_.empty() || host.empty()) return false;
+  [[nodiscard]] bool contains(const std::string& host) const {
+    if (hashes_.empty() || host.empty()) { return false;
+}
     const uint64_t h = fnv1a_lower(host);
-    std::size_t lo = 0, hi = hashes_.size();
+    std::size_t lo = 0;
+    std::size_t hi = hashes_.size();
     while (lo < hi) {
-      const std::size_t mid = lo + (hi - lo) / 2;
-      if (hashes_[mid] < h) lo = mid + 1;
-      else hi = mid;
+      const std::size_t mid = lo + ((hi - lo) / 2);
+      if (hashes_[mid] < h) { lo = mid + 1;
+      } else { hi = mid;
+}
     }
     return lo < hashes_.size() && hashes_[lo] == h;
   }

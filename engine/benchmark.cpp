@@ -9,20 +9,28 @@
 
 #include "spam_engine.h"
 
-static double median(std::vector<double>& v) {
+namespace {
+double median(std::vector<double>& v) {
   std::sort(v.begin(), v.end());
-  auto n = v.size();
-  return (n % 2 == 0) ? (v[n / 2 - 1] + v[n / 2]) / 2.0 : v[n / 2];
+  auto const n = v.size();
+  return (n % 2 == 0) ? (v[(n / 2) - 1] + v[n / 2]) / 2.0 : v[n / 2];
 }
+}  // namespace
 
 int main(int argc, char* argv[]) {
   std::string model_path = "./model";
   int warmup = 2;
   int iters = 10;
 
-  if (argc > 1) model_path = argv[1];
-  if (argc > 2) warmup = std::atoi(argv[2]);
-  if (argc > 3) iters = std::atoi(argv[3]);
+  if (argc > 1) {
+    model_path = argv[1];
+  }
+  if (argc > 2) {
+    warmup = std::stoi(argv[2]);
+  }
+  if (argc > 3) {
+    iters = std::stoi(argv[3]);
+  }
 
   // Texts of varying length.
   // `very_long` is the worst-case input the encoder cap clips: 500+ tokens
@@ -38,7 +46,8 @@ int main(int argc, char* argv[]) {
       "presenting the updated timeline to leadership. Let me know if you need "
       "anything else. Best regards, Mike";
   std::string very_long_body;
-  for (int i = 0; i < 6; ++i) very_long_body += long_body + "\n\n";
+  for (int i = 0; i < 6; ++i) { very_long_body += long_body + "\n\n";
+}
 
   std::vector<std::pair<std::string, std::string>> samples = {
       {"short", "Buy cheap viagra now!"},
@@ -55,11 +64,11 @@ int main(int argc, char* argv[]) {
   spam_engine::EngineConfig config;
   config.model_path = model_path;
 
-  auto t0 = std::chrono::high_resolution_clock::now();
+  auto const t0 = std::chrono::high_resolution_clock::now();
   spam_engine::SpamEngine engine;
   engine.load(config);
-  auto t1 = std::chrono::high_resolution_clock::now();
-  double load_ms =
+  auto const t1 = std::chrono::high_resolution_clock::now();
+  double const load_ms =
       std::chrono::duration<double, std::milli>(t1 - t0).count();
 
   std::cout << std::fixed << std::setprecision(1);
@@ -76,16 +85,16 @@ int main(int argc, char* argv[]) {
     times.reserve(iters);
     std::string last_class;
     for (int i = 0; i < iters; ++i) {
-      auto s = std::chrono::high_resolution_clock::now();
-      auto result = engine.classify(text, "", "", spam_engine::ClassifyOptions{"ensemble"});
-      auto e = std::chrono::high_resolution_clock::now();
+      auto const s = std::chrono::high_resolution_clock::now();
+      auto const result = engine.classify(text, "", "", spam_engine::ClassifyOptions{"ensemble"});
+      auto const e = std::chrono::high_resolution_clock::now();
       times.push_back(
           std::chrono::duration<double, std::milli>(e - s).count());
       last_class = result.class_name;
     }
 
-    double med = median(times);
-    double avg =
+    double const med = median(times);
+    double const avg =
         std::accumulate(times.begin(), times.end(), 0.0) / times.size();
     std::cout << "classify_" << name << ": median=" << med
               << "ms avg=" << avg << "ms class=" << last_class << "\n";
@@ -96,24 +105,22 @@ int main(int argc, char* argv[]) {
     const std::string text = samples[1].first == "medium" ? samples[1].second : samples[0].second;
     // Wrap once via the canonical builder; engine.train requires a
     // CalibratedInputText so the head sees the same shape as production.
-    const auto calibrated = spam_engine::build_input_text(
-        {{"user", text, "email"}}, spam_engine::CustomerInfo{});
     // warmup
     for (int i = 0; i < warmup; ++i) {
-      engine.train(calibrated, 3);
+      engine.train_text(text, 3);
     }
 
     std::vector<double> times;
     times.reserve(iters);
     for (int i = 0; i < iters; ++i) {
-      auto s = std::chrono::high_resolution_clock::now();
-      engine.train(calibrated, 3);  // train as spam
-      auto e = std::chrono::high_resolution_clock::now();
+      auto const s = std::chrono::high_resolution_clock::now();
+      engine.train_text(text, 3);  // train as spam
+      auto const e = std::chrono::high_resolution_clock::now();
       times.push_back(
           std::chrono::duration<double, std::milli>(e - s).count());
     }
 
-    double med = median(times);
+    double const med = median(times);
     std::cout << "train: median=" << med << "ms (embed + backprop)\n";
   }
 

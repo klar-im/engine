@@ -1,6 +1,7 @@
 # Klar Milter — Example Production Configuration
 #
-# Copy this file to /etc/klar/postfix.toml and adjust for your setup.
+# Copy this file to /etc/klar/klar-milterd.toml (the path packaging/klar-milterd.service
+# reads) and adjust for your setup. Behind Stalwart start from stalwart/config/klar-milterd.toml.
 # Reload with: kill -HUP $(pidof klar-milterd)
 
 # ---------------------------------------------------------------------------
@@ -45,8 +46,47 @@ max_inflight_bytes = 536870912  # 512 MB
 # Model
 # ---------------------------------------------------------------------------
 
-model_dir = "/opt/klar/model/current"
-model_version_file = "/opt/klar/model/current/VERSION"
+# Where scripts/fetch_model.sh put the model. The version reported in
+# X-Klar-Model-Version comes from model_version_file: the engine's MANIFEST.json
+# (its model_uuid), or a plain VERSION file with the version on its first line.
+model_dir = "/var/lib/klar/model"
+model_version_file = "/var/lib/klar/model/MANIFEST.json"
+
+# Origin-IP reputation: Spamhaus DROP netblocks, checked offline against the
+# address the MTA saw connect (no per-message DNS). Build with
+# `make model-lab/build-ip-blocklist`. Set empty to disable the signal; a missing or
+# malformed file disables it too and never blocks startup.
+# DROP moves, so refresh this on a cron — past ip_blocklist_max_age_days the
+# daemon reports the list stale (it keeps using it: stale beats absent).
+ip_blocklist_path = "/var/lib/klar/model/ip_blocklist.bin"
+ip_blocklist_max_age_days = 14
+
+# Relay hops you operate, as CIDRs or bare addresses. Set this ONLY if this milter
+# sits behind an MTA you control — it is what licenses reading the origin address
+# out of the Received chain instead of the connection.
+#
+# Why you would need it: behind a relay, xxfi_connect reports the RELAY, so the
+# DROP check above is inert. With this set, the daemon walks the Received chain
+# past hops in these ranges and checks the first one that is not yours. That hop
+# was written by a host you trust; everything below it is attacker-writable and is
+# never read. The resulting signal is deliberately weaker than an observed one and
+# can never junk a message on its own.
+#
+# Empty (the default) = the connecting address is the only origin trusted.
+# trusted_relay_cidrs = ["10.88.0.0/24"]
+
+# What to make of the message's own Authentication-Results header. The engine
+# reads it, it does not verify DKIM/DMARC itself, and a `dkim=pass header.d=<brand>`
+# on a From at that brand's domain is a strong ham signal. So:
+#   "trust-topmost"  the topmost AR was written by YOUR MTA. Correct behind
+#                    Postfix with OpenDKIM/OpenDMARC ahead of this milter in
+#                    smtpd_milters (they stamp a trusted AR and strip the client's).
+#   "ignore"         this milter sees the client's raw bytes, so any AR on them is
+#                    the sender's claim about itself. Stalwart is this case
+#                    (see stalwart/README.md): every AR header is dropped before
+#                    classification and the verdict rests on everything else.
+# Getting this wrong in the trusting direction lets a forged AR buy delivery.
+auth_results = "trust-topmost"
 
 # ---------------------------------------------------------------------------
 # Health / Metrics

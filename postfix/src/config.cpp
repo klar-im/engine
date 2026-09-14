@@ -1,4 +1,5 @@
 #include "config.h"
+#include "origin_ip_blocklist.h"
 
 #include <algorithm>
 #include <cctype>
@@ -311,8 +312,11 @@ static void apply_root(const TomlTable& root, Config& cfg) {
 
     set_string(root, "model_dir", cfg.model_dir);
     set_string(root, "model_version_file", cfg.model_version_file);
+    set_string(root, "ip_blocklist_path", cfg.ip_blocklist_path);
+    set_int(root, "ip_blocklist_max_age_days", cfg.ip_blocklist_max_age_days);
+    set_string_array(root, "trusted_relay_cidrs", cfg.trusted_relay_cidrs);
 
-    set_string(root, "header_prefix", cfg.header_prefix);
+    set_string(root, "auth_results", cfg.auth_results);
     set_int(root, "header_value_max_bytes", cfg.header_value_max_bytes);
     set_string(root, "log_level", cfg.log_level);
     set_bool(root, "log_json", cfg.log_json);
@@ -365,16 +369,7 @@ Config load_config(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
-// profile_to_threshold / Config helpers
-// ---------------------------------------------------------------------------
-
-double profile_to_threshold(const std::string& profile) {
-    if (profile == "cautious")   return 0.70;
-    if (profile == "standard")   return 0.50;
-    if (profile == "aggressive") return 0.30;
-    return 0.50; // fallback
-}
-
+// profile_to_threshold lives in decision_profiles.h (config.h includes it)
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -494,6 +489,32 @@ std::string validate_config(const Config& cfg) {
                    ") which exposes the unauthenticated /metrics endpoint; bind a "
                    "specific address (e.g. 127.0.0.1) or set health_allow_public=true";
         }
+    }
+
+    // 7c. ip_blocklist_max_age_days (only meaningful when a list is configured).
+    // A DROP list nobody refreshes decays silently, so the staleness budget must
+    // be a real number of days, not "0 = never warn".
+    if (!cfg.ip_blocklist_path.empty() &&
+        (cfg.ip_blocklist_max_age_days < 1 || cfg.ip_blocklist_max_age_days > 365)) {
+        return "ip_blocklist_max_age_days must be in [1, 365], got " +
+               std::to_string(cfg.ip_blocklist_max_age_days);
+    }
+
+    // 7d. trusted_relay_cidrs must parse. A typo here does not fail safe: it
+    // would silently drop a relay out of the trusted set and make us read an
+    // untrusted Received line as if our own MTA had written it.
+    if (!cfg.trusted_relay_cidrs.empty()) {
+        TrustedRelays probe;
+        std::string relay_err;
+        if (!probe.load(cfg.trusted_relay_cidrs, &relay_err)) return relay_err;
+    }
+
+    // 7e. auth_results. A misspelling must not read as the default: the default
+    // TRUSTS the header, and an operator who wrote this key at all is the one
+    // running behind an MTA where trusting it is the hole.
+    if (!is_one_of(cfg.auth_results, {"trust-topmost", "ignore"})) {
+        return "auth_results must be trust-topmost|ignore, got '" +
+               cfg.auth_results + "'";
     }
 
     // 8. blocklist_action

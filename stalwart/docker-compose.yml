@@ -1,0 +1,55 @@
+# Stalwart + Klar, the whole thing on one machine, for a trial or the E2E.
+#
+#   cd <repo root>
+#   KLAR_ACCEPT_MODEL_LICENSE=1 docker compose -f stalwart/docker-compose.yml up -d --build
+#   stalwart/scripts/test_e2e.sh          # what the stack is asserted to do
+#
+# Stalwart is upstream's image, pinned to the minor we run in production. Its
+# admin password is set here for a test stack; a real deployment sets its own
+# and publishes its real ports. klar-milterd is built from this tree
+# (postfix/docker/Dockerfile) and fetches the model into its volume on first
+# start, which is the only slow step (~400 MB, once).
+#
+# The two containers talk over the compose network: Stalwart's MtaMilter object
+# points at klar-milterd:8891 (stalwart/scripts/apply.py --milter-host
+# klar-milterd), and the milter binds all interfaces inside its own container
+# for exactly that reason.
+
+services:
+  stalwart:
+    image: stalwartlabs/stalwart:v0.16
+    environment:
+      STALWART_RECOVERY_ADMIN: "admin:${STALWART_ADMIN_PASSWORD:-klar-e2e}"
+      # The JMAP session document advertises this as the server's URL; without
+      # it Stalwart advertises https://<container-hostname>, which nothing can
+      # reach. The clients here rebase on the address they used anyway.
+      STALWART_PUBLIC_URL: "http://127.0.0.1:18080"
+    volumes:
+      - stalwart-etc:/etc/stalwart
+      - stalwart-data:/var/lib/stalwart
+    ports:
+      - "127.0.0.1:2525:25"
+      - "127.0.0.1:18080:8080"
+    depends_on:
+      klar-milterd:
+        condition: service_healthy
+
+  klar-milterd:
+    # Built from this tree by default; KLAR_MILTERD_IMAGE names a prebuilt one
+    # (the CI builds once with a layer cache and hands it in; a released tag
+    # is ghcr.io/klar-im/klar-milterd:<tag>).
+    image: ${KLAR_MILTERD_IMAGE:-klar-milterd:local}
+    build:
+      context: ..
+      dockerfile: postfix/docker/Dockerfile
+    environment:
+      KLAR_ACCEPT_MODEL_LICENSE: "${KLAR_ACCEPT_MODEL_LICENSE:-}"
+    volumes:
+      - klar-data:/var/lib/klar
+    ports:
+      - "127.0.0.1:18892:8892"
+
+volumes:
+  stalwart-etc:
+  stalwart-data:
+  klar-data:

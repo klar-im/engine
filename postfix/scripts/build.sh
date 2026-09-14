@@ -30,7 +30,9 @@ if [ ! -f CMakeCache.txt ]; then
 fi
 
 # Build
-CPU_COUNT="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+# Same knob as engine/scripts/build.sh: an operator on a small box (or the
+# container build, ARG CPU_COUNT) caps the parallelism instead of swapping.
+CPU_COUNT="${CPU_COUNT:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 echo "[postfix/build] Building..."
 cmake --build . -j"$CPU_COUNT"
 

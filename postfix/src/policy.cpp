@@ -121,6 +121,12 @@ PolicyResult evaluate_policy(
     } else if (contains(cfg.allowlist_domains, sender_domain)) {
         pr.policy_reason = "allowlist_domain";
         is_allowlisted = true;
+    } else if (cr.flipped_by_offset) {
+        // A structural offset, not the content model, decided this one. Recorded
+        // distinctly so the common "why was my low-scoring mail junked?" case is
+        // greppable in the JSON log without opening the event store (TASK-388);
+        // fired_offsets on the event says WHICH offset.
+        pr.policy_reason = "structural";
     } else {
         pr.policy_reason = "ml";
     }
@@ -144,6 +150,18 @@ PolicyResult evaluate_policy(
         pr.score_marketing = cr.marketing;
         pr.score_gibberish = cr.gibberish;
         pr.score_spam_adjusted = cr.adjusted_spam;
+    }
+
+    // klass: 4-class argmax over the resolved scores, the X-Klar-Class companion
+    // to the binary label. One pass covers every branch: blocklist forces
+    // spam=1, allowlist forces regular=1, ML uses the raw scores.
+    const struct { const char* name; float score; } classes[] = {
+        {"regular", pr.score_regular}, {"marketing", pr.score_marketing},
+        {"gibberish", pr.score_gibberish}, {"spam", pr.score_spam}};
+    pr.klass = classes[0].name;
+    float best = classes[0].score;
+    for (const auto& c : classes) {
+        if (c.score > best) { best = c.score; pr.klass = c.name; }
     }
 
     // 5. Threshold resolution
@@ -184,7 +202,8 @@ PolicyResult evaluate_policy(
         // Reject/bounce is destructive and irreversible, so it requires TWO
         // independent strong signals (TASK-179): the content model highly
         // confident (raw score >= reject_threshold) AND a structural condemn
-        // (free-host/throwaway DKIM signer). No single scorer's blind spot can
+        // (free-host/throwaway DKIM signer, or a DROP-listed connecting IP —
+        // TASK-113). No single scorer's blind spot can
         // bounce legitimate mail; high-confidence-but-uncorroborated spam falls
         // through to TAG (junk — recoverable). Blocklist reject (above) is an
         // explicit operator decision, not a scorer, so it stays single-factor.

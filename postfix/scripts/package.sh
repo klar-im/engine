@@ -16,45 +16,42 @@ if [ ! -f "$POSTFIX_DIR/build/klar-milterd" ]; then
     exit 1
 fi
 
-# Determine lib extension
-if [[ "$OSTYPE" == darwin* ]]; then
-    LIB_EXT="dylib"
-else
-    LIB_EXT="so"
-fi
-
 # Create dist structure
 rm -rf "$DIST_DIR"
-mkdir -p "$DIST_DIR/bin" "$DIST_DIR/lib" "$DIST_DIR/model" "$DIST_DIR/etc"
+mkdir -p "$DIST_DIR/model" "$DIST_DIR/etc"
 
-# Binary
-cp "$POSTFIX_DIR/build/klar-milterd" "$DIST_DIR/bin/"
-if [ -f "$POSTFIX_DIR/build/klar-policy-cli" ]; then
-    cp "$POSTFIX_DIR/build/klar-policy-cli" "$DIST_DIR/bin/"
-fi
+# bin/: the daemon, the CLI and every library they load, staged by install.sh,
+# the same tree an operator installs. One list of what the daemon loads; this
+# script used to keep a second one (and flattened the soname symlink chain).
+bash "$SCRIPT_DIR/install.sh" "$DIST_DIR" >/dev/null
 
-# Shared libraries
-for lib in libspam_engine.$LIB_EXT libspam_engine_c_api.$LIB_EXT; do
-    if [ -f "$REPO_ROOT/engine/build/$lib" ]; then
-        cp "$REPO_ROOT/engine/build/$lib" "$DIST_DIR/lib/"
-    fi
-done
-
-LLAMA_LIB_DIR="$REPO_ROOT/engine/deps/llama-install/lib"
-if [ -d "$LLAMA_LIB_DIR" ]; then
-    cp "$LLAMA_LIB_DIR"/libllama.so* "$DIST_DIR/lib/" 2>/dev/null || true
-    cp "$LLAMA_LIB_DIR"/libggml*.so* "$DIST_DIR/lib/" 2>/dev/null || true
-fi
-
-# Model files
+# Model files: the head plus the one encoder the artifact declares in its own
+# classifier_config.json (engine/scripts/model_manifest.py owns that list). A
+# fixed Q4 name here packaged a Q8_0 artifact with no encoder at all, and the
+# `-f` skip made it silent; a missing file is a broken milter, so it fails.
 mkdir -p "$DIST_DIR/model/gguf"
-for f in classifier_config.json classifier_dense_weight.bin classifier_dense_bias.bin \
-         classifier_out_proj_weight.bin classifier_out_proj_bias.bin \
-         gguf/encoder-q4_k_m.gguf; do
-    if [ -f "$REPO_ROOT/engine/model/$f" ]; then
-        cp "$REPO_ROOT/engine/model/$f" "$DIST_DIR/model/$f"
+for f in $(python3 - "$REPO_ROOT/engine/model" <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parent / "scripts"))
+from model_manifest import artifacts_for
+config = json.loads((Path(sys.argv[1]) / "classifier_config.json").read_text())
+print("\n".join(artifacts_for(config, include_ftrl=False)))
+PY
+); do
+    if [ ! -f "$REPO_ROOT/engine/model/$f" ]; then
+        echo "error: engine/model/$f is missing; the artifact declares it" >&2
+        exit 1
     fi
+    cp "$REPO_ROOT/engine/model/$f" "$DIST_DIR/model/$f"
 done
+
+# Origin-IP blocklist (TASK-113): optional, and deliberately copied separately
+# from the model files above — it is refreshed on its own cron cadence, not with
+# a model release. Absent just means the origin-IP signal is off.
+if [ -f "$REPO_ROOT/engine/model/ip_blocklist.bin" ]; then
+    cp "$REPO_ROOT/engine/model/ip_blocklist.bin" "$DIST_DIR/model/"
+fi
 
 if [ -f "$REPO_ROOT/engine/model/VERSION" ]; then
     cp "$REPO_ROOT/engine/model/VERSION" "$DIST_DIR/model/"
@@ -70,7 +67,7 @@ cp "$POSTFIX_DIR/packaging/postfix-main.cf.snippet" "$DIST_DIR/etc/"
 # Create tarball
 TARBALL="klar-milterd-${VERSION}-linux-${ARCH}.tar.gz"
 echo "[postfix/package] Creating $TARBALL..."
-tar -czf "$DIST_DIR/$TARBALL" -C "$DIST_DIR" bin/ lib/ model/ etc/
+tar -czf "$DIST_DIR/$TARBALL" -C "$DIST_DIR" bin/ model/ etc/
 
 # Summary
 echo "[postfix/package] Done."

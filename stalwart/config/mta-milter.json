@@ -1,0 +1,15 @@
+{
+  "_comment": "MtaMilter pointing at klar-milterd; apply.py sets hostname/port and strips this key. Why each field: README.md.",
+  "hostname": "127.0.0.1",
+  "port": 8891,
+  "stages": { "data": true },
+  "enable": { "match": {}, "else": "is_empty(authenticated_as)" },
+  "tempFailOnError": false,
+  "useTls": false,
+  "allowInvalidCerts": false,
+  "protocolVersion": "v6",
+  "timeoutConnect": 10000,
+  "timeoutCommand": 10000,
+  "timeoutData": 60000,
+  "maxResponseSize": 52428800
+}

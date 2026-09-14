@@ -1,0 +1,15 @@
+# test_auth_results.sh: the default. Identical to auth_results_ignore.toml except
+# for the one key under test, so the pair isolates it.
+mode = "tag"
+profile = "standard"
+fail_open = true
+timeout_ms = 1500
+max_message_bytes = 5242880
+
+model_dir = "engine/model"
+model_version_file = ""
+ip_blocklist_path = ""
+
+auth_results = "trust-topmost"
+
+event_store_path = "/tmp/klar-policy-replay-events.sqlite3"

@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$ENGINE_DIR/build"
-CPU_COUNT="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)"
+CPU_COUNT="${CPU_COUNT:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)}"
 
 if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
     echo "Error: CMake not configured. Run 'make engine/setup' first." >&2

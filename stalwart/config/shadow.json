@@ -1,0 +1,14 @@
+{
+  "_comment": "apply.py --shadow: Stalwart keeps scoring but this -100 tag on every message keeps the total under scoreSpam, so it never files; apply.py without --shadow deletes both. README.md, 'Shadow mode'.",
+  "_comment_filter": "Shadow needs Stalwart scoring. If enableSpamFilter is exactly what stage-data.json turned it into (off), apply.py --shadow puts Stalwart's default back; any other expression is the operator's and is left alone.",
+  "enableSpamFilter": { "match": {}, "else": "is_empty(authenticated_as)" },
+  "tag": { "@type": "Score", "tag": "KLAR_SHADOW", "score": -100 },
+  "rule": {
+    "@type": "Any",
+    "name": "KLAR_SHADOW",
+    "description": "Klar shadow window: Stalwart scores but never files; the milter decides",
+    "enable": true,
+    "priority": 10,
+    "condition": { "match": {}, "else": "'KLAR_SHADOW'" }
+  }
+}

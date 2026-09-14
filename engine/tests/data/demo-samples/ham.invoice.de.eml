@@ -1,0 +1,12 @@
+From: Stripe <receipts@stripe.com>
+To: you@example.com
+Subject: Ihre Rechnung für Juni
+Date: Mon, 13 Jul 2026 09:12:00 +0200
+Content-Type: text/plain; charset=utf-8
+
+Rechnung INV-0245 wurde bezahlt. Eine Kopie liegt bei.
+
+Betrag: 24,00 EUR
+Zeitraum: 1. bis 30. Juni
+
+Vielen Dank.

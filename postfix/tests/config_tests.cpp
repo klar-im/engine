@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 using klar::Config;
 using klar::validate_config;
@@ -67,6 +68,63 @@ int main() {
     } else {
       std::printf("[FAIL] health_enabled=false should skip health_listen\n");
       ++g_failures;
+    }
+  }
+
+  // TASK-113: the DROP-list staleness budget. A list nobody refreshes decays, so
+  // the budget must be a real number of days — but only when a list is actually
+  // configured, since an empty path means the signal is off.
+  {
+    struct Case { const char* what; std::string path; int days; bool ok; };
+    const Case cases[] = {
+        {"default budget accepted", "/var/lib/klar/model/ip_blocklist.bin", 14, true},
+        {"1 day accepted", "/var/lib/klar/model/ip_blocklist.bin", 1, true},
+        {"365 days accepted", "/var/lib/klar/model/ip_blocklist.bin", 365, true},
+        {"0 days rejected", "/var/lib/klar/model/ip_blocklist.bin", 0, false},
+        {"negative rejected", "/var/lib/klar/model/ip_blocklist.bin", -1, false},
+        {"366 days rejected", "/var/lib/klar/model/ip_blocklist.bin", 366, false},
+        {"no list -> budget unchecked", "", 0, true},
+    };
+    for (const Case& tc : cases) {
+      Config c;
+      c.ip_blocklist_path = tc.path;
+      c.ip_blocklist_max_age_days = tc.days;
+      const bool got_ok = validate_config(c).empty();
+      if (got_ok == tc.ok) {
+        std::printf("[PASS] ip_blocklist: %s\n", tc.what);
+      } else {
+        std::printf("[FAIL] ip_blocklist: %s\n", tc.what);
+        ++g_failures;
+      }
+    }
+  }
+
+  // TASK-387: a typo in trusted_relay_cidrs does NOT fail safe — it would drop a
+  // relay out of the trusted set and make an untrusted Received line read as if
+  // our own MTA had written it. So it must be a config error, not a warning.
+  {
+    struct Case { const char* what; std::vector<std::string> cidrs; bool ok; };
+    const Case cases[] = {
+        {"empty list accepted (feature off)", {}, true},
+        {"IPv4 CIDR accepted", {"10.88.0.0/24"}, true},
+        {"bare address accepted", {"192.0.2.7"}, true},
+        {"IPv6 CIDR accepted", {"2001:db8::/32"}, true},
+        {"several accepted", {"10.88.0.0/24", "127.0.0.1"}, true},
+        {"garbage rejected", {"not-an-ip"}, false},
+        {"oversized IPv4 prefix rejected", {"10.0.0.0/33"}, false},
+        {"non-numeric prefix rejected", {"10.0.0.0/x"}, false},
+        {"one bad entry poisons the list", {"10.88.0.0/24", "nope"}, false},
+    };
+    for (const Case& tc : cases) {
+      Config c;
+      c.trusted_relay_cidrs = tc.cidrs;
+      const bool got_ok = validate_config(c).empty();
+      if (got_ok == tc.ok) {
+        std::printf("[PASS] trusted_relay_cidrs: %s\n", tc.what);
+      } else {
+        std::printf("[FAIL] trusted_relay_cidrs: %s\n", tc.what);
+        ++g_failures;
+      }
     }
   }
 

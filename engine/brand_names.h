@@ -31,8 +31,8 @@
 #include "brand_names_data.h"
 #include "fnv1a.h"
 
-namespace spam_engine {
-namespace brand_names {
+
+namespace spam_engine::brand_names {
 
 // Exact membership of t in a null-free static word list.
 inline bool in_word_list(const std::string& t, const char* const* list, std::size_t n);
@@ -72,18 +72,23 @@ inline bool is_ambiguous_brand(const std::string& t) {
 // short brand). Short brands are Tier-2: a 3-char match is high-ambiguity, so it
 // needs the impersonation shape + a corroborating signal downstream.
 inline int brand_tier(const std::string& stem) {
-  if (stem.size() == 3) return is_short_brand(stem) ? 2 : 0;
-  if (stem.size() < 4) return 0;
+  if (stem.size() == 3) { return is_short_brand(stem) ? 2 : 0;
+}
+  if (stem.size() < 4) { return 0;
+}
   const std::uint64_t h = fnv1a_lower(stem);
-  if (std::binary_search(kBrandNameHashes, kBrandNameHashes + kBrandNameHashesCount, h)) return 1;
-  if (std::binary_search(kBrandNameHashesT2, kBrandNameHashesT2 + kBrandNameHashesT2Count, h)) return 2;
+  if (std::binary_search(kBrandNameHashes, kBrandNameHashes + kBrandNameHashesCount, h)) { return 1;
+}
+  if (std::binary_search(kBrandNameHashesT2, kBrandNameHashesT2 + kBrandNameHashesT2Count, h)) { return 2;
+}
   return 0;
 }
 
 // Exact membership of t in a null-free static word list.
 inline bool in_word_list(const std::string& t, const char* const* list, std::size_t n) {
   for (std::size_t i = 0; i < n; ++i) {
-    if (t == list[i]) return true;
+    if (t == list[i]) { return true;
+}
   }
   return false;
 }
@@ -149,6 +154,64 @@ inline bool is_brand_continuation(const std::string& t) {
   return in_word_list(t, kCont, sizeof(kCont) / sizeof(kCont[0]));
 }
 
+// PRODUCT LINES, SCOPED TO THE BRAND THAT OWNS THEM (2026-08-29).
+//
+// The gap this closes ran the guard BACKWARDS for dictionary-word brands:
+// "Amazon" alone raised a claim and "Amazon Prime" raised none, because "prime"
+// read as a distinctive qualifier and dropped it. Nobody means the river when
+// they write "Amazon Prime"; the namesake writes "Amazon River".
+//
+// THE FIRST ATTEMPT PUT THESE IN kCont, GLOBALLY, AND THAT WAS A REAL FALSE
+// POSITIVE. Every product word then followed every brand, so ordinary display
+// names fired: "Live Music", "Live Video", "Live Nation" (an actual company),
+// "Nothing Fresh", "Booking Assistant", "Visa Business" -- all resolve to a
+// Tier-2 brand token plus a word that is only a product line for some OTHER
+// company. display_impersonation is a 0.99 offset that CAN authorize a bounce,
+// so a global list was the worst possible shape for this.
+//
+// Scoped, the claim only survives when the leftover is a product line of the
+// brand actually matched: "Amazon Prime" yes, "Live Music" no. The namesake
+// vocabulary (river, basin, valley, county, watch) is absent from every entry
+// and still breaks the shape.
+inline bool is_product_line_of(const std::string& brand, const std::string& t) {
+  struct Line { const char* brand; const char* word; };
+  static const Line kLines[] = {
+      {"amazon", "prime"},   {"amazon", "video"},  {"amazon", "music"},
+      {"amazon", "fresh"},   {"amazon", "basics"}, {"amazon", "business"},
+      {"apple", "pay"},      {"apple", "care"},    {"apple", "music"},
+      {"apple", "store"},    {"apple", "watch"},   {"apple", "tv"},
+      {"google", "pay"},     {"google", "drive"},  {"google", "cloud"},
+      {"google", "play"},    {"google", "photos"},
+      {"microsoft", "office"}, {"microsoft", "teams"}, {"microsoft", "azure"},
+      {"orange", "money"},   {"orange", "bank"},
+      {"free", "mobile"},
+      {"paypal", "credit"},
+      {"netflix", "kids"},
+  };
+  return std::any_of(std::begin(kLines), std::end(kLines), [&](const Line& l) {
+    return brand == l.brand && t == l.word;
+  });
+}
+
+// Is this a product-line word for ANY brand? Used ONLY as vocabulary by the
+// separator-less token cover in email_preprocessor.cpp, never by the display
+// shape guard.
+//
+// The distinction matters and it is the whole reason these are two functions.
+// The DISPLAY guard must be brand-scoped, because "Live Music" is not Live and
+// an unscoped list fired on ordinary names. The COVER does not have that
+// exposure: it already demands a KB brand AND a strong keyword AND a full
+// decomposition of the stem, so `amazonprimeresiliation` needs "prime" only as
+// a connecting token, and a cover cannot be built out of product words alone.
+inline bool is_product_line_word(const std::string& t) {
+  static const char* const kWords[] = {
+      "prime", "video", "music", "photos", "drive", "cloud", "wallet", "pay",
+      "care", "play", "store", "kids", "fresh", "business", "basics", "teams",
+      "azure", "office", "money", "mobile", "credit",
+  };
+  return in_word_list(t, kWords, sizeof(kWords) / sizeof(kWords[0]));
+}
+
 // A generic role / corporate-continuation word. These lists are AUTHORITATIVE: some
 // of these words (france, deutschland, partners, labs, signin) are themselves Tranco
 // stems and so land in the brand set, but they are far too generic to be an
@@ -181,9 +244,10 @@ inline BrandMatch operator|(const BrandMatch& a, const BrandMatch& b) {
 // SLD label of an org-domain ("scaleway.fr" -> "scaleway"), lowercased.
 inline std::string domain_stem(const std::string& org_domain) {
   std::string out;
-  for (char ch : org_domain) {
-    if (ch == '.') break;
-    unsigned char c = static_cast<unsigned char>(ch);
+  for (char const ch : org_domain) {
+    if (ch == '.') { break;
+}
+    auto const c = static_cast<unsigned char>(ch);
     out.push_back(static_cast<char>((c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c));
   }
   return out;
@@ -214,12 +278,14 @@ inline constexpr Confusable kConfusables[] = {
   {0x0458, 'j'},
 };
 inline char confusable_skeleton(std::uint32_t cp) {
-  std::size_t lo = 0, hi = sizeof(kConfusables) / sizeof(kConfusables[0]);
+  std::size_t lo = 0;
+  std::size_t hi = sizeof(kConfusables) / sizeof(kConfusables[0]);
   while (lo < hi) {
     const std::size_t mid = (lo + hi) / 2;
-    if (kConfusables[mid].cp < cp) lo = mid + 1;
-    else if (kConfusables[mid].cp > cp) hi = mid;
-    else return kConfusables[mid].ascii;
+    if (kConfusables[mid].cp < cp) { lo = mid + 1;
+    } else if (kConfusables[mid].cp > cp) { hi = mid;
+    } else { return kConfusables[mid].ascii;
+}
   }
   return 0;
 }
@@ -232,8 +298,10 @@ inline char confusable_skeleton(std::uint32_t cp) {
 // display or decoded IDN domain maps onto the brand it imitates (TASK-237). ASCII
 // letters lowercase; digits pass through.
 inline char brand_fold_base(std::uint32_t cp) {
-  if (cp >= 'A' && cp <= 'Z') return static_cast<char>(cp - 'A' + 'a');
-  if ((cp >= 'a' && cp <= 'z') || (cp >= '0' && cp <= '9')) return static_cast<char>(cp);
+  if (cp >= 'A' && cp <= 'Z') { return static_cast<char>(cp - 'A' + 'a');
+}
+  if ((cp >= 'a' && cp <= 'z') || (cp >= '0' && cp <= '9')) { return static_cast<char>(cp);
+}
   switch (cp) {  // Latin-1 Supplement + common Latin Extended-A -> base letter.
     case 0xC0: case 0xC1: case 0xC2: case 0xC3: case 0xC4: case 0xC5: case 0xC6:
     case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6: return 'a';
@@ -266,16 +334,92 @@ struct DisplayToken {
   std::string conf;     // conservative capital-I -> l homoglyph fold
   std::string conf_hg;  // aggressive fold: conf + digit/rn homoglyphs (0->o, 1->l, rn->m, ...)
   bool perturbed = false;  // conf differs from plain (a capital-I homoglyph)
+  // Produced by collapsing a letter-spaced run, so the display's own word
+  // boundaries are NOT recoverable from it: "D e u t s c h e B a n k" arrives as
+  // one token. Only the multi-word JOIN matcher may treat such a token as a
+  // whole brand name; the ordinary tiered paths must not, or a single token
+  // would claim a brand without the impersonation shape ever being checked.
+  bool spaced_join = false;
 };
 
 inline std::string confusable_fold(const std::string& s);  // defined below
+
+// A separator between every letter kills the brand match, and it was the
+// cheapest evasion we had (TASK-459): "A m a z o n", "A.m.a.z.o.n" and
+// "P a y P a l" all raised no claim while the same names all-caps, with Cyrillic
+// homoglyphs, or with a zero-width space all fired. So the fold work was real
+// and separators were simply a hole in it.
+//
+// Fixed by JOINING the run in the tokenizer rather than by adding a synthetic
+// candidate beside it, so every guard downstream keeps working on the joined
+// form unchanged: ownership (a letter-spaced sender on its own domain is still
+// exempt), the Tier-2 impersonation shape, and the leftover/product-line rules.
+//
+// THE FLOOR IS THE FALSE-POSITIVE LEVER, and it is why this is a run length and
+// not a general "collapse single letters" rule. Letter-spacing is a real
+// typographic style, and the words marketing sets that way are short and often
+// dictionary words that are also Tier-2 brands: "S A L E", "F R E E", "L I V E",
+// "N E X T", "A P P L E".
+//
+// SET AT 5 FIRST, AND THAT WAS TOO LOW. The controls written for it were "SALE",
+// "FREE", "LIVE", "NEXT" -- every one of them four letters, which is to say the
+// floor was validated exactly at the boundary it had been set to and nowhere
+// past it. "A P P L E" is five, is a Tier-2 brand, and is a fruit; it fired.
+// Found by probing my own rule after the fact rather than by any gate, which is
+// the same lesson as the English call-service mail two commits earlier: a
+// control set that only contains cases you expect to pass measures nothing.
+//
+// 6 keeps every target of TASK-459 ("A m a z o n" and "P a y P a l" are 6,
+// "N e t f l i x" is 7) and drops "A P P L E".
+//
+// KNOWN RESIDUAL, locked in a test rather than left to be rediscovered:
+// "O R A N G E" is six letters, a Tier-2 brand, and an ordinary word, so it
+// still fires from an unrelated domain. A floor that excluded it would exclude
+// "A m a z o n" too, since they are the same length. The sender's own domain is
+// exempt either way, so the case that remains is a third party letter-spacing
+// the word "orange", which is rare enough to accept and specific enough to name.
+//
+// Measured: 0/30 on the battery's ham classes, 0/32 on its legit-FP gate, and
+// zero additional firings on the 1,479-message transactional panel (35 with the
+// join, the same 35 without it, built both ways).
+inline constexpr std::size_t kMinSpacedRun = 6;
+
+inline void join_letter_spaced_runs(std::vector<DisplayToken>& tokens) {
+  std::vector<DisplayToken> out;
+  out.reserve(tokens.size());
+  std::size_t i = 0;
+  while (i < tokens.size()) {
+    std::size_t j = i;
+    while (j < tokens.size() && tokens[j].plain.size() == 1) { ++j;
+}
+    if (j - i >= kMinSpacedRun) {
+      DisplayToken joined;
+      for (std::size_t k = i; k < j; ++k) {
+        joined.plain += tokens[k].plain;
+        joined.conf += tokens[k].conf;
+        joined.perturbed = joined.perturbed || tokens[k].perturbed;
+      }
+      joined.conf_hg = confusable_fold(joined.conf);
+      joined.spaced_join = true;
+      out.push_back(joined);
+      i = j;
+      continue;
+    }
+    // A run shorter than the floor is left exactly as it was, one token per
+    // letter. Not dropped: "P S 5" beside a brand must still count as tokens.
+    for (std::size_t k = i; k < (j > i ? j : i + 1); ++k) { out.push_back(tokens[k]);
+}
+    i = (j > i ? j : i + 1);
+  }
+  tokens.swap(out);
+}
 
 // Tokenize a display name into normalized letter/digit runs. Apostrophes are
 // non-breaking within a run (L'Oréal→loreal) so the brand stays one token.
 inline std::vector<DisplayToken> tokenize_display(const std::string& display_name) {
   std::vector<DisplayToken> tokens;
   DisplayToken cur;
-  auto flush = [&]() {
+  auto const flush = [&] {
     if (!cur.plain.empty()) {
       // conf keeps only the conservative capital-I->l fold (matched at any tier).
       // conf_hg adds the aggressive digit/rn homoglyph fold, matched at Tier-1
@@ -293,13 +437,14 @@ inline std::vector<DisplayToken> tokenize_display(const std::string& display_nam
   const auto* p = reinterpret_cast<const unsigned char*>(display_name.data());
   const auto* end = p + display_name.size();
   while (p < end) {
-    std::uint32_t cp;
+    std::uint32_t cp = 0;
     if (*p < 0x80) { cp = *p; ++p; }
     else if ((*p >> 5) == 0x6 && p + 1 < end) { cp = ((*p & 0x1F) << 6) | (p[1] & 0x3F); p += 2; }
     else if ((*p >> 4) == 0xE && p + 2 < end) { cp = ((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); p += 3; }
     else if ((*p >> 3) == 0x1E && p + 3 < end) { cp = ((*p & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F); p += 4; }
     else { cp = 0xFFFD; ++p; }
-    if (cp == 0x27 || cp == 0x2019) continue;  // ' ' apostrophe: non-breaking
+    if (cp == 0x27 || cp == 0x2019) { continue;  // ' ' apostrophe: non-breaking
+}
     if (cp == 0xDF) {  // German ß -> ss (a 1->2 fold the single-char map can't do)
       cur.plain.append("ss");
       cur.conf.append("ss");
@@ -310,9 +455,11 @@ inline std::vector<DisplayToken> tokenize_display(const std::string& display_nam
     cur.plain.push_back(b);
     const char c = (cp == 0x49) ? 'l' : b;  // capital 'I' is a homoglyph for 'l'
     cur.conf.push_back(c);
-    if (c != b) cur.perturbed = true;
+    if (c != b) { cur.perturbed = true;
+}
   }
   flush();
+  join_letter_spaced_runs(tokens);
   return tokens;
 }
 
@@ -351,20 +498,28 @@ inline std::string confusable_fold(const std::string& s) { return leet_fold(s, '
 // false (leaving `out` partial) on malformed input or overflow, so the caller fails
 // safe. `in` is the label WITHOUT the "xn--" prefix.
 inline bool punycode_decode(const std::string& in, std::vector<std::uint32_t>& out) {
-  if (in.empty()) return false;
-  constexpr std::uint32_t kBase = 36, kTmin = 1, kTmax = 26, kSkew = 38, kDamp = 700;
+  if (in.empty()) { return false;
+}
+  constexpr std::uint32_t kBase = 36;
+  constexpr std::uint32_t kTmin = 1;
+  constexpr std::uint32_t kTmax = 26;
+  constexpr std::uint32_t kSkew = 38;
+  constexpr std::uint32_t kDamp = 700;
   std::size_t pos = 0;
   const std::size_t last_delim = in.find_last_of('-');
   if (last_delim != std::string::npos) {   // literal ASCII prefix before the last '-'
     for (std::size_t i = 0; i < last_delim; ++i) {
-      const unsigned char c = static_cast<unsigned char>(in[i]);
-      if (c >= 0x80) return false;          // basic section must be ASCII
+      const auto c = static_cast<unsigned char>(in[i]);
+      if (c >= 0x80) { return false;          // basic section must be ASCII
+}
       out.push_back(c);
     }
     pos = last_delim + 1;
   }
-  std::uint32_t n = 128, i = 0, bias = 72;
-  auto adapt = [&](std::uint32_t delta, std::uint32_t numpoints, bool first) {
+  std::uint32_t n = 128;
+  std::uint32_t i = 0;
+  std::uint32_t bias = 72;
+  auto const adapt = [&](std::uint32_t delta, std::uint32_t numpoints, bool first) {
     delta = first ? delta / kDamp : delta / 2;
     delta += delta / numpoints;
     std::uint32_t k = 0;
@@ -373,19 +528,25 @@ inline bool punycode_decode(const std::string& in, std::vector<std::uint32_t>& o
   };
   while (pos < in.size()) {
     const std::uint32_t oldi = i;
-    std::uint32_t w = 1, k = kBase;
+    std::uint32_t w = 1;
+    std::uint32_t k = kBase;
     for (;;) {
-      if (pos >= in.size()) return false;
+      if (pos >= in.size()) { return false;
+}
       const char ch = in[pos++];
-      std::uint32_t digit;
-      if (ch >= 'a' && ch <= 'z') digit = static_cast<std::uint32_t>(ch - 'a');
-      else if (ch >= '0' && ch <= '9') digit = static_cast<std::uint32_t>(ch - '0' + 26);
-      else return false;
-      if (digit > (0xFFFFFFFFu - i) / w) return false;   // overflow guard
+      std::uint32_t digit = 0;
+      if (ch >= 'a' && ch <= 'z') { digit = static_cast<std::uint32_t>(ch - 'a');
+      } else if (ch >= '0' && ch <= '9') { digit = static_cast<std::uint32_t>(ch - '0' + 26);
+      } else { return false;
+}
+      if (digit > (0xFFFFFFFFU - i) / w) { return false;   // overflow guard
+}
       i += digit * w;
       const std::uint32_t t = k <= bias ? kTmin : (k >= bias + kTmax ? kTmax : k - bias);
-      if (digit < t) break;
-      if (w > 0xFFFFFFFFu / (kBase - t)) return false;    // overflow guard
+      if (digit < t) { break;
+}
+      if (w > 0xFFFFFFFFU / (kBase - t)) { return false;    // overflow guard
+}
       w *= (kBase - t);
       k += kBase;
     }
@@ -393,11 +554,51 @@ inline bool punycode_decode(const std::string& in, std::vector<std::uint32_t>& o
     bias = adapt(i - oldi, numpoints, oldi == 0);
     n += i / numpoints;
     i = i % numpoints;
-    if (n > 0x10FFFF) return false;                        // not a valid code point
+    if (n > 0x10FFFF) { return false;                        // not a valid code point
+}
     out.insert(out.begin() + i, n);
     ++i;
   }
   return true;
+}
+
+// Decode an `xn--` stem to UTF-8, or "" if it is not one (or is malformed).
+//
+// Separate from confusable_fold_unicode below, which decodes the SAME label but
+// then folds it through the confusables skeleton to catch a homoglyph. That is a
+// different question from "what does this domain actually say", and the skeleton
+// answers it wrongly for accented Latin: é is not a confusable of e, it is a
+// French letter, so the skeleton leaves it alone and the caller sees no keyword.
+//
+// The two encodings are not interchangeable and that asymmetry is the bug this
+// exists for: GMime decodes the From header's `xn--` to raw UTF-8, while BODY
+// URL hosts stay ASCII `xn--`. So `amazon-prime-résiliation.com` was caught in
+// the From and missed in a link, for the same message.
+inline std::string idn_to_utf8(const std::string& sld) {
+  if (sld.rfind("xn--", 0) != 0) { return "";
+}
+  std::vector<std::uint32_t> cps;
+  if (!punycode_decode(sld.substr(4), cps)) { return "";
+}
+  std::string out;
+  for (std::uint32_t cp : cps) {
+    if (cp < 0x80) {
+      out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+      out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+      out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+      out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+      out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+  }
+  return out;
 }
 
 // Confusable-fold a non-ASCII domain stem onto the brand it imitates (TASK-237 AC#3).
@@ -410,13 +611,14 @@ inline bool punycode_decode(const std::string& in, std::vector<std::uint32_t>& o
 inline std::string confusable_fold_unicode(const std::string& sld) {
   std::vector<std::uint32_t> cps;
   if (sld.rfind("xn--", 0) == 0) {
-    if (!punycode_decode(sld.substr(4), cps)) return "";
+    if (!punycode_decode(sld.substr(4), cps)) { return "";
+}
   } else {
     bool non_ascii = false;
     const auto* p = reinterpret_cast<const unsigned char*>(sld.data());
     const auto* end = p + sld.size();
     while (p < end) {                       // minimal UTF-8 decode (matches tokenize_display)
-      std::uint32_t cp;
+      std::uint32_t cp = 0;
       if (*p < 0x80) { cp = *p; ++p; }
       else if ((*p >> 5) == 0x6 && p + 1 < end) { cp = ((*p & 0x1F) << 6) | (p[1] & 0x3F); p += 2; non_ascii = true; }
       else if ((*p >> 4) == 0xE && p + 2 < end) { cp = ((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); p += 3; non_ascii = true; }
@@ -424,13 +626,15 @@ inline std::string confusable_fold_unicode(const std::string& sld) {
       else { cp = 0xFFFD; ++p; non_ascii = true; }
       cps.push_back(cp);
     }
-    if (!non_ascii) return "";              // pure ASCII: nothing cross-script to fold
+    if (!non_ascii) { return "";              // pure ASCII: nothing cross-script to fold
+}
   }
   std::string folded;
   folded.reserve(cps.size());
   for (const std::uint32_t cp : cps) {
     const char b = brand_fold_base(cp);
-    if (b) folded.push_back(b);             // unmapped code points drop out
+    if (b) { folded.push_back(b);             // unmapped code points drop out
+}
   }
   return folded;
 }
@@ -442,9 +646,11 @@ inline std::string confusable_fold_unicode(const std::string& sld) {
 // sender Cyrillic-encodes its ASCII brand); the ASCII digit/rn fold stays Tier-1 only.
 inline bool is_homoglyph_domain(const std::string& org_domain) {
   const std::string sld = domain_stem(org_domain);
-  if (sld.size() < 4) return false;
+  if (sld.size() < 4) { return false;
+}
   const std::string uni = confusable_fold_unicode(sld);
-  if (!uni.empty() && brand_tier(uni) != 0 && !is_generic_token(uni)) return true;
+  if (!uni.empty() && brand_tier(uni) != 0 && !is_generic_token(uni)) { return true;
+}
   const std::string folded = confusable_fold(sld);
   return folded != sld && is_distinctive_brand(folded);
 }
@@ -457,7 +663,8 @@ inline bool is_homoglyph_domain(const std::string& org_domain) {
 // combosquat over Reply-To / body URLs false-fires on legit ESP and notification infra
 // (hubspotemail-na2.net, notif-laposte.info) that legit mail routinely references.
 inline bool is_lookalike_domain(const std::string& from_org_domain) {
-  if (is_homoglyph_domain(from_org_domain)) return true;
+  if (is_homoglyph_domain(from_org_domain)) { return true;
+}
   const std::string sld = domain_stem(from_org_domain);
   // Combosquat: a hyphen-delimited token is a distinctive brand, but the whole stem
   // is not itself a brand. The generic guard keeps a legit hyphenated name
@@ -467,8 +674,10 @@ inline bool is_lookalike_domain(const std::string& from_org_domain) {
     while (start <= sld.size()) {
       const std::size_t dash = sld.find('-', start);
       const std::size_t len = (dash == std::string::npos) ? sld.size() - start : dash - start;
-      if (len >= 4 && is_distinctive_brand(sld.substr(start, len))) return true;
-      if (dash == std::string::npos) break;
+      if (len >= 4 && is_distinctive_brand(sld.substr(start, len))) { return true;
+}
+      if (dash == std::string::npos) { break;
+}
       start = dash + 1;
     }
   }
@@ -485,7 +694,8 @@ inline bool is_lookalike_domain(const std::string& from_org_domain) {
 inline BrandMatch display_impersonates_brand(const std::string& display_name,
                                              const std::string& from_org_domain) {
   BrandMatch m;
-  if (display_name.empty() || from_org_domain.empty()) return m;
+  if (display_name.empty() || from_org_domain.empty()) { return m;
+}
   const std::string fstem = domain_stem(from_org_domain);
   // The sending domain stem STARTS WITH this string (a look-alike domain whose
   // name sits at the front: "societe" under societegenerale.fr).
@@ -497,39 +707,59 @@ inline BrandMatch display_impersonates_brand(const std::string& display_name,
   // against: "PayPaI" from paypal.com matches via conf="paypal", so the conf form
   // is the one that owns the domain.
   struct Match { int tier; const std::string* form; };
-  auto match_brand = [&](const DisplayToken& t) -> Match {
+  auto const match_brand = [&](const DisplayToken& t) -> Match {
     // A generic word (france, partners, support, ...) never matches as a brand even
     // when it is coincidentally a Tranco stem; the role/continuation lists win.
     // len>=3 admits the curated short brands (DHL/UPS/SFR); brand_tier returns 0 for
     // any other 3-char token, so the noise floor is unchanged.
     if (t.plain.size() >= 3 && !is_generic_token(t.plain)) {
-      const int tt = brand_tier(t.plain); if (tt) return {tt, &t.plain};
+      const int tt = brand_tier(t.plain); if (tt) { return {tt, &t.plain};
+}
     }
     if (t.perturbed && t.conf.size() >= 3 && !is_generic_token(t.conf)) {
       // Conservative capital-I->l fold: unambiguous, so admitted at any tier
       // (DecathIon -> decathlon, Tier-2).
-      const int tt = brand_tier(t.conf); if (tt) return {tt, &t.conf};
+      const int tt = brand_tier(t.conf); if (tt) { return {tt, &t.conf};
+}
     }
     if (t.conf_hg != t.conf && t.conf_hg.size() >= 3 && !is_generic_token(t.conf_hg)) {
-      // Aggressive digit/rn homoglyph fold (PayPa1 -> paypal): admitted only for a
-      // DISTINCTIVE (Tier-1) brand, so a digit coincidence can't fold onto a
-      // dictionary-word (Tier-2) brand and false-fire (FN2, TASK-251).
-      if (brand_tier(t.conf_hg) == 1) return {1, &t.conf_hg};
+      // Aggressive digit/rn homoglyph fold (PayPa1 -> paypal, AMAZ0N -> amazon).
+      //
+      // TIER-1 ONLY UNTIL 2026-08-29 (FN2, TASK-251), on the worry that a digit
+      // coincidence would fold onto a dictionary-word brand and false-fire. That
+      // left 'AMAZ0N' raising no claim at all while 'PayPa1' did, and the domain
+      // fold already covered BOTH tiers (amaz0n.com fires), so the display path
+      // was the odd one out rather than the careful one.
+      //
+      // The worry was reasonable and turned out to be unfounded, and that is a
+      // measurement rather than an argument. Admitting Tier-2 here is 0/30 on the
+      // brand-impersonation battery's ham classes and 0/32 on its legit-FP gate,
+      // and on the 1,479-message transactional ham panel it changes NOTHING:
+      // display_impersonation fires on exactly 35 messages with the gate and 35
+      // without it, the same 35, measured by building both ways. The reason is
+      // structural: this branch only runs when the fold CHANGED the token
+      // (conf_hg != conf), so an ordinary all-letter display never reaches it,
+      // and the Tier-2 shape guard below still requires every other token to be
+      // a role word, owned, or a brand.
+      const int tt = brand_tier(t.conf_hg); if (tt) { return {tt, &t.conf_hg};
+}
     }
     return {0, nullptr};
   };
   // A token whose plain OR folded form sits at the front of the sending domain is
   // an owned look-alike, not a spoof of that token (TASK-230 homoglyph-aware).
-  auto token_owned = [&](const DisplayToken& t) {
+  auto const token_owned = [&](const DisplayToken& t) {
     return owns_prefix(t.plain) || (t.perturbed && owns_prefix(t.conf));
   };
   // A digit-obfuscated role word must not break the impersonation shape
   // (TASK-268): '1' reads as BOTH 'l' and 'i', so try the shared conf_hg fold
   // (1->l, rn->m: "A1ert") and the 1->i leet reading ("Serv1ce", "B1ll1ng").
   // The digit guard skips the second fold for the common all-letter token.
-  auto digit_obfuscated_role = [](const DisplayToken& t) {
-    if (t.conf_hg != t.plain && is_role_word(t.conf_hg)) return true;
-    if (t.plain.find_first_of("013457") == std::string::npos) return false;
+  auto const digit_obfuscated_role = [](const DisplayToken& t) {
+    if (t.conf_hg != t.plain && is_role_word(t.conf_hg)) { return true;
+}
+    if (t.plain.find_first_of("013457") == std::string::npos) { return false;
+}
     return is_role_word(leet_fold(t.plain, 'i', /*fold_rn=*/false));
   };
 
@@ -554,20 +784,30 @@ inline BrandMatch display_impersonates_brand(const std::string& display_name,
   // below), leaving only the un-owned brand to fire.
   for (const DisplayToken& t : tokens) {
     const Match mt = match_brand(t);
-    if (mt.tier && *mt.form == fstem) return m;  // (a) sender IS this brand's bare domain
+    if (mt.tier && *mt.form == fstem) { return m;  // (a) sender IS this brand's bare domain
+}
   }
-  std::string lead_plain, lead_conf;
+  std::string lead_plain;
+  std::string lead_conf;
   for (const DisplayToken& t : tokens) {
     lead_plain += t.plain;
     lead_conf += t.perturbed ? t.conf : t.plain;
-    if (lead_plain == fstem || lead_conf == fstem) return m;  // (b) leading tokens spell the stem
-    if (lead_plain.size() >= fstem.size()) break;  // == lead_conf.size() (conf fold is 1:1)
+    if (lead_plain == fstem || lead_conf == fstem) { return m;  // (b) leading tokens spell the stem
+}
+    if (lead_plain.size() >= fstem.size()) { break;  // == lead_conf.size() (conf fold is 1:1)
+}
   }
 
-  bool tier2_present = false, ambiguous_present = false, distinctive_leftover = false;
-  std::string tier1_brand, tier2_brand, ambiguous_brand;
+  bool tier2_present = false;
+  bool ambiguous_present = false;
+  bool distinctive_leftover = false;
+  std::vector<std::string> leftover_candidates;
+  std::string tier1_brand;
+  std::string tier2_brand;
+  std::string ambiguous_brand;
   for (const DisplayToken& t : tokens) {
-    if (token_owned(t)) continue;              // an owned look-alike token is a different signal
+    if (token_owned(t)) { continue;              // an owned look-alike token is a different signal
+}
     const Match mt = match_brand(t);
     if (mt.tier == 1 && mt.form == &t.plain && is_ambiguous_brand(t.plain)) {
       // Ambiguous Tier-1 (surname-brand, TASK-268): Tier-1 strength but only with
@@ -575,10 +815,13 @@ inline BrandMatch display_impersonates_brand(const std::string& display_name,
       // spelling qualifies: a homoglyph fold ("B0ulanger" -> boulanger) has no
       // personal-name population, so it stays plain Tier-1 below.
       ambiguous_present = true;
-      if (ambiguous_brand.empty()) ambiguous_brand = t.plain;
+      if (ambiguous_brand.empty()) { ambiguous_brand = t.plain;
+}
     }
-    else if (mt.tier == 1) { m.tier1 = true; if (tier1_brand.empty()) tier1_brand = *mt.form; }
-    else if (mt.tier == 2) { tier2_present = true; if (tier2_brand.empty()) tier2_brand = *mt.form; }
+    else if (mt.tier == 1) { m.tier1 = true; if (tier1_brand.empty()) { tier1_brand = *mt.form;
+}}
+    else if (mt.tier == 2) { tier2_present = true; if (tier2_brand.empty()) { tier2_brand = *mt.form;
+}}
     else if (t.plain.size() >= 4 && t.plain.find_first_not_of("0123456789") != std::string::npos &&
              !is_role_word(t.plain) && !is_brand_continuation(t.plain) &&
              !digit_obfuscated_role(t)) {
@@ -586,7 +829,25 @@ inline BrandMatch display_impersonates_brand(const std::string& display_name,
       // token (an order number) and a digit-obfuscated role word ("Serv1ce",
       // "A1ert") are attacker-typical filler, not a person's distinctive name,
       // so they do NOT break it (TASK-268).
+      //
+      // DEFERRED, not decided here: whether the word is a product line depends
+      // on WHICH brand was matched, and the matching brand is not known until
+      // this loop finishes. Deciding it inline is what produced the global list
+      // that fired on "Live Music" and "Live Nation".
+      leftover_candidates.push_back(t.plain);
+    }
+  }
+  // A leftover that is a product line OF THE BRAND MATCHED does not break the
+  // shape: "Amazon Prime" is Amazon. A product line of some other company does:
+  // "Live Music" is not Live, and "music" is only Apple's and Amazon's word.
+  for (const std::string& leftover : leftover_candidates) {
+    const bool owned =
+        (!tier1_brand.empty() && is_product_line_of(tier1_brand, leftover)) ||
+        (!tier2_brand.empty() && is_product_line_of(tier2_brand, leftover)) ||
+        (!ambiguous_brand.empty() && is_product_line_of(ambiguous_brand, leftover));
+    if (!owned) {
       distinctive_leftover = true;
+      break;
     }
   }
   // An ambiguous brand with the shape intact condemns standalone ("Boulanger
@@ -602,5 +863,4 @@ inline BrandMatch display_impersonates_brand(const std::string& display_name,
   return m;
 }
 
-}  // namespace brand_names
-}  // namespace spam_engine
+} // namespace spam_engine::brand_names

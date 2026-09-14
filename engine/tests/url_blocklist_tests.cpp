@@ -1,8 +1,9 @@
 // Unit tests for the phishing URL blocklist (TASK-201). Dependency-free (no model),
 // like decision_layer_tests — builds a tiny .bin, loads it, checks lookups, and pins
-// FNV-1a cross-language parity with pythonDiscovery/scripts/build_phishing_blocklist.py.
+// FNV-1a cross-language parity with model-lab/scripts/build_phishing_blocklist.py.
 
 #include "../url_blocklist.h"
+#include "must_fopen.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -21,11 +22,14 @@ void check(bool c, const char* what) {
 
 void write_bin(const char* path, const std::vector<std::string>& domains) {
   std::vector<uint64_t> h;
-  for (const auto& d : domains) h.push_back(se::fnv1a_lower(d));
+  h.reserve(domains.size());
+  for (const auto& d : domains) { h.push_back(se::fnv1a_lower(d));
+}
   std::sort(h.begin(), h.end());
-  std::FILE* f = std::fopen(path, "wb");
+  std::FILE* f = must_fopen(path, "wb");
   std::fwrite("KLARPB1\0", 1, 8, f);
-  uint32_t bits = 64, count = static_cast<uint32_t>(h.size());
+  uint32_t bits = 64;
+  auto count = static_cast<uint32_t>(h.size());
   std::fwrite(&bits, 4, 1, f);
   std::fwrite(&count, 4, 1, f);
   std::fwrite(h.data(), sizeof(uint64_t), count, f);
@@ -58,9 +62,10 @@ int main() {
   // 4. a header count larger than the file's actual payload must be rejected BEFORE
   //    the resize (a 4-billion count would allocate 32 GiB to OOM) (TASK-251).
   const char* lying = "/tmp/klar_ublk_lying_count.bin";
-  std::FILE* lf = std::fopen(lying, "wb");
+  std::FILE* lf = must_fopen(lying, "wb");
   std::fwrite("KLARPB1\0", 1, 8, lf);
-  uint32_t lbits = 64, lcount = 4000000000u;  // claims 4e9 hashes...
+  uint32_t lbits = 64;
+  uint32_t lcount = 4000000000U;  // claims 4e9 hashes...
   std::fwrite(&lbits, 4, 1, lf);
   std::fwrite(&lcount, 4, 1, lf);
   const uint64_t one = se::fnv1a_lower("evil.example");

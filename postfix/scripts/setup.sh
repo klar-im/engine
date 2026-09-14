@@ -3,7 +3,6 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 POSTFIX_DIR="$(dirname "$SCRIPT_DIR")"
-REPO_ROOT="$(dirname "$POSTFIX_DIR")"
 
 echo "[postfix/setup] Checking dependencies..."
 
@@ -23,17 +22,17 @@ else
     # Linux
     echo "[postfix/setup] Ensuring system packages..."
     if command -v apt-get >/dev/null 2>&1; then
-        NEEDED=""
-        dpkg -l build-essential >/dev/null 2>&1 || NEEDED="$NEEDED build-essential"
-        dpkg -l cmake >/dev/null 2>&1 || NEEDED="$NEEDED cmake"
-        dpkg -l pkg-config >/dev/null 2>&1 || NEEDED="$NEEDED pkg-config"
-        dpkg -l libmilter-dev >/dev/null 2>&1 || NEEDED="$NEEDED libmilter-dev"
-        dpkg -l libsqlite3-dev >/dev/null 2>&1 || NEEDED="$NEEDED libsqlite3-dev"
-        dpkg -l libgmime-3.0-dev >/dev/null 2>&1 || NEEDED="$NEEDED libgmime-3.0-dev"
-        dpkg -l python3-venv >/dev/null 2>&1 || NEEDED="$NEEDED python3-venv"
-        if [ -n "$NEEDED" ]; then
-            echo "[postfix/setup] Installing: $NEEDED"
-            sudo apt-get update -qq && sudo apt-get install -y -qq $NEEDED
+        NEEDED=()
+        dpkg -l build-essential >/dev/null 2>&1 || NEEDED+=(build-essential)
+        dpkg -l cmake >/dev/null 2>&1 || NEEDED+=(cmake)
+        dpkg -l pkg-config >/dev/null 2>&1 || NEEDED+=(pkg-config)
+        dpkg -l libmilter-dev >/dev/null 2>&1 || NEEDED+=(libmilter-dev)
+        dpkg -l libsqlite3-dev >/dev/null 2>&1 || NEEDED+=(libsqlite3-dev)
+        dpkg -l libgmime-3.0-dev >/dev/null 2>&1 || NEEDED+=(libgmime-3.0-dev)
+        dpkg -l python3-venv >/dev/null 2>&1 || NEEDED+=(python3-venv)
+        if [ "${#NEEDED[@]}" -gt 0 ]; then
+            echo "[postfix/setup] Installing: ${NEEDED[*]}"
+            sudo apt-get update -qq && sudo apt-get install -y -qq "${NEEDED[@]}"
         fi
     fi
 fi

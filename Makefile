@@ -24,9 +24,13 @@ build:
 	@engine/scripts/build.sh
 	@postfix/scripts/build.sh
 
-test: build
+test: build stalwart/test-unit
 	cd engine && ctest --test-dir build --output-on-failure --timeout 600
 	cd postfix && ctest --test-dir build --output-on-failure --timeout 120
+
+# stalwart/: the same milter behind Stalwart. `make stalwart/test-e2e` runs the
+# compose stack (docker compose + network); `make stalwart/apply` wires a server.
+include stalwart/Makefile
 
 # Download an HF model and convert it into engine/model/ (encoder GGUF + head).
 # Defaults to the public production model (icosha/spam-xlmr-v1, CC-BY-NC-4.0) so

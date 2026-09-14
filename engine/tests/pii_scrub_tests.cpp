@@ -11,10 +11,11 @@
 
 using spam_engine::scrub_body_text;
 
-static int g_failures = 0;
+namespace {
+int g_failures = 0;
 
-static void check(bool cond, const std::string& name,
-                  const std::string& detail = "") {
+void check(bool cond, const std::string& name,
+           const std::string& detail = "") {
   if (cond) {
     std::printf("[PASS] %s\n", name.c_str());
   } else {
@@ -23,6 +24,7 @@ static void check(bool cond, const std::string& name,
     ++g_failures;
   }
 }
+}  // namespace
 
 int main() {
   // Normal redaction still works after the input cap was added.
@@ -43,7 +45,7 @@ int main() {
   // One case per dangerous pattern: hex/colon (IPv6), digits (phone/card), and a
   // data: URI payload (the linear strip). A regression here is a SEGFAULT, not a
   // soft failure — the test crashing IS the signal.
-  auto stress = [&](const std::string& label, const std::string& evil) {
+  auto const stress = [&](const std::string& label, const std::string& evil) {
     const auto t0 = std::chrono::steady_clock::now();
     const std::string out = scrub_body_text(evil, {});
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -53,9 +55,10 @@ int main() {
                                 std::to_string(out.size()) + " bytes out");
   };
   {
-    const std::size_t n = 4 * 1024 * 1024;
+    const auto n = static_cast<std::size_t>(4 * 1024 * 1024);
     std::string hexcolon(n, '1');
-    for (std::size_t i = 0; i < n; i += 2) hexcolon[i] = ':';
+    for (std::size_t i = 0; i < n; i += 2) { hexcolon[i] = ':';
+}
     stress("pathological hex/colon body bounded (IPv6 regex)", hexcolon);
     stress("pathological digit body bounded (phone/card regex)", std::string(n, '1'));
     stress("pathological data: URI body bounded (linear strip)", "data:" + std::string(n, 'A'));

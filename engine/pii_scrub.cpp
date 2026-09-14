@@ -1,9 +1,12 @@
 #include "pii_scrub.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <regex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -23,23 +26,26 @@ const std::set<std::string>& dropped_headers() {
   return s;
 }
 
-const std::string kPlaceholder = "<redacted>";
+constexpr std::string_view kPlaceholder = "<redacted>";
 
 std::string to_lower(std::string s) {
-  for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  for (auto& c : s) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+}
   return s;
 }
 
 std::string trim(const std::string& s) {
   const size_t a = s.find_first_not_of(" \t");
-  if (a == std::string::npos) return "";
+  if (a == std::string::npos) { return "";
+}
   const size_t b = s.find_last_not_of(" \t");
   return s.substr(a, b - a + 1);
 }
 
 // A strip-table header name (lower-cased): the explicit set or the ARC-* family.
 bool is_sensitive_name(const std::string& lower) {
-  if (recipient_headers().count(lower) || dropped_headers().count(lower)) return true;
+  if (recipient_headers().count(lower) || dropped_headers().count(lower)) { return true;
+}
   return lower.rfind("arc-", 0) == 0;
 }
 
@@ -61,13 +67,15 @@ std::vector<std::string> split_lines(const std::string& text) {
 // Strip leading quote markers ('>') and whitespace off a body line.
 std::pair<std::string, std::string> de_quote(const std::string& line) {
   size_t i = 0;
-  while (i < line.size() && (line[i] == '>' || line[i] == ' ' || line[i] == '\t')) i++;
+  while (i < line.size() && (line[i] == '>' || line[i] == ' ' || line[i] == '\t')) { i++;
+}
   return {line.substr(0, i), line.substr(i)};
 }
 
 std::string value_after_colon(const std::string& s) {
   const size_t colon = s.find(':');
-  if (colon == std::string::npos) return "";
+  if (colon == std::string::npos) { return "";
+}
   return trim(s.substr(colon + 1));
 }
 
@@ -77,11 +85,15 @@ bool sensitive_header_start(const std::string& line, std::string& prefix, std::s
   const auto dq = de_quote(line);
   const std::string& rest = dq.second;
   const size_t colon = rest.find(':');
-  if (colon == std::string::npos) return false;
+  if (colon == std::string::npos) { return false;
+}
   name = rest.substr(0, colon);
-  if (name.empty()) return false;
-  if (name.find(' ') != std::string::npos || name.find('\t') != std::string::npos) return false;
-  if (!is_sensitive_name(to_lower(name))) return false;
+  if (name.empty()) { return false;
+}
+  if (name.find(' ') != std::string::npos || name.find('\t') != std::string::npos) { return false;
+}
+  if (!is_sensitive_name(to_lower(name))) { return false;
+}
   prefix = dq.first;
   return true;
 }
@@ -92,7 +104,8 @@ bool is_fold_continuation(const std::string& line) {
   size_t i = 0;
   while (i < line.size() && line[i] == '>') {
     i++;
-    if (i < line.size() && line[i] == ' ') i++;
+    if (i < line.size() && line[i] == ' ') { i++;
+}
   }
   return i < line.size() && (line[i] == ' ' || line[i] == '\t');
 }
@@ -100,29 +113,38 @@ bool is_fold_continuation(const std::string& line) {
 // True for an IPv6-looking token. Requires a `::` or a hex letter so pure-digit,
 // colon-separated values (timestamps like 10:30:45, MACs) are NOT matched.
 bool looks_like_ipv6(const std::string& s) {
-  bool has_hex = false, has_colons = false;
+  bool has_hex = false;
   int colons = 0;
-  for (char c : s) {
-    if (c == ':') { colons++; has_colons = true; }
-    else if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) has_hex = true;
-    else if (!(c >= '0' && c <= '9')) return false;  // only hex digits + colons
+  for (char const c : s) {
+    if (c == ':') {
+      colons++;
+    } else if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+      has_hex = true;
+    } else if (c < '0' || c > '9') {
+      return false;  // only hex digits + colons
+    }
   }
-  if (colons < 2) return false;
+  if (colons < 2) {
+    return false;
+  }
   return s.find("::") != std::string::npos || has_hex;
 }
 
 // True if the text carries contact PII we must not leak: an email address or an
 // IP literal (the routing IPs in `Received:` lines).
 bool contains_contact_pii(const std::string& text) {
-  if (text.find('@') != std::string::npos) return true;
+  if (text.find('@') != std::string::npos) { return true;
+}
   static const std::regex ipv4(R"(\b\d{1,3}(\.\d{1,3}){3}\b)");
-  if (std::regex_search(text, ipv4)) return true;
+  if (std::regex_search(text, ipv4)) { return true;
+}
   static const std::regex ipv6_candidate(R"([0-9A-Fa-f:]{2,45}:[0-9A-Fa-f:]{1,45})");
-  std::smatch m;
   std::string s = text;
-  auto begin = std::sregex_iterator(s.begin(), s.end(), ipv6_candidate);
-  for (auto it = begin; it != std::sregex_iterator(); ++it)
-    if (looks_like_ipv6(it->str())) return true;
+  auto const begin = std::sregex_iterator(s.begin(), s.end(), ipv6_candidate);
+  for (auto it = begin; it != std::sregex_iterator(); ++it) {
+    if (looks_like_ipv6(it->str())) { return true;
+}
+}
   return false;
 }
 
@@ -148,6 +170,8 @@ std::string redact_where(const std::string& body, const std::regex& re,
 // Redact bare email addresses in body text, KEEPING the domain as spam signal
 // (the local-part is the identifier): john.doe@evil.ru -> <email>@evil.ru.
 std::string redact_emails(const std::string& body) {
+  if (body.find('@') == std::string::npos) { return body;
+}
   // Bounded quantifiers: libstdc++ std::regex recurses per matched char, so an
   // unbounded run of matching bytes from an attacker body stack-overflows. RFC
   // limits keep the bounds well above any real address (local<=64, domain<=255).
@@ -160,23 +184,72 @@ std::string redact_emails(const std::string& body) {
 std::string redact_url_identifiers(const std::string& body) {
   static const std::regex enc_email(R"([A-Za-z0-9._.+\-]{1,64}%(?:25)?40[A-Za-z0-9._%+\-]{1,255}\.[A-Za-z]{2,24})",
                                      std::regex::icase);
-  std::string s = std::regex_replace(body, enc_email, "<email>");
+  std::string s = body.find('%') == std::string::npos
+      ? body : std::regex_replace(body, enc_email, "<email>");
+  if (s.find('?') == std::string::npos && s.find('&') == std::string::npos) {
+    return s;
+  }
   static const std::regex track(
       R"(([?&](?:email|e|u|eid|uid|rcpt|recipient|subscriber|mailto|toaddr)=)[^&\s"'<>]{1,512})",
       std::regex::icase);
   return std::regex_replace(s, track, "$1<redacted>");
 }
 
-// Redact phone-number-shaped runs: a candidate with 7–15 digits. Digit-count is
-// checked in code (regex can't), so order numbers / prices (too few digits) and
-// long IDs (too many) are left alone.
+bool is_phone_body_char(char c) {
+  const auto value = static_cast<unsigned char>(c);
+  return std::isdigit(value) || std::isspace(value) || c == '(' || c == ')' ||
+         c == '.' || c == '-';
+}
+
+// Redact phone-number-shaped runs: a candidate with 7–15 digits. This mirrors
+// `\+?\d[\d\s().\-]{5,30}\d` with a bounded linear scan. std::regex takes
+// seconds on a 256 KiB digit run even with bounded quantifiers, which makes an
+// attacker-controlled contribution body a practical local denial of service.
 std::string redact_phones(const std::string& body) {
-  static const std::regex re(R"(\+?\d[\d\s().\-]{5,30}\d)");
-  return redact_where(body, re, "<phone>", [](const std::string& tok) {
+  std::string out;
+  out.reserve(body.size());
+  size_t i = 0;
+  while (i < body.size()) {
+    const bool has_plus = body[i] == '+';
+    const size_t first_digit = i + (has_plus ? 1 : 0);
+    if (first_digit >= body.size() || !std::isdigit(
+            static_cast<unsigned char>(body[first_digit]))) {
+      out.push_back(body[i++]);
+      continue;
+    }
+
+    // The regex consumes at most 32 characters from its first digit and then
+    // backtracks to the last digit in that window. Preserve the same
+    // non-overlapping chunking so ordinary behavior does not change.
+    const size_t limit = std::min(body.size(), first_digit + 32);
+    size_t scan = first_digit;
+    size_t last_digit = std::string::npos;
+    while (scan < limit && is_phone_body_char(body[scan])) {
+      if (std::isdigit(static_cast<unsigned char>(body[scan]))) {
+        last_digit = scan;
+      }
+      ++scan;
+    }
+    const size_t chars = last_digit == std::string::npos
+        ? 0 : last_digit - first_digit + 1;
+    if (chars < 7) {
+      out.push_back(body[i++]);
+      continue;
+    }
+
     int digits = 0;
-    for (char c : tok) if (c >= '0' && c <= '9') digits++;
-    return digits >= 7 && digits <= 15;
-  });
+    for (size_t j = first_digit; j <= last_digit; ++j) {
+      if (std::isdigit(static_cast<unsigned char>(body[j]))) { ++digits;
+}
+    }
+    if (digits >= 7 && digits <= 15) {
+      out += "<phone>";
+    } else {
+      out.append(body, i, last_digit - i + 1);
+    }
+    i = last_digit + 1;
+  }
+  return out;
 }
 
 // Redact body IPv6 literals (the gate above only covers quoted header lines).
@@ -185,22 +258,62 @@ std::string redact_ipv6(const std::string& body) {
   return redact_where(body, re, "<ip>", looks_like_ipv6);
 }
 
-// Redact card-number-shaped runs that pass the Luhn checksum (13–19 digits with
-// optional space/dash grouping). Luhn keeps false positives near zero.
-std::string redact_credit_cards(const std::string& body) {
-  static const std::regex re(R"(\b(?:\d[ \-]?){13,19}\b)");
-  return redact_where(body, re, "<redacted-number>", [](const std::string& tok) {
-    std::string d;
-    for (char c : tok) if (c >= '0' && c <= '9') d += c;
-    if (d.size() < 13 || d.size() > 19) return false;
-    int sum = 0; bool dbl = false;
-    for (auto it = d.rbegin(); it != d.rend(); ++it) {
-      int v = *it - '0';
-      if (dbl) { v *= 2; if (v > 9) v -= 9; }
-      sum += v; dbl = !dbl;
+bool is_ascii_word(char c) {
+  const auto value = static_cast<unsigned char>(c);
+  return std::isalnum(value) || c == '_';
+}
+
+bool luhn_valid(const std::string& digits) {
+  int sum = 0;
+  bool dbl = false;
+  for (auto it = digits.rbegin(); it != digits.rend(); ++it) {
+    int value = *it - '0';
+    if (dbl) {
+      value *= 2;
+      if (value > 9) { value -= 9;
+}
     }
-    return sum % 10 == 0;
-  });
+    sum += value;
+    dbl = !dbl;
+  }
+  return sum % 10 == 0;
+}
+
+// Redact card-number-shaped runs that pass the Luhn checksum (13–19 digits with
+// optional single-space/dash grouping). The linear scanner consumes an entire
+// overlong run once, so a long attacker-supplied digit body remains cheap.
+std::string redact_credit_cards(const std::string& body) {
+  std::string out;
+  out.reserve(body.size());
+  size_t i = 0;
+  while (i < body.size()) {
+    if (!std::isdigit(static_cast<unsigned char>(body[i])) ||
+        (i > 0 && is_ascii_word(body[i - 1]))) {
+      out.push_back(body[i++]);
+      continue;
+    }
+
+    size_t end = i;
+    std::string digits;
+    while (end < body.size() &&
+           std::isdigit(static_cast<unsigned char>(body[end]))) {
+      digits.push_back(body[end++]);
+      if (end < body.size() && (body[end] == ' ' || body[end] == '-') &&
+          end + 1 < body.size() &&
+          std::isdigit(static_cast<unsigned char>(body[end + 1]))) {
+        ++end;
+      }
+    }
+    const bool right_boundary = end == body.size() || !is_ascii_word(body[end]);
+    if (right_boundary && digits.size() >= 13 && digits.size() <= 19 &&
+        luhn_valid(digits)) {
+      out += "<redacted-number>";
+    } else {
+      out.append(body, i, end - i);
+    }
+    i = end;
+  }
+  return out;
 }
 
 // Redact recipient/routing headers that appear *in the body* (a quoted or
@@ -211,7 +324,8 @@ std::string redact_quoted_headers(const std::vector<std::string>& lines) {
   std::vector<std::string> out;
   size_t i = 0;
   while (i < lines.size()) {
-    std::string prefix, name;
+    std::string prefix;
+    std::string name;
     if (!sensitive_header_start(lines[i], prefix, name)) {
       out.push_back(lines[i]);
       i++;
@@ -224,15 +338,21 @@ std::string redact_quoted_headers(const std::vector<std::string>& lines) {
       j++;
     }
     if (contains_contact_pii(value)) {
-      out.push_back(prefix + name + ": " + kPlaceholder);  // drops the folds too
+      std::string redacted = prefix;
+      redacted += name;
+      redacted += ": ";
+      redacted += kPlaceholder;
+      out.push_back(std::move(redacted));  // drops the folds too
     } else {
-      for (size_t k = i; k < j; k++) out.push_back(lines[k]);  // keep prose verbatim
+      for (size_t k = i; k < j; k++) { out.push_back(lines[k]);  // keep prose verbatim
+}
     }
     i = j;
   }
   std::string joined;
   for (size_t k = 0; k < out.size(); k++) {
-    if (k) joined += "\n";
+    if (k) { joined += '\n';
+}
     joined += out[k];
   }
   return joined;
@@ -242,8 +362,9 @@ std::string redact_quoted_headers(const std::vector<std::string>& lines) {
 std::string regex_escape(const std::string& s) {
   static const std::string special = R"(\^$.|?*+()[]{})";
   std::string out;
-  for (char c : s) {
-    if (special.find(c) != std::string::npos) out += '\\';
+  for (char const c : s) {
+    if (special.find(c) != std::string::npos) { out += '\\';
+}
     out += c;
   }
   return out;
@@ -252,10 +373,13 @@ std::string regex_escape(const std::string& s) {
 // Case-insensitive substring replace of `needle` with `replacement` in `s`.
 std::string replace_ci(const std::string& s, const std::string& needle,
                        const std::string& replacement) {
-  if (needle.empty()) return s;
-  const std::string low_s = to_lower(s), low_n = to_lower(needle);
+  if (needle.empty()) { return s;
+}
+  const std::string low_s = to_lower(s);
+  const std::string low_n = to_lower(needle);
   std::string out;
-  size_t pos = 0, f;
+  size_t pos = 0;
+  size_t f = 0;
   while ((f = low_s.find(low_n, pos)) != std::string::npos) {
     out.append(s, pos, f - pos);
     out += replacement;
@@ -271,7 +395,8 @@ std::string replace_ci(const std::string& s, const std::string& needle,
 // "Park" doesn't nuke "Parking".
 std::string redact_recipient_tokens(std::string s, const std::vector<std::string>& tokens) {
   for (const std::string& tok : tokens) {
-    if (tok.empty()) continue;
+    if (tok.empty()) { continue;
+}
     if (tok.find('@') != std::string::npos) {
       s = replace_ci(s, tok, "<email>");
       std::string at = tok;
@@ -311,7 +436,8 @@ std::string strip_data_uris(const std::string& body) {
     if (is_marker(body, i)) {
       out += "data:<stripped>";
       i += 5;
-      while (i < body.size() && !is_delim(body[i])) ++i;  // skip the payload
+      while (i < body.size() && !is_delim(body[i])) { ++i;  // skip the payload
+}
     } else {
       out += body[i++];
     }
@@ -329,7 +455,7 @@ std::string scrub_body_text(const std::string& body,
   // the head, so truncating here loses nothing (the C ABI also clamps the output
   // to the caller capacity). Only materialise a copy on the rare overflow path —
   // the common case passes `body` straight through by reference.
-  static constexpr size_t kMaxScrubBytes = 256 * 1024;
+  static constexpr auto kMaxScrubBytes = static_cast<size_t>(256 * 1024);
   std::string truncated;
   const std::string& capped = body.size() > kMaxScrubBytes
                                   ? (truncated = body.substr(0, kMaxScrubBytes))

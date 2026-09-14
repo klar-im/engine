@@ -28,7 +28,7 @@ spam_engine_status_t spam_engine_train(
 //   sender shape and train with another, the head's calibration drifts.
 //   See engine/PARITY_PLAN.md.
 //
-// Uses the same RFC822 preprocessing + canonical wrapping path as
+// Uses the same RFC822 preprocessing + model-declared calibration path as
 // classify_rfc822 — bit-for-bit identical, enforced at the C++ type
 // level via CalibratedInputText.
 spam_engine_status_t spam_engine_train_rfc822(
@@ -51,12 +51,53 @@ spam_engine_status_t spam_engine_add_training_sample(
     const char* sender_email,
     int correct_label);
 
-// Train on all queued samples and clear the queue.
-// out_avg_loss and out_trained_count can be NULL if not needed.
+// Train queued samples. On success the queue is empty. If one sample fails,
+// already-applied prefix updates are reported in out_trained_count, the failing
+// sample is dropped from the native queue, and the untried tail remains queued
+// for the next call. out_avg_loss and out_trained_count can be NULL.
 spam_engine_status_t spam_engine_train_incremental(
     spam_engine_handle_t* handle,
     float* out_avg_loss,
     size_t* out_trained_count);
+
+// Which online learner receives a queued correction.
+//
+// FTRL is folded escalate-only at classification time, so FTRL_ONLY can learn
+// personalized spam evidence but can never lower the frozen neural spam side.
+// HEAD_AND_FTRL preserves the existing Klar Plus behavior.
+typedef enum spam_engine_training_mode {
+  SPAM_ENGINE_TRAIN_HEAD_AND_FTRL = 0,
+  SPAM_ENGINE_TRAIN_FTRL_ONLY = 1,
+} spam_engine_training_mode_t;
+
+// Train queued samples with an explicit learner role. FTRL_ONLY returns an
+// average loss of 0 because the FTRL update has no neural cross-entropy loss.
+// Queue/error semantics match spam_engine_train_incremental.
+spam_engine_status_t spam_engine_train_incremental_mode(
+    spam_engine_handle_t* handle,
+    spam_engine_training_mode_t mode,
+    float* out_avg_loss,
+    size_t* out_trained_count);
+
+// Trust-region telemetry (doc-26). Either out-param may be NULL.
+//   out_saturation — ‖w-w0‖ as a fraction of the max_drift budget, maxed over
+//                    the head's four tensors. 1.0 = pinned to the boundary, so
+//                    further corrections displace earlier ones rather than
+//                    adding to them, and the learning rate stops mattering.
+//   out_relative_drift — the same distance without the budget in the
+//                    denominator (‖w-w0‖/‖w0‖).
+// Both read 0 before any training. Diagnostic only; classification ignores them.
+spam_engine_status_t spam_engine_head_drift(
+    spam_engine_handle_t* handle,
+    float* out_saturation,
+    float* out_relative_drift);
+
+// Number of Adam updates applied in this loaded training session. Each
+// successfully applied RFC822 correction contributes one update; distinct
+// plain and HTML bodies form one averaged batch.
+spam_engine_status_t spam_engine_head_optimizer_steps(
+    spam_engine_handle_t* handle,
+    size_t* out_steps);
 
 // Save the trained model weights.
 // If model_path is NULL or empty, saves to the original load path.

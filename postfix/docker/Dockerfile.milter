@@ -1,6 +1,7 @@
 FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    libarchive13t64 \
     libgmime-3.0-0 \
     libmilter1.0.1 \
     libsqlite3-0 \

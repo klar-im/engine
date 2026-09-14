@@ -1,0 +1,160 @@
+---
+# Widened from the TASK-472 first baseline (2026-09-01), which enabled only a
+# curated ~32-check subset because turning on full wildcards produced 1,700+
+# style findings and would have made the warnings-as-errors gate unactionable.
+# That codebase-wide sweep has now happened (TASK-478): every family below is
+# enabled except the ones named, each with its own reason, so the exception
+# list is scoped to individual checks instead of one blanket "too many
+# findings" cutoff.
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  readability-*,
+  modernize-*,
+  misc-*,
+  cppcoreguidelines-*,
+  clang-analyzer-*,
+  portability-*,
+  concurrency-*,
+  -google-*,
+  -cert-*,
+  -modernize-use-trailing-return-type,
+  -modernize-avoid-c-arrays,
+  -modernize-use-string-view,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -readability-function-cognitive-complexity,
+  -readability-trailing-comma,
+  -readability-implicit-bool-conversion,
+  -readability-avoid-nested-conditional-operator,
+  -cppcoreguidelines-pro-bounds-*,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-use-enum-class,
+  -bugprone-narrowing-conversions,
+  -cppcoreguidelines-narrowing-conversions,
+  -bugprone-signed-bitwise,
+  -bugprone-branch-clone,
+  -bugprone-exception-escape,
+  -misc-non-private-member-variables-in-classes,
+  -misc-include-cleaner,
+  -misc-no-recursion,
+  -portability-avoid-pragma-once
+WarningsAsErrors: '*'
+HeaderFilterRegex: '^.*/engine/.*'
+SystemHeaders: false
+CheckOptions:
+  bugprone-easily-swappable-parameters.MinimumLength: '4'
+
+# Exclusion reasons:
+# - google-*: Google C++ style opinions (naming, include order, non-const-ref
+#   params). This codebase doesn't follow Google style; these aren't
+#   correctness findings.
+# - cert-*: CERT rules are aliases of checks already covered once
+#   bugprone-*/cppcoreguidelines-* are on. Enabling both duplicates the same
+#   finding under two names.
+# - modernize-use-trailing-return-type: pure style preference, rewrites every
+#   function signature to `auto f() -> T`. Not adopted here.
+# - modernize-avoid-c-arrays / cppcoreguidelines-avoid-c-arrays: the C ABI
+#   surface (spam_engine_c_api.h and its callers across Swift/ObjC bridging)
+#   needs fixed-layout C arrays; the rest is a large, low-value refactor to
+#   std::array with no correctness upside. One check, listed under both
+#   aliases so it's clear neither half is silently still on.
+# - modernize-use-string-view: changes public function signatures (the
+#   parameter type), which needs a per-call-site check for code that relies
+#   on the string being null-terminated (C library calls, regex). Not a
+#   mechanical fix at this volume.
+# - cppcoreguidelines-avoid-magic-numbers / readability-magic-numbers: fires
+#   on every non-0/1 literal; not high-signal at this codebase's size.
+# - readability-identifier-length: flags every short local (i, j, s, c, n) —
+#   idiomatic in tight loops and math; pure style opinion, not a correctness
+#   finding.
+# - readability-function-cognitive-complexity: structural mismatch for this
+#   codebase's linear parsing/classification functions (tokenizers, shape
+#   matchers), the same reasoning model-lab's ruff config uses to leave
+#   PLR0912/PLR0915 off (model-lab/CLAUDE.md, ruff strictness increment #6).
+#   Refactoring ~50 working functions to satisfy a complexity metric isn't a
+#   good trade here.
+# - readability-trailing-comma: its clang-tidy fixer was observed (TASK-478)
+#   to corrupt a nested empty-brace initializer (`{}` inside an outer
+#   aggregate init) in spam_engine.cpp, dropping the following separator and
+#   breaking the build. Purely cosmetic value, not worth an unreliable
+#   auto-fix or 100+ sites of manual review.
+# - readability-implicit-bool-conversion: fires on idiomatic pointer
+#   truthiness (`if (ptr)`) and on every glib/gmime `gboolean` (aka int)
+#   return this codebase's C-library interop touches. Neither is a
+#   correctness finding.
+# - readability-avoid-nested-conditional-operator: pure style; this codebase
+#   uses short nested ternaries in lookup-style code where the nesting is
+#   the clearest shape.
+# - cppcoreguidelines-pro-bounds-* (all four: pointer-arithmetic,
+#   array-to-pointer-decay, constant-array-index,
+#   avoid-unchecked-container-access), -owning-memory:
+#   these assume the GSL (gsl::span, gsl::owner, gsl::at) or blanket .at()
+#   bounds-checking. The byte/text-processing hot paths (tokenizer, PII
+#   scrubber, URL/IP blocklist matchers) index within loop-bound-checked
+#   ranges; adopting GSL or paying .at()'s bounds-check cost across those
+#   loops is a real perf trade-off, out of scope for a lint pass.
+# - cppcoreguidelines-pro-type-reinterpret-cast: required for the binary I/O
+#   this engine does throughout (GGUF/checkpoint loading, raw byte-buffer
+#   parsing, the C API's byte-copy contract) — there's no reinterpret_cast-
+#   free way to read a typed buffer from a byte stream pre-C++20 bit_cast,
+#   and this codebase targets platforms without a guaranteed bit_cast.
+# - cppcoreguidelines-pro-type-vararg: dominated by printf/fprintf-family
+#   logging and glib/gmime's C API (which is itself varargs-based, e.g.
+#   g_object_set); this is C-library interop, not a bug pattern.
+# - cppcoreguidelines-avoid-non-const-global-variables: every hit is either
+#   the minimal test-harness pass/fail-counter pattern repeated identically
+#   across every *_tests.cpp file, or atexit_teardown_test.cpp's g_handle,
+#   which is structurally required (atexit() callbacks have no other way to
+#   reach state). Neither is the "spooky action at a distance" bug shape
+#   this check exists to catch.
+# - cppcoreguidelines-use-enum-class: verified (TASK-478) every unique hit —
+#   spam_engine_status, spam_engine_profile, spam_engine_training_mode, all
+#   three in headers deliberately written to compile as plain C (extern "C",
+#   stddef.h/stdint.h not cstddef/cstdint, typedef not using —
+#   spam_engine_c_api.h, spam_engine_training_c_api.h). `enum class` doesn't
+#   exist in C, so converting any of them breaks that contract. Permanent,
+#   not deferred: every candidate is genuinely C-ABI-exposed, none was an
+#   internal enum that happened to be unscoped (those were all already
+#   `enum class` — see performance-enum-size, now enabled, same audit).
+# - bugprone-narrowing-conversions / cppcoreguidelines-narrowing-conversions:
+#   dominated by completely idiomatic `size_t` <-> iterator `difference_type`
+#   arithmetic (`vec.begin() + n`) and small size_t-to-float ratio
+#   computations — both unavoidable without wrapping every container/
+#   iterator use, and neither is a real precision-loss risk at this
+#   codebase's data sizes.
+# - bugprone-signed-bitwise: verified (TASK-478) to be a false-positive
+#   pattern here, not a real signedness bug — it fires on the STATIC type of
+#   an operand (any bare hex literal like `0xE0`, or an int-promoted
+#   `unsigned char`), not on whether the value can actually be negative. Sampled
+#   across brand_names.h's UTF-8 decoder (`unsigned char*`, promotion is
+#   value-preserving), ftrl_classifier.h's UTF-8 encoder (`uint32_t cp`, an
+#   unsuffixed hex literal ORed with it), and its signed-hash sign-bit
+#   extraction (`uint64_t >> 63`) — none had an actual sign-extension bug,
+#   and the check has no fixit.
+# - bugprone-branch-clone: verified (TASK-478) to false-positive on
+#   intentional lookup-table-style code where distinct conditions
+#   legitimately produce the same result (no_contact_shape.h's accent-fold
+#   table maps both the uppercase and lowercase Latin-1 ranges to the same
+#   folded letter; ftrl_classifier.h's UTF-8 decoder handles an ASCII byte
+#   and a malformed continuation byte identically on purpose).
+# - bugprone-exception-escape: every hit (TASK-478) is either "main() may
+#   throw" in a test/CLI binary (acceptable — a loud crash with a message
+#   beats swallowing the error) or a lambda passed to std::async, whose
+#   exception is safely captured by the returned future, not a std::terminate
+#   risk. None is the destructor/noexcept-function throw this check exists
+#   to catch.
+# - misc-non-private-member-variables-in-classes: conflicts with existing
+#   plain-struct patterns used throughout the engine.
+# - misc-include-cleaner: IWYU-strict and noisy independent of correctness.
+# - misc-no-recursion: MISRA-style blanket ban on recursion; not a real
+#   constraint for this codebase.
+# - portability-avoid-pragma-once: this codebase and its generated headers
+#   universally use #pragma once, supported by every compiler this project
+#   targets (AppleClang, Ubuntu clang). Not a portability target.

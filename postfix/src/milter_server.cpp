@@ -1,7 +1,11 @@
 #include "milter_server.h"
 #include "session_context.h"
+#include "auth_results.h"
 #include "policy.h"
 #include <libmilter/mfapi.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <iostream>
 #include <sstream>
 #include <cstring>
@@ -19,13 +23,23 @@ static std::shared_ptr<const Config> g_cfg;
 static ModelRuntime* g_runtime = nullptr;
 static EventStore*   g_store   = nullptr;
 static ServerState*  g_state   = nullptr;
+static OriginIpBlocklist* g_ip_blocklist = nullptr;
+// Parsed once at startup / SIGHUP from cfg.trusted_relay_cidrs. Read-only during
+// operation, like the other globals here.
+static TrustedRelays g_trusted_relays;
 
 void set_global_state(std::shared_ptr<const Config> cfg, ModelRuntime* runtime,
-                      EventStore* store, ServerState* state) {
+                      EventStore* store, ServerState* state,
+                      OriginIpBlocklist* ip_blocklist) {
     std::atomic_store(&g_cfg, std::move(cfg));
     g_runtime = runtime;
     g_store   = store;
     g_state   = state;
+    g_ip_blocklist = ip_blocklist;
+}
+
+void set_trusted_relays(const TrustedRelays& relays) {
+    g_trusted_relays = relays;
 }
 
 void swap_global_config(std::shared_ptr<const Config> new_cfg) {
@@ -120,7 +134,26 @@ static void parse_from_header(const std::string& value,
 // Milter callbacks
 // ---------------------------------------------------------------------------
 
-static sfsistat xxfi_connect(SMFICTX* ctx, char* /* hostname */, _SOCK_ADDR* /* hostaddr */) {
+// Textual form of the connecting peer's address, "" for a unix socket, an
+// unknown family, or a NULL hostaddr (Postfix passes NULL for a local
+// submission). This is the ONLY address allowed to feed the DROP offset: it is
+// what the MTA observed on the wire, not what a header claims (TASK-113).
+static std::string peer_ip_text(const _SOCK_ADDR* hostaddr) {
+    if (hostaddr == nullptr) return {};
+    const void* src = nullptr;
+    if (hostaddr->sa_family == AF_INET) {
+        src = &reinterpret_cast<const struct sockaddr_in*>(hostaddr)->sin_addr;
+    } else if (hostaddr->sa_family == AF_INET6) {
+        src = &reinterpret_cast<const struct sockaddr_in6*>(hostaddr)->sin6_addr;
+    } else {
+        return {};
+    }
+    char buf[INET6_ADDRSTRLEN] = {0};
+    if (inet_ntop(hostaddr->sa_family, src, buf, sizeof(buf)) == nullptr) return {};
+    return buf;
+}
+
+static sfsistat xxfi_connect(SMFICTX* ctx, char* /* hostname */, _SOCK_ADDR* hostaddr) {
     auto cfg = std::atomic_load(&g_cfg);
     if (static_cast<int>(g_state->inflight_sessions.load(std::memory_order_relaxed))
         >= cfg->max_inflight_sessions) {
@@ -133,6 +166,7 @@ static sfsistat xxfi_connect(SMFICTX* ctx, char* /* hostname */, _SOCK_ADDR* /* 
 
     auto* session = new SessionContext();
     session->started = std::chrono::steady_clock::now();
+    session->connect_ip = peer_ip_text(hostaddr);
     smfi_setpriv(ctx, session);
 
     return SMFIS_CONTINUE;
@@ -148,6 +182,7 @@ static sfsistat xxfi_envfrom(SMFICTX* ctx, char** argv) {
 
     // Clear per-message state (connection reuse)
     session->raw_rfc822.clear();
+    session->received.clear();
     session->rcpt_to.clear();
     session->from_header_name.clear();
     session->from_header_email.clear();
@@ -157,6 +192,7 @@ static sfsistat xxfi_envfrom(SMFICTX* ctx, char** argv) {
     session->bypass_due_overload = false;
     session->queue_id.clear();
     session->started = std::chrono::steady_clock::now();
+    session->drop_auth_results = ignores_auth_results(*std::atomic_load(&g_cfg));
 
     return SMFIS_CONTINUE;
 }
@@ -174,6 +210,12 @@ static sfsistat xxfi_header(SMFICTX* ctx, char* headerf, char* headerv) {
     auto* session = static_cast<SessionContext*>(smfi_getpriv(ctx));
     if (!session) return SMFIS_TEMPFAIL;
 
+    // auth_results = "ignore": the engine never sees the client's claims about
+    // its own authentication (config.h). Dropped here, before accumulation, so
+    // the bytes handed to classify_rfc822 carry no such header at all, which is
+    // the state the engine reads as DMARC Unknown.
+    if (session->drop_auth_results && is_auth_results_header(headerf)) return SMFIS_CONTINUE;
+
     // Accumulate raw RFC822
     session->raw_rfc822 += headerf;
     session->raw_rfc822 += ": ";
@@ -181,6 +223,13 @@ static sfsistat xxfi_header(SMFICTX* ctx, char* headerf, char* headerv) {
     session->raw_rfc822 += "\r\n";
 
     // Parse interesting headers
+    if (strcasecmp(headerf, "Received") == 0) {
+        // Bounded: a forged message can carry thousands of Received lines, and
+        // the trust walk only ever reads down to the first untrusted hop anyway.
+        if (session->received.size() < 32) {
+            session->received.emplace_back(headerv ? headerv : "");
+        }
+    }
     if (strcasecmp(headerf, "From") == 0) {
         parse_from_header(headerv, session->from_header_name, session->from_header_email);
     } else if (strcasecmp(headerf, "Message-ID") == 0) {
@@ -249,10 +298,27 @@ static sfsistat xxfi_eom(SMFICTX* ctx) {
     auto cfg = std::atomic_load(&g_cfg);
 
     // Classify
+    // Resolve the origin against the DROP list here, at the layer that owns the
+    // connection, and hand the engine the answer (TASK-113/387). Behind a
+    // configured trusted relay the observed peer is our own hop, so the origin
+    // comes from the Received chain instead — and is reported as the WEAKER
+    // header-derived signal, never as an observed one.
+    const bool have_list = g_ip_blocklist != nullptr;
+    const bool connect_ip_blocked =
+        have_list && g_ip_blocklist->contains(session->connect_ip);
+    bool header_ip_blocked = false;
+    if (have_list && !connect_ip_blocked) {
+        const std::string origin = klar::resolve_origin_ip(
+            session->connect_ip, session->received, g_trusted_relays);
+        header_ip_blocked = origin != session->connect_ip &&
+                            g_ip_blocklist->contains(origin);
+    }
+
     ClassifyResult cr = g_runtime->classify_rfc822(
         session->raw_rfc822,
         session->from_header_name,
-        session->mail_from);
+        session->mail_from,
+        connect_ip_blocked, header_ip_blocked);
 
     // Evaluate policy
     PolicyResult pr = evaluate_policy(
@@ -287,6 +353,7 @@ static sfsistat xxfi_eom(SMFICTX* ctx) {
     ev.error_code     = pr.error_code;
     ev.message_id_header = truncate_header_value(session->message_id_header, 1024);
     ev.policy_reason  = pr.policy_reason;
+    ev.fired_offsets  = cr.fired_offsets;
 
     // Record & log
     g_store->record(ev);
@@ -301,12 +368,23 @@ static sfsistat xxfi_eom(SMFICTX* ctx) {
 
     add_hdr("X-Klar-Event-ID",        ev.event_id);
     add_hdr("X-Klar-Label",          pr.label);
+    add_hdr("X-Klar-Class",          pr.klass);
     add_hdr("X-Klar-Score-Spam",     fmt_score(pr.score_spam));
     add_hdr("X-Klar-Score-Regular",  fmt_score(pr.score_regular));
     add_hdr("X-Klar-Score-Marketing", fmt_score(pr.score_marketing));
     add_hdr("X-Klar-Score-Gibberish", fmt_score(pr.score_gibberish));
     add_hdr("X-Klar-Action",         action_to_string(pr.action));
     add_hdr("X-Klar-Model-Version",  g_runtime->loaded_model_version());
+    // Only stamped when it fires: the scores above explain a content-driven
+    // verdict, but a DROP hit is the one reason a low-scoring message can still
+    // be junked, and an operator debugging that needs to see it (TASK-113).
+    if (connect_ip_blocked || header_ip_blocked) {
+        // The value names the PROVENANCE, because the two carry different weight
+        // and an operator debugging a verdict needs to know which one fired.
+        add_hdr("X-Klar-Origin-IP",
+                connect_ip_blocked ? "drop-listed" : "drop-listed-via-relay");
+        g_state->origin_ip_blocked.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // Update metrics
     g_state->decisions_total.fetch_add(1, std::memory_order_relaxed);
@@ -413,7 +491,8 @@ int milter_setup(const Config& cfg) {
 // Prometheus metrics
 // ---------------------------------------------------------------------------
 
-std::string generate_metrics(const ServerState& state, const ModelRuntime& runtime) {
+std::string generate_metrics(const ServerState& state, const ModelRuntime& runtime,
+                             const OriginIpBlocklist& ip_blocklist) {
     std::ostringstream os;
 
     os << "# HELP klar_inflight_sessions Number of active milter sessions\n"
@@ -445,6 +524,23 @@ std::string generate_metrics(const ServerState& state, const ModelRuntime& runti
     os << "# HELP klar_model_generation Model reload generation counter\n"
        << "# TYPE klar_model_generation counter\n"
        << "klar_model_generation " << runtime.generation() << "\n";
+
+    // Origin-IP reputation (TASK-113). Three series, because this layer dies
+    // silently in three ways: the artifact never shipped (0 ranges), nobody
+    // refreshes it (stale), or it loads fresh and never matches because the
+    // address never reaches the lookup (a flat 0 counter against the measured
+    // ~3% of spam). Alert on all three.
+    os << "# HELP klar_ip_blocklist_ranges Loaded DROP netblock ranges (0 = signal off)\n"
+       << "# TYPE klar_ip_blocklist_ranges gauge\n"
+       << "klar_ip_blocklist_ranges " << ip_blocklist.size() << "\n";
+
+    os << "# HELP klar_ip_blocklist_stale DROP list older than ip_blocklist_max_age_days\n"
+       << "# TYPE klar_ip_blocklist_stale gauge\n"
+       << "klar_ip_blocklist_stale " << (ip_blocklist.stale() ? 1 : 0) << "\n";
+
+    os << "# HELP klar_origin_ip_blocked_total Messages from a DROP-listed IP\n"
+       << "# TYPE klar_origin_ip_blocked_total counter\n"
+       << "klar_origin_ip_blocked_total " << state.origin_ip_blocked.load(std::memory_order_relaxed) << "\n";
 
     return os.str();
 }

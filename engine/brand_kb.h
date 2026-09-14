@@ -21,12 +21,13 @@
 #include "brand_names.h"  // domain_stem + brand_tier (distinctive-brand gate)
 #include "fnv1a.h"
 
-namespace spam_engine {
-namespace brand_kb {
+
+namespace spam_engine::brand_kb {
 
 // The full org-domain is a canonical brand domain (apple.com, boursorama.fr).
 inline bool is_canonical_domain(const std::string& org_domain) {
-  if (org_domain.empty()) return false;
+  if (org_domain.empty()) { return false;
+}
   const std::uint64_t h = fnv1a_lower(org_domain);
   return std::binary_search(kKbCanonicalHashes, kKbCanonicalHashes + kKbCanonicalHashesCount, h);
 }
@@ -43,7 +44,8 @@ inline bool kb_auth_pair_less(const KbBrandAuthPair& a, const KbBrandAuthPair& b
 
 // The KB knows brand X's authenticated sending domains (so a mismatch is meaningful).
 inline bool brand_has_auth_set(const std::string& brand) {
-  if (brand.empty()) return false;
+  if (brand.empty()) { return false;
+}
   const KbBrandAuthPair key{fnv1a_lower(brand), 0};
   const KbBrandAuthPair* end = kKbBrandAuthPairs + kKbBrandAuthPairsCount;
   const KbBrandAuthPair* it = std::lower_bound(kKbBrandAuthPairs, end, key, kb_auth_pair_less);
@@ -52,10 +54,30 @@ inline bool brand_has_auth_set(const std::string& brand) {
 
 // org_domain is one of brand X's authenticated sending domains (X claimed it, X sent it).
 inline bool domain_in_brand_auth_set(const std::string& brand, const std::string& org_domain) {
-  if (brand.empty() || org_domain.empty()) return false;
+  if (brand.empty() || org_domain.empty()) { return false;
+}
   const KbBrandAuthPair key{fnv1a_lower(brand), fnv1a_lower(org_domain)};
   return std::binary_search(kKbBrandAuthPairs, kKbBrandAuthPairs + kKbBrandAuthPairsCount,
                             key, kb_auth_pair_less);
+}
+
+// org_domain appears in ANY brand's authenticated set (brand-agnostic membership,
+// for the kb_brand_dmarc_pass rescue where the credential is "a curated brand's
+// own sending domain", no display claim needed). The pairs are sorted by brand,
+// not domain, so build a sorted domain index once on first use.
+inline bool is_auth_set_domain(const std::string& org_domain) {
+  if (org_domain.empty()) { return false;
+}
+  static const std::vector<std::uint64_t> kDomains = [] {
+    std::vector<std::uint64_t> v;
+    v.reserve(kKbBrandAuthPairsCount);
+    for (auto const kKbBrandAuthPair : kKbBrandAuthPairs) { v.push_back(kKbBrandAuthPair.domain);
+}
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    return v;
+  }();
+  return std::binary_search(kDomains.begin(), kDomains.end(), fnv1a_lower(org_domain));
 }
 
 // The message's DMARC outcome, as a THREE-state verdict. The brand-ownership exonerations below
@@ -65,7 +87,7 @@ inline bool domain_in_brand_auth_set(const std::string& brand, const std::string
 // FP-safe rule "exonerate unless DMARC positively FAILED" cannot be re-collapsed into a boolean
 // (the bug that regressed this exoneration twice: DKIM-only, then dmarc_pass, each folding Unknown
 // into the condemn side). The only state that blocks exoneration is Fail.
-enum class DmarcVerdict { Unknown, Pass, Fail };
+enum class DmarcVerdict : std::uint8_t { Unknown, Pass, Fail };
 
 // The sender is authenticated AS brand X on a domain X owns: From's org-domain is in X's
 // authenticated set, DMARC did not positively fail, and the domain is NOT a shared sender platform.
@@ -93,7 +115,8 @@ inline bool authenticated_canonical(const std::string& org_domain, DmarcVerdict 
 
 // The label is exactly a curated brand's SLD ("paypal", "boursorama").
 inline bool is_brand_sld(const std::string& sld) {
-  if (sld.size() < 4) return false;
+  if (sld.size() < 4) { return false;
+}
   const std::uint64_t h = fnv1a_lower(sld);
   return std::binary_search(kKbBrandSldHashes, kKbBrandSldHashes + kKbBrandSldHashesCount, h);
 }
@@ -103,7 +126,8 @@ inline bool is_brand_sld(const std::string& sld) {
 // written as separate words concatenates to this; the hyphenated canonical SLD
 // would never match it. Used only by the multi-word JOIN matcher below.
 inline bool is_joined_sld(const std::string& joined) {
-  if (joined.size() < 6) return false;
+  if (joined.size() < 6) { return false;
+}
   const std::uint64_t h = fnv1a_lower(joined);
   return std::binary_search(kKbJoinedSldHashes, kKbJoinedSldHashes + kKbJoinedSldHashesCount, h);
 }
@@ -124,9 +148,11 @@ inline bool is_joined_sld(const std::string& joined) {
 inline brand_names::BrandMatch display_join_impersonates(const std::string& display_name,
                                                          const std::string& from_org_domain) {
   brand_names::BrandMatch m;
-  if (display_name.empty() || from_org_domain.empty()) return m;
+  if (display_name.empty() || from_org_domain.empty()) { return m;
+}
   const std::vector<brand_names::DisplayToken> tokens = brand_names::tokenize_display(display_name);
-  if (tokens.size() < 2) return m;
+  if (tokens.empty()) { return m;
+}
   // This identifies the multi-word brand a display CLAIMS and exempts only the structural
   // owns-prefix case (the sender's stem IS the brand). The authenticated-domain exemption is NOT
   // applied here: the matched brand is returned so the combine routes it through the same
@@ -134,37 +160,89 @@ inline brand_names::BrandMatch display_join_impersonates(const std::string& disp
   const std::string fstem = brand_names::domain_stem(from_org_domain);
   // A brand's own hyphenated domain (deutsche-bank.com -> stem "deutsche-bank")
   // owns the hyphen-free join form "deutschebank", so for a hyphenated stem also
-  // accept the hyphen-stripped form, by EQUALITY: a combosquat (deutsche-bank-
-  // secure.com -> "deutschebanksecure") is a longer string, not the brand, so it
-  // still fires. A non-hyphenated stem needs only the prefix test (the stripped
-  // form would equal the stem). Prefix-equality keeps the existing exemption for a
-  // brand at the front of its own stem.
+  // accept the hyphen-stripped form. Both tests are EQUALITY.
+  //
+  // This used to accept a PREFIX for the non-hyphenated case, and that was the
+  // hole TASK-440 walked through: "geeksquad-invoice-dept.com" has the stem
+  // "geeksquad-invoice-dept", which starts with "geeksquad", so the reported Geek
+  // Squad scam was exempted as the brand owning its own name. A stem that merely
+  // begins with a brand is the definition of a combosquat, and the hyphenated
+  // branch already knew that ("deutsche-bank-secure" is a longer string, not the
+  // brand); the non-hyphenated branch just did not.
+  //
+  // Nothing legitimate is lost by tightening it, because ownership is not this
+  // function's job: a domain the brand really does send from is either in the KB's
+  // canonical set or authenticates as the brand, and the combine routes every
+  // match returned here through authenticated_as_brand / authenticated_canonical
+  // before anything condemns. Prefix-exemption here short-circuited that check.
   std::string fstem_joined;
   if (fstem.find('-') != std::string::npos) {
-    for (char c : fstem) {
-      if (c != '-') fstem_joined.push_back(c);
+    for (char const c : fstem) {
+      if (c != '-') { fstem_joined.push_back(c);
+}
     }
   }
-  auto owns = [&](const std::string& form) {
-    return (fstem.size() >= form.size() && fstem.compare(0, form.size(), form) == 0) ||
-           fstem_joined == form;
+  auto const owns = [&](const std::string& form) {
+    return fstem == form || fstem_joined == form;
   };
-  auto is_brand_join = [](const std::string& j) {
+  auto const is_brand_join = [](const std::string& j) {
     return is_brand_sld(j) || is_joined_sld(j);
   };
+  // A SINGLE token can be a multi-word brand's join, and missing that left the
+  // letter-spacing evasion half-open after TASK-459 closed it for single-word
+  // brands. tokenize_display now collapses a run of single-character tokens, so
+  // "D e u t s c h e B a n k" arrives here as ONE token "deutschebank": the
+  // display's own word boundary is not recoverable from a string that separates
+  // every letter. With the >= 2 guard this returned immediately, and
+  // brand_tier has no hyphenless "deutschebank", so the claim was 0 while
+  // "Deutsche Bank" was 1. Found by a cold review, which is also why the join
+  // matcher is the right place for it rather than a second collapse rule:
+  // is_joined_sld exists precisely to hold these hyphen-stripped forms.
+  // NARROW ON PURPOSE, and the first version was not. It ran is_brand_join over
+  // EVERY token, and that predicate includes is_brand_sld, so "Apple Valley
+  // News" and "Amazon River" matched Tier-1 here and never reached the Tier-2
+  // impersonation shape guard that exists to keep exactly those out. Four tests
+  // caught it immediately, which is what those tests are for.
+  //
+  // Two restrictions, each carrying its own reason:
+  //   spaced_join  the token came from collapsing a letter-spaced run, so its
+  //                internal word boundaries are genuinely unrecoverable. An
+  //                ordinary token has boundaries and belongs to the tiered paths.
+  //   is_joined_sld ONLY, never is_brand_sld: a single-word brand written with
+  //                spaces ("A m a z o n") is already handled by brand_tier on
+  //                the normal path, with its tier and shape rules intact. What
+  //                needs this is the multi-word brand whose canonical SLD is
+  //                hyphenated, which is the one form no other path can see.
+  for (const brand_names::DisplayToken& t : tokens) {
+    if (!t.spaced_join) { continue;
+}
+    const std::string* form = is_joined_sld(t.plain) ? &t.plain
+                            : (t.perturbed && is_joined_sld(t.conf)) ? &t.conf : nullptr;
+    if (!form) { continue;
+}
+    if (owns(*form)) { return brand_names::BrandMatch{};
+}
+    m.tier1 = true;
+    m.brand = *form;
+    return m;
+  }
   for (std::size_t i = 0; i + 1 < tokens.size(); ++i) {
-    std::string plain, conf;
+    std::string plain;
+    std::string conf;
     bool perturbed = false;
     for (std::size_t j = i; j < tokens.size() && j < i + 3; ++j) {
       plain += tokens[j].plain;
       conf += tokens[j].conf;
       perturbed = perturbed || tokens[j].perturbed;
-      if (j == i) continue;  // a join is >= 2 tokens
+      if (j == i) { continue;  // a join is >= 2 tokens
+}
       const std::string* form = is_brand_join(plain) ? &plain
                               : (perturbed && is_brand_join(conf)) ? &conf : nullptr;
-      if (!form) continue;
-      if (owns(*form))
+      if (!form) { continue;
+}
+      if (owns(*form)) {
         return brand_names::BrandMatch{};  // sender's stem IS the brand -> not a spoof
+}
       // A non-owned multi-word brand claim: Tier-1, carrying the matched brand for the combine.
       m.tier1 = true;
       m.brand = *form;
@@ -177,12 +255,17 @@ inline brand_names::BrandMatch display_join_impersonates(const std::string& disp
 // True when a and b differ by exactly one edit (insert / delete / substitute).
 // Transposition is not counted (a v1 simplification); identical strings are false.
 inline bool within_edit1(const std::string& a, const std::string& b) {
-  const int la = static_cast<int>(a.size()), lb = static_cast<int>(b.size());
-  if (la - lb > 1 || lb - la > 1) return false;
-  int i = 0, j = 0, diff = 0;
+  const int la = static_cast<int>(a.size());
+  const int lb = static_cast<int>(b.size());
+  if (la - lb > 1 || lb - la > 1) { return false;
+}
+  int i = 0;
+  int j = 0;
+  int diff = 0;
   while (i < la && j < lb) {
     if (a[i] == b[j]) { ++i; ++j; continue; }
-    if (++diff > 1) return false;
+    if (++diff > 1) { return false;
+}
     if (la == lb) { ++i; ++j; }   // substitution
     else if (la > lb) { ++i; }    // deletion from a
     else { ++j; }                 // insertion into a
@@ -202,9 +285,10 @@ inline bool within_edit1(const std::string& a, const std::string& b) {
 inline const std::vector<std::string>& distinctive_slds() {
   static const std::vector<std::string> v = [] {
     std::vector<std::string> out;
-    for (std::size_t k = 0; k < kKbBrandSldStringsCount; ++k) {
-      const std::string s = kKbBrandSldStrings[k];
-      if (s.size() >= 5 && brand_names::is_distinctive_brand(s)) out.push_back(s);
+    for (const auto *kKbBrandSldString : kKbBrandSldStrings) {
+      const std::string s = kKbBrandSldString;
+      if (s.size() >= 5 && brand_names::is_distinctive_brand(s)) { out.push_back(s);
+}
     }
     return out;
   }();
@@ -220,9 +304,11 @@ inline const std::vector<std::string>& distinctive_slds() {
 // A legit regional brand signs aligned from its own domain, never via a throwaway,
 // so corroboration-gating eliminates the regional false-positive class.
 inline bool is_tld_swap_kb(const std::string& org_domain) {
-  if (is_canonical_domain(org_domain)) return false;
+  if (is_canonical_domain(org_domain)) { return false;
+}
   const std::string sld = brand_names::domain_stem(org_domain);
-  if (sld.size() < 4) return false;
+  if (sld.size() < 4) { return false;
+}
   return is_brand_sld(sld) && brand_names::is_distinctive_brand(sld);
 }
 
@@ -236,11 +322,14 @@ inline bool is_tld_swap_kb(const std::string& org_domain) {
 // part); an unclaimed one-edit domain is ambiguous with a legit same-name company
 // and joins the corroboration-gated Tier-2 path, exactly like the TLD-swap.
 inline std::string typosquat_target_kb(const std::string& org_domain) {
-  if (is_canonical_domain(org_domain)) return "";
+  if (is_canonical_domain(org_domain)) { return "";
+}
   const std::string sld = brand_names::domain_stem(org_domain);
-  if (sld.size() < 5) return "";
+  if (sld.size() < 5) { return "";
+}
   for (const std::string& b : distinctive_slds()) {
-    if (within_edit1(sld, b)) return b;
+    if (within_edit1(sld, b)) { return b;
+}
   }
   return "";
 }
@@ -251,12 +340,13 @@ inline std::string typosquat_target_kb(const std::string& org_domain) {
 // folding (dеutsche-bank -> deutschebank, сredit-agricole -> creditagricole) is caught.
 // A homoglyph is an unambiguous MORPH, never legit -> the caller treats it as Tier-1.
 inline bool is_idn_lookalike_kb(const std::string& org_domain) {
-  if (is_canonical_domain(org_domain)) return false;
+  if (is_canonical_domain(org_domain)) { return false;
+}
   const std::string uni =
       brand_names::confusable_fold_unicode(brand_names::domain_stem(org_domain));
-  if (uni.size() < 4) return false;
+  if (uni.size() < 4) { return false;
+}
   return is_brand_sld(uni) || is_joined_sld(uni);
 }
 
-}  // namespace brand_kb
-}  // namespace spam_engine
+} // namespace spam_engine::brand_kb

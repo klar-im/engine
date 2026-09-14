@@ -1,0 +1,12 @@
+From: Stripe <receipts@stripe.com>
+To: you@example.com
+Subject: Your June invoice
+Date: Mon, 13 Jul 2026 09:12:00 +0200
+Content-Type: text/plain; charset=utf-8
+
+Invoice INV-0245 was paid. A copy is attached for your records.
+
+Amount: EUR 24.00
+Billing period: 1-30 June
+
+Thanks for your business.

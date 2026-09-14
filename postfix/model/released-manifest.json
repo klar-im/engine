@@ -1,0 +1,41 @@
+{
+  "files": {
+    "classifier_config.json": {
+      "md5_b64": "TZevL42Shr/MbxX4mlC3BA==",
+      "sha256": "bd799b915c9f9df1baa5e9aac15056ef363692e07dafcf09c53414a1ec807383",
+      "size": 146
+    },
+    "classifier_dense_bias.bin": {
+      "md5_b64": "smw7t8qno84Umwa8uUjWnQ==",
+      "sha256": "eedc2d176f3aa6002ecc7c6b417914d6b5dc4b897f759b8355f0658a87b1d8e7",
+      "size": 4096
+    },
+    "classifier_dense_weight.bin": {
+      "md5_b64": "HqpPIKZ4gG+XmJW7QYc/tQ==",
+      "sha256": "c93f75ac402b07a3ebee1efdeb3dba6ba132690a7a8a15138abffbb31fdb7d3b",
+      "size": 4194304
+    },
+    "classifier_out_proj_bias.bin": {
+      "md5_b64": "tllXd2xS51EKoIj76aj7Ow==",
+      "sha256": "d295088f3851d9fcdf4e49f54e2af7f18cf8dde768d264402c20117d025e7506",
+      "size": 16
+    },
+    "classifier_out_proj_weight.bin": {
+      "md5_b64": "uwDzAuFDUWfcNF2IsYx9JQ==",
+      "sha256": "567ef2933c75506bc6bbc6c51dc6f4c631e5bfa720d15e46e9b50fa896c0896f",
+      "size": 16384
+    },
+    "ftrl_baseline.bin": {
+      "md5_b64": "B/IEn1DsFReGQZw5Rmmi4Q==",
+      "sha256": "a08229f289a42eb9e4597b34b576b0272ac2a372fd2689d3e4d0a37630b787bf",
+      "size": 8388652
+    },
+    "gguf/encoder-q4_k_m.gguf": {
+      "md5_b64": "qwFhCv40c6omLMgTpuKayg==",
+      "sha256": "85707d2a714c2f019549a84378e4418cd30cf06b0ecbabc894fbbfacd148db4e",
+      "size": 406917696
+    }
+  },
+  "model_uuid": "21bcd2ff-beaf-41d4-aa84-8083083d3554",
+  "source_model": null
+}

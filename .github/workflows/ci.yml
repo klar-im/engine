@@ -17,6 +17,7 @@ on:
     branches: [main]
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 concurrency:
@@ -94,3 +95,82 @@ jobs:
 
       - name: Run C ABI tests
         run: make test
+
+  # Stalwart + klar-milterd, end to end (stalwart/scripts/test_e2e.sh): the
+  # image built from this tree with no weights, the model fetched into its
+  # volume on first start, upstream's Stalwart image beside it, both modes
+  # (shadow and final) driven over SMTP and read back over JMAP. Needs docker
+  # compose, which ubuntu-latest has, and ~400 MB from Klar's public bucket.
+  #
+  # The image is built ONCE here, through buildx with the Actions layer cache
+  # (the engine compile is the slow layer and rarely changes), then handed to
+  # the compose stack prebuilt and saved as an artifact for the release job,
+  # which retags what was tested rather than compiling a third time.
+  stalwart-e2e:
+    timeout-minutes: 40
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - name: Build klar-milterd (cached layers)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: postfix/docker/Dockerfile
+          tags: klar-milterd:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Stalwart + klar-milterd end to end
+        env:
+          KLAR_MILTERD_IMAGE: klar-milterd:ci
+        run: bash stalwart/scripts/test_e2e.sh
+      - name: Save the tested image for the release job
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: docker save klar-milterd:ci | gzip > klar-milterd-image.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: klar-milterd-image
+          path: klar-milterd-image.tar.gz
+          retention-days: 1
+
+  # A tag v* publishes the klar-milterd image the E2E just exercised to ghcr.io
+  # (no weights, licence-gated model fetch at first start) and opens a GitHub
+  # Release for it. GITHUB_TOKEN is the only credential and only this job may
+  # write; the two jobs above stay read-only.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-and-test, stalwart-e2e]
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: klar-milterd-image
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Push the tested image
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/klar-milterd
+          TAG=${GITHUB_REF_NAME}
+          docker load < klar-milterd-image.tar.gz
+          docker tag klar-milterd:ci "$IMAGE:$TAG"
+          docker tag klar-milterd:ci "$IMAGE:latest"
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+      - name: Prove the pushed image refuses without the licence flag
+        run: |
+          set +e
+          docker run --rm "ghcr.io/${{ github.repository_owner }}/klar-milterd:${GITHUB_REF_NAME}" >/dev/null 2>&1
+          [ $? -eq 3 ] || { echo "the image must exit 3 without KLAR_ACCEPT_MODEL_LICENSE"; exit 1; }
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "klar-milterd $GITHUB_REF_NAME" --generate-notes \
+            --notes "Container image: \`ghcr.io/${{ github.repository_owner }}/klar-milterd:${GITHUB_REF_NAME}\` (built from this tag, no weights; first start fetches the CC-BY-NC-4.0 model with KLAR_ACCEPT_MODEL_LICENSE=1). Stalwart setup: stalwart/README.md. Postfix setup: postfix/README.md."

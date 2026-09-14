@@ -1,12 +1,15 @@
 [Unit]
-Description=Klar Milter Daemon for Postfix
-After=network.target postfix.service
+Description=Klar spam-filter milter (Postfix, Stalwart, or any libmilter MTA)
+After=network.target
 
 [Service]
 Type=simple
 User=klarmilter
 Group=klarmilter
-ExecStart=/usr/local/bin/klar-milterd --config /etc/klar/postfix.toml
+# postfix/scripts/install.sh puts the binary and every library it loads in one
+# directory; LD_LIBRARY_PATH makes that directory the only one that matters.
+Environment=LD_LIBRARY_PATH=/opt/klar/bin
+ExecStart=/opt/klar/bin/klar-milterd --config /etc/klar/klar-milterd.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
@@ -16,7 +19,9 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/klar /var/log/klar-milter /var/spool/klar-milter
+# The event store and (if fetched at runtime) the model live here; the model
+# may also be read-only elsewhere (model_dir in the toml), which strict allows.
+ReadWritePaths=/var/lib/klar
 
 [Install]
 WantedBy=multi-user.target

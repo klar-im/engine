@@ -25,7 +25,12 @@ struct DecisionEvent {
     std::string error_code;      // "E_NONE", "E_ENGINE_LOAD", etc.
     std::string message_id_header;
     std::string event_id;        // UUIDv4
-    std::string policy_reason;   // "ml", "allowlist_sender", etc.
+    std::string policy_reason;   // "ml", "structural", "allowlist_sender", etc.
+    // Which structural offsets fired, comma-separated, "!" marking the one that
+    // flipped the verdict (TASK-388). Straight from the engine fold, so a junked
+    // message with a near-zero content score is explainable after the fact
+    // instead of reading as an inexplicable "ml" decision.
+    std::string fired_offsets;
 };
 
 struct FeedbackEvent {
@@ -51,6 +56,7 @@ private:
     sqlite3* db_ = nullptr;
     mutable std::mutex mutex_;
     bool ensure_schema();
+    bool apply_migrations();
 };
 
 // Generate a UUIDv4 string

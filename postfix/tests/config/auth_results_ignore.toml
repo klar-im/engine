@@ -1,0 +1,15 @@
+# test_auth_results.sh: the Stalwart-shaped deployment, where the milter sees the
+# client's raw bytes and must not believe an Authentication-Results it carries.
+mode = "tag"
+profile = "standard"
+fail_open = true
+timeout_ms = 1500
+max_message_bytes = 5242880
+
+model_dir = "engine/model"
+model_version_file = ""
+ip_blocklist_path = ""
+
+auth_results = "ignore"
+
+event_store_path = "/tmp/klar-policy-replay-events.sqlite3"

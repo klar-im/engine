@@ -1,0 +1,4 @@
+CompileFlags:
+  # CMake writes this database during engine/setup. clangd also reads the
+  # sibling .clang-tidy, so editor diagnostics and make engine/lint share rules.
+  CompilationDatabase: build

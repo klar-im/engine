@@ -1,0 +1,12 @@
+From: Stripe <receipts@stripe.com>
+To: you@example.com
+Subject: Votre facture de juin
+Date: Mon, 13 Jul 2026 09:12:00 +0200
+Content-Type: text/plain; charset=utf-8
+
+La facture INV-0245 a été réglée. Une copie est jointe.
+
+Montant : 24,00 EUR
+Période : 1er au 30 juin
+
+Merci de votre confiance.

@@ -1,7 +1,7 @@
 # Postfix Milter Specification
 
 Status: v1 — implemented and tested
-Last updated: 2026-03-13
+Last updated: 2026-07-12
 Primary deliverables: `klar-milterd` (milter daemon), `klar-policy-cli` (offline CLI)
 
 ## 1. Product statement
@@ -14,16 +14,18 @@ There is no quarantine. We are not an antivirus product. Messages are either del
 
 ## 2. Terminology
 
-1. `score.spam`: `result.scores.spam` from C ABI.
-2. `label`: binary decision (`spam` or `regular`).
-3. `profile`: threshold preset:
+1. `score.spam`: `result.scores.spam` from C ABI (raw model head).
+2. `score.spam_adjusted`: `score.spam` after the engine decision layer folds the parsed sender-auth signals (`spam_engine_decision_input_from_signals` + `spam_engine_decide`, TASK-179/231). All threshold labeling uses this value, not the raw head.
+3. `structural_condemn`: decision-layer flag for a structural spam signal (e.g. free-host/throwaway DKIM signer) independent of the content model.
+4. `label`: binary decision (`spam` or `regular`).
+5. `profile`: threshold preset:
    - `cautious=0.70`,
    - `standard=0.50`,
    - `aggressive=0.30`.
-4. `fail-open`: accept mail when scoring path fails.
-5. `allowlist`: sender/domain override that forces `TAG`.
-6. `blocklist`: sender/domain override that forces `REJECT`.
-7. `domain policy`: recipient-domain-specific policy override.
+6. `fail-open`: accept mail when scoring path fails.
+7. `allowlist`: sender/domain override that forces `TAG`.
+8. `blocklist`: sender/domain override that forces `REJECT`.
+9. `domain policy`: recipient-domain-specific policy override.
 
 ## 3. Exact behavior definitions
 
@@ -32,6 +34,9 @@ There is no quarantine. We are not an antivirus product. Messages are either del
 1. Message is always accepted.
 2. Headers added:
    - `X-Klar-Label` (`spam` or `regular`),
+   - `X-Klar-Class` (4-class argmax over the raw scores:
+     `regular|marketing|gibberish|spam`; informative companion to the binary
+     label, lets deployments file marketing separately),
    - `X-Klar-Score-Spam`,
    - `X-Klar-Score-Regular`,
    - `X-Klar-Score-Marketing`,
@@ -39,12 +44,13 @@ There is no quarantine. We are not an antivirus product. Messages are either del
    - `X-Klar-Action` (`tag`, `reject`, or `bypass`),
    - `X-Klar-Model-Version`,
    - `X-Klar-Event-ID` (UUIDv4).
-3. Dovecot Sieve files messages with `X-Klar-Label: spam` to Junk folder.
+3. Dovecot Sieve files `X-Klar-Label: spam` to Junk, else
+   `X-Klar-Class: marketing` to Marketing.
 
 ### 3.2 `mode=reject`
 
 1. Message classified at `xxfi_eom`.
-2. If `score.spam >= reject_threshold`:
+2. If `score.spam >= reject_threshold` AND `structural_condemn` (TASK-179: bounce is irreversible, so it requires two independent strong signals; high-confidence-but-uncorroborated spam falls through to TAG, which is recoverable from Junk):
    - call `smfi_setreply(ctx, "550", "5.7.1", "Message rejected by spam policy")`,
    - return `SMFIS_REJECT`.
 3. Else: return `SMFIS_ACCEPT` with headers.
@@ -220,10 +226,10 @@ Action decision (in order):
 3. Else if allowlist matched: `TAG`.
 4. Else if scoring failed and `fail_open=true`: `BYPASS`.
 5. Else if scoring failed and `fail_open=false`: `TEMPFAIL`.
-6. Else if `mode=reject` and `score.spam >= reject_threshold`: `REJECT`.
+6. Else if `mode=reject` and `score.spam >= reject_threshold` and `structural_condemn`: `REJECT`.
 7. Else: `TAG`.
 
-Labels: blocklist → `spam`, allowlist → `regular`, ML → `spam` when `score.spam >= threshold`.
+Labels: blocklist → `spam`, allowlist → `regular`, ML → `spam` when `score.spam_adjusted >= threshold` (offset-adjusted, TASK-179: keeps the label deterministic when the raw head sits near the gate, and junks offset-carried phish the head leaks as marketing).
 
 Header `X-Klar-Action` is one of: `tag`, `reject`, `bypass`.
 
@@ -350,8 +356,16 @@ Global LMTP delivery script (`sieve_before`):
 require ["fileinto"];
 if header :is "X-Klar-Label" "spam" {
     fileinto "Junk";
+} elsif header :is "X-Klar-Class" "marketing" {
+    fileinto "Marketing";
 }
 ```
+
+The spam label takes precedence: a message the milter labels `spam` is always
+filed to Junk even if its 4-class argmax was `marketing`. Non-spam mail whose
+dominant class is `marketing` is filed to a Marketing folder; everything else
+(regular, gibberish) is left in INBOX. The Marketing mailbox must exist and be
+auto-subscribed (`mailbox Marketing { auto = subscribe }` in the namespace).
 
 ### 10.3 Feedback via imapsieve
 

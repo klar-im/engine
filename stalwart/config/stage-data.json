@@ -1,0 +1,4 @@
+{
+  "_comment": "MtaStageData patch: the built-in filter stops deciding (it runs before milters and files on a flag no header clears; README.md). Not applied under apply.py --shadow.",
+  "enableSpamFilter": { "match": {}, "else": "false" }
+}

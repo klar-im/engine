@@ -76,7 +76,7 @@ spam_engine_status_t spam_engine_train(
   }
 
   try {
-    std::lock_guard<std::mutex> lock(handle->mutex);
+    std::scoped_lock const lock(handle->mutex);
 
     if (text == nullptr) {
       return set_error_locked(
@@ -91,12 +91,9 @@ spam_engine_status_t spam_engine_train(
 
     clear_error_locked(handle);
 
-    // Wrap raw text via the canonical wrapper so the head sees the same
-    // input distribution it was trained on. CalibratedInputText enforces
-    // this at the C++ level — there's no other way to reach engine.train.
-    const auto calibrated = spam_engine::build_input_text(
-        {{"user", text, "email"}}, spam_engine::CustomerInfo{});
-    const float loss = handle->engine.train(calibrated, correct_label);
+    // The loaded artifact selects the same neural representation used by
+    // inference; FTRL independently retains its legacy envelope.
+    const float loss = handle->engine.train_text(text, correct_label);
     if (out_loss != nullptr) {
       *out_loss = loss;
     }
@@ -124,7 +121,7 @@ spam_engine_status_t spam_engine_train_rfc822(
   }
 
   try {
-    std::lock_guard<std::mutex> lock(handle->mutex);
+    std::scoped_lock const lock(handle->mutex);
 
     if (const auto validation_status = validate_rfc822_training_input_locked(
             handle, raw_email, raw_email_len, correct_label);
@@ -166,7 +163,7 @@ spam_engine_status_t spam_engine_add_training_sample(
   }
 
   try {
-    std::lock_guard<std::mutex> lock(handle->mutex);
+    std::scoped_lock const lock(handle->mutex);
 
     if (const auto validation_status = validate_rfc822_training_input_locked(
             handle, raw_email, raw_email_len, correct_label);
@@ -194,20 +191,25 @@ spam_engine_status_t spam_engine_add_training_sample(
   }
 }
 
-spam_engine_status_t spam_engine_train_incremental(
+spam_engine_status_t spam_engine_train_incremental_mode(
     spam_engine_handle_t* handle,
+    spam_engine_training_mode_t mode,
     float* out_avg_loss,
     size_t* out_trained_count) {
   if (handle == nullptr) {
     return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
   }
+  if (mode != SPAM_ENGINE_TRAIN_HEAD_AND_FTRL &&
+      mode != SPAM_ENGINE_TRAIN_FTRL_ONLY) {
+    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
+  }
 
   try {
-    std::lock_guard<std::mutex> lock(handle->mutex);
+    std::scoped_lock const lock(handle->mutex);
     clear_error_locked(handle);
 
     if (out_avg_loss != nullptr) {
-      *out_avg_loss = 0.0f;
+      *out_avg_loss = 0.0F;
     }
     if (out_trained_count != nullptr) {
       *out_trained_count = 0;
@@ -222,14 +224,19 @@ spam_engine_status_t spam_engine_train_incremental(
     handle->pending_training_samples.clear();
 
     size_t processed = 0;
-    float loss_sum = 0.0f;
+    float loss_sum = 0.0F;
     try {
       for (; processed < samples.size(); ++processed) {
         const auto& sample = samples[processed];
-        loss_sum += handle->engine.train_rfc822(
-            sample.raw_email,
-            spam_engine::CustomerInfo{sample.sender_name, sample.sender_email, false},
-            sample.correct_label);
+        const auto customer = spam_engine::CustomerInfo{
+            sample.sender_name, sample.sender_email, false};
+        if (mode == SPAM_ENGINE_TRAIN_FTRL_ONLY) {
+          handle->engine.train_ftrl_rfc822(
+              sample.raw_email, customer, sample.correct_label);
+        } else {
+          loss_sum += handle->engine.train_rfc822(
+              sample.raw_email, customer, sample.correct_label);
+        }
       }
     } catch (...) {
       // A sample failed mid-batch. The already-trained ones stay applied (re-queuing
@@ -243,7 +250,8 @@ spam_engine_status_t spam_engine_train_incremental(
       }
       // Report the head that WAS trained and applied, so the caller doesn't read
       // the RUNTIME_ERROR as "nothing applied" and re-train those samples.
-      if (out_trained_count != nullptr) *out_trained_count = processed;
+      if (out_trained_count != nullptr) { *out_trained_count = processed;
+}
       if (out_avg_loss != nullptr && processed > 0) {
         *out_avg_loss = loss_sum / static_cast<float>(processed);
       }
@@ -271,6 +279,67 @@ spam_engine_status_t spam_engine_train_incremental(
   }
 }
 
+spam_engine_status_t spam_engine_train_incremental(
+    spam_engine_handle_t* handle,
+    float* out_avg_loss,
+    size_t* out_trained_count) {
+  return spam_engine_train_incremental_mode(
+      handle,
+      SPAM_ENGINE_TRAIN_HEAD_AND_FTRL,
+      out_avg_loss,
+      out_trained_count);
+}
+
+spam_engine_status_t spam_engine_head_drift(
+    spam_engine_handle_t* handle,
+    float* out_saturation,
+    float* out_relative_drift) {
+  if (handle == nullptr) {
+    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
+  }
+
+  try {
+    std::scoped_lock const lock(handle->mutex);
+    clear_error_locked(handle);
+
+    if (out_saturation != nullptr) {
+      *out_saturation = handle->engine.head_drift_saturation();
+    }
+    if (out_relative_drift != nullptr) {
+      *out_relative_drift = handle->engine.head_relative_drift();
+    }
+    return SPAM_ENGINE_STATUS_OK;
+  } catch (const std::exception& e) {
+    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
+  } catch (...) {
+    return set_error_locked(
+        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR,
+        "Unknown runtime error in spam_engine_head_drift");
+  }
+}
+
+spam_engine_status_t spam_engine_head_optimizer_steps(
+    spam_engine_handle_t* handle,
+    size_t* out_steps) {
+  if (handle == nullptr || out_steps == nullptr) {
+    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
+  }
+  try {
+    std::scoped_lock const lock(handle->mutex);
+    clear_error_locked(handle);
+    *out_steps = static_cast<size_t>(handle->engine.head_optimizer_steps());
+    return SPAM_ENGINE_STATUS_OK;
+  } catch (const std::system_error&) {
+    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
+  } catch (const std::exception& e) {
+    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
+  } catch (...) {
+    return set_error_locked(
+        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR,
+        "Unknown runtime error in spam_engine_head_optimizer_steps");
+  }
+}
+
 spam_engine_status_t spam_engine_save(
     spam_engine_handle_t* handle,
     const char* model_path) {
@@ -279,7 +348,7 @@ spam_engine_status_t spam_engine_save(
   }
 
   try {
-    std::lock_guard<std::mutex> lock(handle->mutex);
+    std::scoped_lock const lock(handle->mutex);
     clear_error_locked(handle);
 
     const std::string path = (model_path != nullptr) ? model_path : "";

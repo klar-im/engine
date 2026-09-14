@@ -46,6 +46,10 @@ bool EventStore::open(const std::string& path) {
     return true;
 }
 
+// Schema version of the CURRENT code. Bump it and add a case to apply_migrations
+// whenever the events/feedback tables change.
+static constexpr int kSchemaVersion = 1;
+
 bool EventStore::ensure_schema() {
     const char* ddl = R"SQL(
 CREATE TABLE IF NOT EXISTS events (
@@ -95,6 +99,77 @@ CREATE INDEX IF NOT EXISTS idx_feedback_ts       ON feedback(ts);
         if (err_msg) sqlite3_free(err_msg);
         return false;
     }
+    return apply_migrations();
+}
+
+// Bring an existing database up to kSchemaVersion (TASK-388).
+//
+// Before this, the schema was CREATE TABLE IF NOT EXISTS and nothing else, so
+// adding a column would have broken every deployed database: the table already
+// exists, IF NOT EXISTS skips it, and the next INSERT names a column that is not
+// there. Hence the version ladder — and hence the DDL above deliberately does NOT
+// carry the new columns, so a fresh database and an upgraded one reach an
+// IDENTICAL schema by the same path instead of two paths that can drift.
+// True if `table` already has `column`. Used to make a step idempotent, so a
+// database left half-migrated by an older build (or any interrupted run) heals on
+// the next open instead of failing forever on "duplicate column name".
+static bool column_exists(sqlite3* db, const char* table, const char* column) {
+    const std::string sql = std::string("PRAGMA table_info(") + table + ");";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
+    bool found = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char* name = sqlite3_column_text(stmt, 1);  // 1 = column name
+        if (name != nullptr && std::strcmp(reinterpret_cast<const char*>(name), column) == 0) {
+            found = true;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+bool EventStore::apply_migrations() {
+    int version = 0;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "PRAGMA user_version;", -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) version = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    if (version >= kSchemaVersion) return true;
+
+    // Each step is idempotent-by-version and applied in order.
+    const char* migrations[] = {
+        // v1: record WHICH structural offsets fired (TASK-388). Defaulted rather
+        // than nullable so every historical row reads as "no offsets recorded"
+        // instead of NULL, which a reader would have to special-case.
+        "ALTER TABLE events ADD COLUMN fired_offsets TEXT NOT NULL DEFAULT '';",
+    };
+
+    // Two guards, because a schema migration gets exactly one chance to be wrong.
+    // (1) Each step runs in a transaction WITH its version bump: SQLite's DDL is
+    //     transactional, so a crash between the two rolls both back rather than
+    //     leaving a database whose schema and version disagree.
+    // (2) Each step is idempotent anyway, so a database ALREADY left in that state
+    //     -- by an older build, or any interrupted run -- heals on the next open
+    //     instead of failing on "duplicate column name" forever. Without (2) a
+    //     single badly-timed kill would be a permanently dead daemon.
+    for (int v = version; v < kSchemaVersion; ++v) {
+        const bool already_applied =
+            v == 0 && column_exists(db_, "events", "fired_offsets");
+        const std::string step = std::string("BEGIN IMMEDIATE;") +
+                                 (already_applied ? "" : migrations[v]) +
+                                 "PRAGMA user_version = " + std::to_string(v + 1) +
+                                 ";COMMIT;";
+        char* err_msg = nullptr;
+        if (sqlite3_exec(db_, step.c_str(), nullptr, nullptr, &err_msg) != SQLITE_OK) {
+            if (err_msg) sqlite3_free(err_msg);
+            sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -107,12 +182,12 @@ INSERT INTO events (
     ts, queue_id, mail_from, rcpt_count, bytes_seen, truncated,
     model_version, score_spam, score_regular, score_marketing, score_gibberish,
     label, action, latency_ms, status, error_code,
-    message_id_header, event_id, policy_reason
+    message_id_header, event_id, policy_reason, fired_offsets
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6,
     ?7, ?8, ?9, ?10, ?11,
     ?12, ?13, ?14, ?15, ?16,
-    ?17, ?18, ?19
+    ?17, ?18, ?19, ?20
 );
 )SQL";
 
@@ -139,6 +214,7 @@ INSERT INTO events (
     sqlite3_bind_text(stmt, 17, event.message_id_header.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 18, event.event_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 19, event.policy_reason.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 20, event.fired_offsets.c_str(), -1, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -296,6 +372,10 @@ std::string event_to_json(const DecisionEvent& e) {
     o << ",\"message_id_header\":\"" << json_escape(e.message_id_header) << "\"";
     o << ",\"event_id\":\"" << json_escape(e.event_id) << "\"";
     o << ",\"policy_reason\":\"" << json_escape(e.policy_reason) << "\"";
+    // Only when something fired, so the common line stays as terse as it was.
+    if (!e.fired_offsets.empty()) {
+        o << ",\"fired_offsets\":\"" << json_escape(e.fired_offsets) << "\"";
+    }
     o << "}";
     return o.str();
 }

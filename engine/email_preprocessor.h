@@ -1,5 +1,7 @@
 #pragma once
 
+#include "attachment_features.h"
+
 #include <string>
 #include <vector>
 
@@ -51,6 +53,22 @@ struct ExtractedAuthFeatures {
   // names): measured 0/51 ham FP, catches the Scaleway/LeroyMerlin phish
   // (TASK-214). Kept in sync with the Swift mirror.
   bool        display_impersonation = false;
+  // The From org-domain is a curated KB brand sending domain (canonical or in a
+  // brand's authenticated set), is NOT a shared sender platform, and the topmost
+  // Authentication-Results says dmarc=pass. The receiver-verified "this really is
+  // amazon.com/coinbase.com mail" credential that gates the strong transactional
+  // ham rescue (TASK-337/334): measured 203 FP rescued / 0 spam lost on real
+  // AR-stamped mail (2,203 ham + 693 junk candidates). Requires an explicit
+  // dmarc=pass, so AR-less offline corpora are unaffected.
+  bool        kb_brand_dmarc_pass = false;
+  // The topmost Authentication-Results says dmarc=pass, for ANY sender: the
+  // receiver's own verdict, not our derivation of it. Distinct from
+  // dmarc_aligned above, which is the stricter DKIM-only form and is false for a
+  // message that passed DMARC through SPF alignment. The parser has computed
+  // this since TASK-337 and discarded it; the callback-shape offset (TASK-440)
+  // needs exactly this looser form, because that is what its false-positive rate
+  // was measured against.
+  bool        dmarc_pass = false;
 };
 
 // Structural body-URL signals for the decision layer (TASK-257). Only the
@@ -59,13 +77,39 @@ struct ExtractedAuthFeatures {
 // wired: a bare-IP host is ~never legit (0/56 ham, structural), whereas
 // shortener wrappers (t.co/lnkd.in) and shared CDNs (S3/imgur/googleapis) carry
 // real legit mail, so their clean corpus rate was sample-luck. See the block in
-// decision_layer.h and pythonDiscovery/scripts/measure_url_structure.py.
+// decision_layer.h and model-lab/scripts/measure_url_structure.py.
 struct ExtractedUrlFeatures {
   // A body link whose host is a bare IPv4 (or IPv6) literal: legit senders use
   // domain names, so this is a textbook phishing tell. IPv4 is the covered case;
-  // IPv6 literals are rare and best-effort (the shared host_from_url port-strip
-  // mangles bracketed forms).
+  // IPv6 literals are covered too: host_from_url understands a bracketed
+  // authority (TASK-389).
   bool raw_ip_url = false;
+};
+
+// Structural BODY signals that are not about links. Computed from body parts
+// preprocess_rfc822 has already collected, so this adds no traversal of its own.
+// (preprocess_rfc822 itself still walks twice — once decoded+normalized, once
+// raw — which predates this and is tracked as TASK-395.)
+struct ExtractedBodyFeatures {
+  // The GTUBE test string (the anti-spam equivalent of EICAR) appears in the
+  // subject or body. Defined by convention to never occur in real mail, so it is
+  // not a heuristic: it is how an operator proves a filter is live end-to-end
+  // without crafting real spam. See kGtubeTest in decision_layer.h.
+  bool gtube_test = false;
+
+  // Brand-independent callback phishing (TASK-440): billing language, a phone
+  // number to call, and NO LINK anywhere. The reasoning, the ham panel it was
+  // measured against and why two obvious extra predicates were left out are all
+  // in callback_shape.h; kCallbackShape in decision_layer.h is what it is worth.
+  bool callback_shape = false;
+
+  // The bank-advisor scam's second message (TASK-460): an instruction NOT to
+  // check with your bank. Chosen over `iban` and `security_id` because those
+  // fire on real bank mail and on prose about the scam; this one is the genre's
+  // defining act. The measured table, the reported-speech discriminator and the
+  // blind spot are in no_contact_shape.h; kNoContactInstruction in
+  // decision_layer.h is what it is worth.
+  bool no_contact_instruction = false;
 };
 
 struct PreprocessedEmail {
@@ -77,6 +121,10 @@ struct PreprocessedEmail {
   std::string normalized_html_text;
   std::string body_text;
   std::string normalized_text;
+  // Candidate-only enrichment derived from the raw HTML. Kept separate from
+  // normalized_* so the loaded neural artifact can opt in without changing
+  // the legacy public model or FTRL feature distribution.
+  std::string structural_marker_prefix;
   // True if the message has a Reply-To header that differs from the From
   // header. Common spam pattern (legitimate senders rarely need to differ).
   // Surfaced via CustomerInfo so the head can learn from it; see
@@ -94,10 +142,14 @@ struct PreprocessedEmail {
   ExtractedThreadFeatures thread_features;
   ExtractedAuthFeatures   auth_features;
   ExtractedUrlFeatures    url_features;
+  ExtractedBodyFeatures   body_features;
+  ExtractedAttachmentFeatures attachment_features;
 };
 
 // For ML classification: extracts and normalizes text content.
-PreprocessedEmail preprocess_rfc822(const std::string& raw_rfc822);
+PreprocessedEmail preprocess_rfc822(
+    const std::string& raw_rfc822,
+    bool extract_attachments = false);
 
 // For display: extracts raw HTML body without text conversion.
 struct ExtractedEmailBody {
@@ -111,6 +163,12 @@ struct ExtractedEmailBody {
 
 ExtractedEmailBody extract_email_body(const std::string& raw_rfc822);
 
+// Version-1 replay representation for oversized local corpus messages. Keeps
+// message/MIME headers and inline text/plain + text/html bodies (including
+// URLs), but removes attachment payloads while preserving their MIME metadata.
+// Throws when GMime cannot parse or serialize the message.
+std::string make_replay_rfc822(const std::string& raw_rfc822);
+
 // Standalone parse-and-extract entry points (used by the C ABI and its tests).
 // The classification hot path does NOT call these — preprocess_rfc822 computes
 // the same features from its own parse (TASK-173). Both share the internal
@@ -118,6 +176,20 @@ ExtractedEmailBody extract_email_body(const std::string& raw_rfc822);
 ExtractedThreadFeatures extract_thread_features(const std::string& raw_rfc822);
 ExtractedAuthFeatures extract_auth_features(const std::string& raw_rfc822);
 ExtractedUrlFeatures extract_url_features(const std::string& raw_rfc822);
+
+// True if `text` contains the GTUBE test string. Case-sensitive and exact, as the
+// convention specifies — a filter that matched it loosely would junk mail that
+// merely DISCUSSES the test, which is exactly the mail an operator sends while
+// setting one up.
+bool contains_gtube(const std::string& text);
+
+ExtractedBodyFeatures extract_body_features(const std::string& raw_rfc822);
+
+// Attachment facts + bounded joint-context prefix. This is the same C++
+// implementation preprocess_rfc822 uses, exposed so training/evaluation can
+// render the exact runtime bytes without loading a model.
+ExtractedAttachmentFeatures extract_attachment_features(
+    const std::string& raw_rfc822);
 
 // True if `host` is a bare IP literal: an IPv4 dotted quad (each octet 0-255) or
 // an IPv6 literal (contains ':' and only hex/':'). Exposed for the offset unit
@@ -139,6 +211,16 @@ std::vector<std::string> url_domains_from_bodies(const std::string& plain_body,
 
 // Convert HTML to plain text (strips tags, decodes entities).
 std::string html_to_text(const std::string& html);
+
+// Bounded structural-summary prefix the successor model (markers + P0.25
+// dropout, TASK-283/344) was trained on: "images N", "image only" (near-empty
+// body), and up to 8 "link <registrable-domain>" tokens in document order.
+// Byte-parity port of enrich_structural.py render(..., "markers"); returns ""
+// (no-op) for plain mail or a message with no structural signal. `raw_html` is
+// the concatenated raw text/html parts; `base_for_imgonly` is the plain base
+// (subject + preferred body) whose <40-char length triggers "image only".
+std::string structural_marker_prefix(const std::string& raw_html,
+                                     const std::string& base_for_imgonly);
 
 // Registrable href domains of every <a ...> in a raw HTML body, in document
 // order ("" for a non-http/mailto target). Exposed so tests can assert the

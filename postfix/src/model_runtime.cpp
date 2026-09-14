@@ -4,6 +4,7 @@
 
 #include <fstream>
 #include <sstream>
+#include <nlohmann/json.hpp>
 
 namespace klar {
 
@@ -82,7 +83,9 @@ bool ModelRuntime::reload_if_needed(const Config& cfg) {
 
 ClassifyResult ModelRuntime::classify_rfc822(const std::string& raw_email,
                                               const std::string& sender_name,
-                                              const std::string& sender_email) {
+                                              const std::string& sender_email,
+                                              bool connect_ip_blocked,
+                                              bool header_ip_blocked) {
     std::lock_guard<std::mutex> lock(mutex_);
     ClassifyResult cr;
 
@@ -134,11 +137,33 @@ ClassifyResult ModelRuntime::classify_rfc822(const std::string& raw_email,
     spam_engine_decision_input_t din{};
     spam_engine_decision_input_from_signals(&din, &result.scores, &signals);
     din.profile = SPAM_ENGINE_PROFILE_STANDARD;
+    // The one input no parse can produce: who actually connected (TASK-113). The
+    // caller resolved it against the DROP list from an address it OBSERVED; a hit
+    // is condemn-capable, which is only sound because of that provenance.
+    din.connect_ip_blocked = connect_ip_blocked ? 1 : 0;
+    din.header_ip_blocked = header_ip_blocked ? 1 : 0;
+    // The artifact's own spam-side calibration. A successor model's scores do
+    // not sit where public-v0's sit, so it declares a knot and the fold maps it
+    // onto the fixed 0.99 gate BEFORE the offsets are added. Omitting it folds a
+    // calibrated model on the raw scale, which is a different classifier from
+    // the one release qualification measured. spam_engine_classify_full does
+    // this for its own callers; a standalone spam_engine_decide has to do it
+    // here, and 0 (the value-initialised default) is the identity map that every
+    // artifact shipping today wants.
+    spam_engine_model_info_t info{};
+    // model_info is a boolean-style query (1 success, 0 failure), not a
+    // spam_engine_status_t operation. Comparing it with STATUS_OK (0) silently
+    // inverted the branch and left every calibrated artifact on its raw scale.
+    if (spam_engine_model_info(handle_, &info) == 1) {
+        din.spam_side_knot = info.spam_side_calibration_knot;
+    }
 
     spam_engine_decision_result_t dout{};
     if (spam_engine_decide(&din, &dout) == SPAM_ENGINE_STATUS_OK) {
         cr.adjusted_spam = static_cast<float>(dout.adjusted_spam_side);
         cr.structural_condemn = (dout.condemn_offset_fired != 0);
+        cr.fired_offsets = dout.fired_offsets;
+        cr.flipped_by_offset = cr.fired_offsets.find('!') != std::string::npos;
     } else {
         // Defensive: fall back to the bare spam-side (spam+gibberish) if the fold
         // somehow fails — never worse than the pre-TASK-179 behaviour.
@@ -175,7 +200,22 @@ std::string ModelRuntime::read_version_file(const std::string& path) {
     auto start = line.find_first_not_of(" \t\r\n");
     if (start == std::string::npos) return {};
     auto end = line.find_last_not_of(" \t\r\n");
-    return line.substr(start, end - start + 1);
+    line = line.substr(start, end - start + 1);
+    if (line[0] != '{') return line;
+
+    // A MANIFEST.json: the engine's model directory carries no VERSION file,
+    // and `{` is not a version. Its model_uuid is the artifact's identity
+    // (engine/CLAUDE.md), so that is what X-Klar-Model-Version reports. Parsed
+    // with the same library the engine reads it with (spam_engine.cpp), and
+    // read again from the top since getline consumed the first line.
+    f.clear();
+    f.seekg(0);
+    try {
+        const auto doc = nlohmann::json::parse(f);
+        return doc.value("model_uuid", std::string{});
+    } catch (const nlohmann::json::exception&) {
+        return {};
+    }
 }
 
 } // namespace klar

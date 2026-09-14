@@ -1,0 +1,38 @@
+# klar-milterd behind Stalwart. Every key is documented in
+# postfix/config/example.toml; the ones that differ from a Postfix deployment:
+#
+#   auth_results = "ignore"   Stalwart hands milters the message as the client
+#                             sent it, so any Authentication-Results on it is the
+#                             sender's own claim. Dropped before the engine sees
+#                             the message. Do not set trust-topmost here.
+#   listen                    Stalwart's MtaMilter (config/mta-milter.json) points
+#                             at KLAR_MILTER_HOST:KLAR_MILTER_PORT. On the same
+#                             host keep loopback; in a container or another
+#                             network namespace the bind must be reachable from
+#                             Stalwart, e.g. "inet:8891@0.0.0.0".
+#   mode = "tag"              The milter stamps X-Klar-* and never moves mail;
+#                             sieve/klar.sieve files. Reject mode works too but
+#                             read the two-factor rule in postfix/README.md first.
+
+listen = "inet:8891@127.0.0.1"
+mode = "tag"
+profile = "standard"
+fail_open = true
+timeout_ms = 1500
+max_message_bytes = 5242880
+max_inflight_sessions = 64
+max_inflight_bytes = 268435456
+
+model_dir = "/var/lib/klar/model"
+model_version_file = "/var/lib/klar/model/MANIFEST.json"
+ip_blocklist_path = ""
+
+auth_results = "ignore"
+
+health_enabled = true
+health_listen = "127.0.0.1:8892"
+
+event_store_path = "/var/lib/klar/events.sqlite3"
+
+log_level = "info"
+log_json = true

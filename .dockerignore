@@ -1,0 +1,32 @@
+# Build context for postfix/docker/Dockerfile (built from the repository root,
+# in this monorepo and in the public klar-im/engine mirror alike). The image
+# builds the engine and the milter from source and fetches the model at first
+# start, so nothing built, downloaded or trained on the host belongs in the
+# context: a host engine/build carries a CMakeCache from another path and fails
+# the configure, engine/model is 400 MB to 2 GB of weights the image must not
+# contain, and the monorepo-only trees below would be gigabytes for nothing.
+**/build
+**/dist
+**/.e2e-staging
+**/node_modules
+**/.venv
+**/__pycache__
+engine/deps
+engine/model
+engine/models
+*.gguf
+*.safetensors
+.git
+.worktrees
+.claude
+.tftmp
+apple
+company
+data
+design
+infra
+integrations
+marketing
+model-lab
+spamd
+website

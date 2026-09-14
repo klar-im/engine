@@ -11,6 +11,10 @@ enum class Action { TAG, REJECT, BYPASS, TEMPFAIL };
 struct PolicyResult {
     Action action = Action::TAG;
     std::string label;           // "spam" or "regular"
+    // 4-class argmax over the raw scores: "regular|marketing|gibberish|spam".
+    // Informative companion to the binary label. Sieve files non-spam
+    // marketing to a Marketing folder off this (X-Klar-Class header).
+    std::string klass = "regular";
     std::string policy_reason;   // "ml", "allowlist_sender", "blocklist_domain", etc.
     double effective_threshold = 0.5;
 
