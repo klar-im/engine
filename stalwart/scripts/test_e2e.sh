@@ -102,12 +102,36 @@ wait_api() {  # Stalwart's management API answers, or the run stops here, saying
         sleep 2
     done
     flunk "Stalwart API never answered. The CLI's last word, the listener, and the container:"
-    cli query Domain 2>&1 | indent
+    cli query Domain 2>&1 | indent || true
     curl -sS -o /dev/null -w '      GET /healthz -> HTTP %{http_code}\n' http://127.0.0.1:18080/healthz || true
-    "${COMPOSE[@]}" ps 2>&1 | indent
-    "${COMPOSE[@]}" logs --no-color --tail 60 stalwart 2>&1 | indent
+    "${COMPOSE[@]}" ps 2>&1 | indent || true
+    "${COMPOSE[@]}" logs --no-color --tail 60 stalwart 2>&1 | indent || true
     exit 1
 }
+
+# A fresh Stalwart 0.16 starts in BOOTSTRAP MODE: only the Bootstrap object
+# answers ("forbidden: The server is in bootstrap mode ...") until the setup
+# wizard has run. Its one call, `update Bootstrap`, creates the default domain
+# (Manual DKIM when generateDkimKeys is off) and every listener, smtp on :25
+# included; the server leaves bootstrap mode on the restart after it. The
+# recovery admin from STALWART_RECOVERY_ADMIN keeps working across it, and the
+# admin@<domain> account the wizard prints is not needed here. A stack whose
+# volume already went through this (a re-run) answers Domain queries at once
+# and skips the block.
+bootstrap_if_fresh() {
+    local out
+    for _ in $(seq 1 60); do
+        out="$(cli query Domain 2>&1)" && return 0
+        case "$out" in *"bootstrap mode"*) break ;; esac
+        sleep 2
+    done
+    case "$out" in *"bootstrap mode"*) ;; *) return 0 ;; esac
+    say "fresh server: completing Stalwart's bootstrap for $DOMAIN"
+    printf '%s' "{\"serverHostname\":\"mail.$DOMAIN\",\"defaultDomain\":\"$DOMAIN\",\"requestTlsCertificate\":false,\"generateDkimKeys\":false}" \
+        | cli update Bootstrap singleton --stdin >/dev/null
+    "${COMPOSE[@]}" restart stalwart >/dev/null
+}
+bootstrap_if_fresh
 say "waiting for Stalwart's management API"
 wait_api
 
