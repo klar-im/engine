@@ -25,7 +25,11 @@ TestFlight invitation at a score of 8.90 with DKIM, SPF and DMARC all passing
 
 You need a Stalwart 0.16 server you administer (`stalwart-cli` with admin
 credentials) and a Linux host for the milter. Everything is idempotent; run it
-again and it changes nothing.
+again and it changes nothing. A brand-new Stalwart is in bootstrap mode until
+its setup wizard has run (every management call answers "forbidden: The
+server is in bootstrap mode"); finish the wizard in the WebUI first, or do
+what the E2E does and `stalwart-cli update Bootstrap singleton` with your
+hostname and domain, then restart.
 
 ### 1. The milter
 
@@ -93,7 +97,7 @@ reloads settings once if anything changed:
 | `MtaMilter` | klar-milterd at `--milter-host:--milter-port`, DATA stage, `enable = is_empty(authenticated_as)` (inbound only, never your users' own submissions), `tempFailOnError false` (a milter outage delivers unclassified; it never defers mail) | `config/mta-milter.json` |
 | `SenderAuth` | `dmarcVerify = strict` on port 25: a message failing DMARC under a `p=reject` policy is refused at SMTP time. Stalwart keeps verifying; only its *filing* stops | `config/sender-auth.json` |
 | `SieveUserScript` | the global user script `klar` (the filing rules, `sieve/klar.sieve`) | |
-| `MtaStageData` | `enableSpamFilter = false`: the built-in filter no longer runs | `config/stage-data.json` |
+| `MtaStageData` | `enableSpamFilter = false`: the built-in filter no longer runs, so `X-Spam-Result` disappears. An `X-Spam-Status: No` still appears on every message: ingest writes it from a per-recipient flag that nothing sets any more (`crates/email/src/message/ingest.rs`, under the global `spam-filter.enable`). Informational; it is not the classifier | `config/stage-data.json` |
 
 ```bash
 export STALWART_URL=http://127.0.0.1:8080 STALWART_USER=admin STALWART_PASSWORD=...   # as for stalwart-cli

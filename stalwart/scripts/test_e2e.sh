@@ -5,7 +5,9 @@
 #
 #   shadow   apply.py --shadow: Stalwart still scores (X-Spam-Result present,
 #            KLAR_SHADOW in it, X-Spam-Status No) and the milter stamps X-Klar-*.
-#   final    apply.py: no X-Spam-* on new mail at all (filter off);
+#   final    apply.py: no X-Spam-Result on new mail (the filter is off; an
+#            "X-Spam-Status: No" still appears, written at ingest from a flag
+#            nothing sets);
 #            GTUBE to alice  -> Junk, X-Klar-Label spam
 #            ham to alice    -> Inbox, X-Klar-Label regular
 #            GTUBE to trap   -> Inbox with X-Klar-Label spam (a collection
@@ -50,7 +52,13 @@ trap cleanup EXIT
 say()  { printf '[stalwart/e2e] %s\n' "$*"; }
 pass() { printf 'PASS  %s\n' "$*"; }
 flunk() { printf 'FAIL  %s\n' "$*"; fail=1; }
-indent() { while IFS= read -r line; do printf '      %s\n' "$line"; done <<<"$1"; }
+indent() {  # indent "<text>" or a pipe into it: six spaces before every line
+    if [ $# -gt 0 ]; then
+        while IFS= read -r line; do printf '      %s\n' "$line"; done <<<"$1"
+    else
+        while IFS= read -r line; do printf '      %s\n' "$line"; done
+    fi
+}
 
 # stalwart-cli is a separate release (stalwartlabs/cli); upstream's server image
 # does not carry it. Fetch the pinned build once (same pin and checksum as
@@ -90,13 +98,42 @@ START_PERIOD="$(sed -n 's/.*--start-period=\([0-9]*\)s.*/\1/p' "$STALWART_DIR/..
 [ -n "$START_PERIOD" ] || { echo "error: no --start-period in postfix/docker/Dockerfile HEALTHCHECK" >&2; exit 1; }
 "${COMPOSE[@]}" up -d "$BUILD_FLAG" --wait --wait-timeout "$START_PERIOD"
 
-wait_api() {  # Stalwart's management API answers, or the run stops here
+wait_api() {  # Stalwart's management API answers, or the run stops here, saying why
     for _ in $(seq 1 60); do
         cli query Domain >/dev/null 2>&1 && return 0
         sleep 2
     done
-    flunk "Stalwart API never answered"; exit 1
+    flunk "Stalwart API never answered. The CLI's last word, the listener, and the container:"
+    cli query Domain 2>&1 | indent || true
+    curl -sS -o /dev/null -w '      GET /healthz -> HTTP %{http_code}\n' http://127.0.0.1:18080/healthz || true
+    "${COMPOSE[@]}" ps 2>&1 | indent || true
+    "${COMPOSE[@]}" logs --no-color --tail 60 stalwart 2>&1 | indent || true
+    exit 1
 }
+
+# A fresh Stalwart 0.16 starts in BOOTSTRAP MODE: only the Bootstrap object
+# answers ("forbidden: The server is in bootstrap mode ...") until the setup
+# wizard has run. Its one call, `update Bootstrap`, creates the default domain
+# (Manual DKIM when generateDkimKeys is off) and every listener, smtp on :25
+# included; the server leaves bootstrap mode on the restart after it. The
+# recovery admin from STALWART_RECOVERY_ADMIN keeps working across it, and the
+# admin@<domain> account the wizard prints is not needed here. A stack whose
+# volume already went through this (a re-run) answers Domain queries at once
+# and skips the block.
+bootstrap_if_fresh() {
+    local out
+    for _ in $(seq 1 60); do
+        out="$(cli query Domain 2>&1)" && return 0
+        case "$out" in *"bootstrap mode"*) break ;; esac
+        sleep 2
+    done
+    case "$out" in *"bootstrap mode"*) ;; *) return 0 ;; esac
+    say "fresh server: completing Stalwart's bootstrap for $DOMAIN"
+    printf '%s' "{\"serverHostname\":\"mail.$DOMAIN\",\"defaultDomain\":\"$DOMAIN\",\"requestTlsCertificate\":false,\"generateDkimKeys\":false}" \
+        | cli update Bootstrap singleton --stdin >/dev/null
+    "${COMPOSE[@]}" restart stalwart >/dev/null
+}
+bootstrap_if_fresh
 say "waiting for Stalwart's management API"
 wait_api
 
@@ -184,7 +221,11 @@ gtube() {  # gtube <rcpt> <marker>
     echo "$TMP/$2.eml"
 }
 ham() {  # ham <rcpt> <marker>
-    printf 'From: Dana <dana@sender.example>\r\nTo: %s\r\nSubject: lunch tomorrow %s\r\nMessage-ID: <%s@sender.example>\r\n\r\nStill on for lunch tomorrow at noon? I booked the usual place.\r\n\r\nDana\r\n' "$1" "$2" "$2" > "$TMP/$2.eml"
+    # A personal note, far from the marketing boundary: 0.99 regular on the
+    # released model. The first fixture ("still on for lunch tomorrow at noon?
+    # I booked the usual place") sat at 0.57 regular / 0.43 marketing on one
+    # CPU and flipped to marketing on another, and the Sieve filed it there.
+    printf 'From: Dana <dana@sender.example>\r\nTo: %s\r\nSubject: Re: keys %s\r\nMessage-ID: <%s@sender.example>\r\n\r\nFound them, they were in the other coat. I will drop them off on my way to work tomorrow, around eight. Do you want me to bring the book back too?\r\n\r\nDana\r\n' "$1" "$2" "$2" > "$TMP/$2.eml"
     echo "$TMP/$2.eml"
 }
 
@@ -207,8 +248,12 @@ STALWART_CLI="$CLI_WRAP" python3 "$HERE/apply.py" --milter-host klar-milterd --m
 
 accepted "alice@$DOMAIN" "$(gtube "alice@$DOMAIN" "gtube-alice-$STAMP")"
 out="$(inspect alice "$ALICE_PW" "gtube-alice-$STAMP")"
-if grep -q "^mailbox=junk" <<<"$out" && grep -q "^x-klar-label=spam" <<<"$out" && ! grep -q "^x-spam-" <<<"$out"; then
-    pass "final: GTUBE to alice -> Junk via X-Klar-Label spam, no X-Spam-* header"
+# X-Spam-Result is the classifier's own header and is gone when the filter is
+# off. X-Spam-Status stays: ingest writes "No" from a per-recipient flag that
+# nothing sets any more (crates/email/src/message/ingest.rs, under the global
+# spam-filter.enable), so its presence proves nothing either way.
+if grep -q "^mailbox=junk" <<<"$out" && grep -q "^x-klar-label=spam" <<<"$out" && ! grep -q "^x-spam-result=" <<<"$out"; then
+    pass "final: GTUBE to alice -> Junk via X-Klar-Label spam, no X-Spam-Result"
 else
     flunk "GTUBE to alice:"; indent "$out"
 fi

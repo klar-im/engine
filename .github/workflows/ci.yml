@@ -31,8 +31,6 @@ permissions:
 # test binaries link against them.
 env:
   LD_LIBRARY_PATH: ${{ github.workspace }}/engine/deps/llama-install/lib
-  # Keep in sync with engine/scripts/setup.sh (LLAMA_PIN).
-  LLAMA_PIN: b8660
   # Deterministic GEMM reductions so boundary-adjacent fixtures don't flip on
   # thread-scheduling noise (mirrors the monorepo milter CI).
   OMP_NUM_THREADS: "1"
@@ -51,12 +49,12 @@ jobs:
           path: engine/deps/llama-install
           key: ${{ runner.os }}-llama-${{ hashFiles('engine/scripts/setup.sh') }}
 
-      - name: Cache converted model
+      - name: Cache the released model
         uses: actions/cache@v5
         with:
           path: engine/model
-          # Bust when the conversion path changes (Makefile/converter/deps).
-          key: engine-model-${{ env.LLAMA_PIN }}-${{ hashFiles('Makefile', 'engine/export_classifier_weights.py', 'engine/requirements-import.txt') }}
+          # The manifest pins every byte, so it is the whole key.
+          key: engine-model-${{ hashFiles('postfix/model/released-manifest.json') }}
 
       - name: Install system dependencies
         run: |
@@ -68,27 +66,15 @@ jobs:
       - name: Set up C/C++ deps (llama.cpp, cmake configure)
         run: make setup
 
-      - name: Install GGUF tooling (Linux only, not provided by setup.sh)
-        run: |
-          # llama-quantize binary from the pinned prebuilt release.
-          curl -sL "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_PIN}/llama-${LLAMA_PIN}-bin-ubuntu-x64.tar.gz" \
-            | tar -xz -C /tmp --wildcards '*llama-quantize'
-          sudo install -m 0755 "$(find /tmp -type f -name llama-quantize | head -1)" /usr/local/bin/llama-quantize
-          # convert_hf_to_gguf.py from the matching source tag (imports the pip
-          # `gguf` module installed by `make import` / requirements-import.txt).
-          sudo curl -sL "https://raw.githubusercontent.com/ggml-org/llama.cpp/${LLAMA_PIN}/convert_hf_to_gguf.py" \
-            -o /usr/local/bin/convert_hf_to_gguf.py
-          sudo chmod 0755 /usr/local/bin/convert_hf_to_gguf.py
-
-      - name: Import the public production model
-        run: |
-          python3 -m venv .venv
-          # Skips cleanly if the model cache already populated engine/model.
-          if [ ! -f engine/model/gguf/encoder-q4_k_m.gguf ]; then
-            make import PYTHON="$PWD/.venv/bin/python"
-          else
-            echo "[ci] model restored from cache; skipping import"
-          fi
+      # The tests run against the RELEASED bytes, the same artifact klar.im's box
+      # and the container fetch: sha256-verified per file, 400 MB, seconds from
+      # the cache. `make import` (HF download + GGUF conversion) stays the path for
+      # converting your own model; its quantisation is not bit-identical to the
+      # release, and boundary-adjacent fixtures flip on that, so it is not what
+      # the suite is measured against. The licence acceptance is the CI's, for the
+      # test run only: nothing here redistributes the weights.
+      - name: Fetch the released model
+        run: KLAR_ACCEPT_MODEL_LICENSE=1 postfix/scripts/fetch_model.sh engine/model
 
       - name: Build engine + reference milter
         run: make build
