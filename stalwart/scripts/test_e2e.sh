@@ -5,7 +5,9 @@
 #
 #   shadow   apply.py --shadow: Stalwart still scores (X-Spam-Result present,
 #            KLAR_SHADOW in it, X-Spam-Status No) and the milter stamps X-Klar-*.
-#   final    apply.py: no X-Spam-* on new mail at all (filter off);
+#   final    apply.py: no X-Spam-Result on new mail (the filter is off; an
+#            "X-Spam-Status: No" still appears, written at ingest from a flag
+#            nothing sets);
 #            GTUBE to alice  -> Junk, X-Klar-Label spam
 #            ham to alice    -> Inbox, X-Klar-Label regular
 #            GTUBE to trap   -> Inbox with X-Klar-Label spam (a collection
@@ -219,7 +221,11 @@ gtube() {  # gtube <rcpt> <marker>
     echo "$TMP/$2.eml"
 }
 ham() {  # ham <rcpt> <marker>
-    printf 'From: Dana <dana@sender.example>\r\nTo: %s\r\nSubject: lunch tomorrow %s\r\nMessage-ID: <%s@sender.example>\r\n\r\nStill on for lunch tomorrow at noon? I booked the usual place.\r\n\r\nDana\r\n' "$1" "$2" "$2" > "$TMP/$2.eml"
+    # A personal note, far from the marketing boundary: 0.99 regular on the
+    # released model. The first fixture ("still on for lunch tomorrow at noon?
+    # I booked the usual place") sat at 0.57 regular / 0.43 marketing on one
+    # CPU and flipped to marketing on another, and the Sieve filed it there.
+    printf 'From: Dana <dana@sender.example>\r\nTo: %s\r\nSubject: Re: keys %s\r\nMessage-ID: <%s@sender.example>\r\n\r\nFound them, they were in the other coat. I will drop them off on my way to work tomorrow, around eight. Do you want me to bring the book back too?\r\n\r\nDana\r\n' "$1" "$2" "$2" > "$TMP/$2.eml"
     echo "$TMP/$2.eml"
 }
 
@@ -242,8 +248,12 @@ STALWART_CLI="$CLI_WRAP" python3 "$HERE/apply.py" --milter-host klar-milterd --m
 
 accepted "alice@$DOMAIN" "$(gtube "alice@$DOMAIN" "gtube-alice-$STAMP")"
 out="$(inspect alice "$ALICE_PW" "gtube-alice-$STAMP")"
-if grep -q "^mailbox=junk" <<<"$out" && grep -q "^x-klar-label=spam" <<<"$out" && ! grep -q "^x-spam-" <<<"$out"; then
-    pass "final: GTUBE to alice -> Junk via X-Klar-Label spam, no X-Spam-* header"
+# X-Spam-Result is the classifier's own header and is gone when the filter is
+# off. X-Spam-Status stays: ingest writes "No" from a per-recipient flag that
+# nothing sets any more (crates/email/src/message/ingest.rs, under the global
+# spam-filter.enable), so its presence proves nothing either way.
+if grep -q "^mailbox=junk" <<<"$out" && grep -q "^x-klar-label=spam" <<<"$out" && ! grep -q "^x-spam-result=" <<<"$out"; then
+    pass "final: GTUBE to alice -> Junk via X-Klar-Label spam, no X-Spam-Result"
 else
     flunk "GTUBE to alice:"; indent "$out"
 fi
