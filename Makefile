@@ -27,6 +27,7 @@ build:
 test: build stalwart/test-unit
 	cd engine && ctest --test-dir build --output-on-failure --timeout 600
 	cd postfix && ctest --test-dir build --output-on-failure --timeout 120
+	bash stalwart/tests/test_e2e_fixtures.sh
 
 # stalwart/: the same milter behind Stalwart. `make stalwart/test-e2e` runs the
 # compose stack (docker compose + network); `make stalwart/apply` wires a server.
