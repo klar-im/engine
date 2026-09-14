@@ -50,7 +50,13 @@ trap cleanup EXIT
 say()  { printf '[stalwart/e2e] %s\n' "$*"; }
 pass() { printf 'PASS  %s\n' "$*"; }
 flunk() { printf 'FAIL  %s\n' "$*"; fail=1; }
-indent() { while IFS= read -r line; do printf '      %s\n' "$line"; done <<<"$1"; }
+indent() {  # indent "<text>" or a pipe into it: six spaces before every line
+    if [ $# -gt 0 ]; then
+        while IFS= read -r line; do printf '      %s\n' "$line"; done <<<"$1"
+    else
+        while IFS= read -r line; do printf '      %s\n' "$line"; done
+    fi
+}
 
 # stalwart-cli is a separate release (stalwartlabs/cli); upstream's server image
 # does not carry it. Fetch the pinned build once (same pin and checksum as
@@ -90,12 +96,17 @@ START_PERIOD="$(sed -n 's/.*--start-period=\([0-9]*\)s.*/\1/p' "$STALWART_DIR/..
 [ -n "$START_PERIOD" ] || { echo "error: no --start-period in postfix/docker/Dockerfile HEALTHCHECK" >&2; exit 1; }
 "${COMPOSE[@]}" up -d "$BUILD_FLAG" --wait --wait-timeout "$START_PERIOD"
 
-wait_api() {  # Stalwart's management API answers, or the run stops here
+wait_api() {  # Stalwart's management API answers, or the run stops here, saying why
     for _ in $(seq 1 60); do
         cli query Domain >/dev/null 2>&1 && return 0
         sleep 2
     done
-    flunk "Stalwart API never answered"; exit 1
+    flunk "Stalwart API never answered. The CLI's last word, the listener, and the container:"
+    cli query Domain 2>&1 | indent
+    curl -sS -o /dev/null -w '      GET /healthz -> HTTP %{http_code}\n' http://127.0.0.1:18080/healthz || true
+    "${COMPOSE[@]}" ps 2>&1 | indent
+    "${COMPOSE[@]}" logs --no-color --tail 60 stalwart 2>&1 | indent
+    exit 1
 }
 say "waiting for Stalwart's management API"
 wait_api
