@@ -24,9 +24,13 @@ profile = "standard"
 # Set to -1 to use the profile default.
 # spam_threshold_override = -1.0
 
-# In reject mode, only reject if spam score exceeds this threshold.
-# Should be high (0.99+) to avoid false positives.
-reject_threshold = 0.995
+# In reject mode, bounce only when the content model's CALIBRATED spam side
+# (the artifact's own knot mapped onto the 0.99 Standard gate, before any
+# structural offset) reaches this AND a structural condemn corroborates it.
+# 0.99 is the gate itself. Values above it are reachable only by heads that
+# emit raw probabilities near 1.0 on blatant spam; a label-smoothed head such
+# as gen3-v6 tops out at 0.9906 on this scale, so 0.995 would never bounce.
+reject_threshold = 0.99
 
 # If classification fails (engine crash, timeout), accept the message anyway.
 # Set to false to tempfail (4xx) on errors — safer but may delay mail.
@@ -141,4 +145,4 @@ blocklist_action = "reject"
 # recipient_domain = "sensitive.example.com"
 # mode = "reject"
 # profile = "cautious"
-# reject_threshold = 0.999
+# reject_threshold = 0.99

@@ -81,20 +81,19 @@ Behind iCloud/Gmail (the Apple Mail deployment) the provider has already done th
 a standalone Postfix relay has not. See `engine/ARCHITECTURE.md` ("Trust boundary:
 the sender-auth layer reads, it does not verify").
 
-**When the MTA cannot put its AR in front of the milter, set `auth_results =
-"ignore"`.** Stalwart is the known case: it verifies DKIM/SPF/DMARC itself but
-writes its `Authentication-Results` at queue time, after the milters have run, and
-hands milters the message as the client sent it (Stalwart 0.16.18
-`crates/smtp/src/inbound/data.rs`: AR written at :504 into the queued prefix,
-`run_milters` at :602 on `auth_message`). Any AR the milter sees there is the
-sender's own claim. `ignore` drops every `Authentication-Results` and
-`ARC-Authentication-Results` header before the engine parses the message, so a
-forged `dkim=pass header.d=paypal.com` cannot buy the `kb_brand_dmarc` rescue;
-`postfix/scripts/test_auth_results.sh` shows the same phish delivered as regular
-under the default and labelled spam under `ignore`. What `ignore` gives up is the
-AR-derived condemn on a *failing* DMARC, which Stalwart covers at SMTP time with
-`SenderAuth.dmarcVerify = "strict"`. The full Stalwart setup, including the
-Sieve that files on `X-Klar-Label`, is in `stalwart/README.md`.
+**When the MTA does not put its own AR in front of the milter, set
+`auth_results = "ignore"`.** Stalwart is one such MTA: it verifies DKIM, SPF
+and DMARC itself and adds its `Authentication-Results` to the queued message
+after the milters have run (`crates/smtp/src/inbound/data.rs`, 0.16.18 `:504`
+and `:602`, 0.16.22 `:501` and `:595`), so at DATA a milter sees the message
+as the sender delivered it. `ignore` drops every `Authentication-Results` and
+`ARC-Authentication-Results` header before the engine parses the message;
+`postfix/scripts/test_auth_results.sh` shows the same phish delivered as
+regular under the default and labelled spam under `ignore`. What `ignore`
+gives up is the AR-derived condemn on a *failing* DMARC, which Stalwart
+enforces at SMTP time with `SenderAuth.dmarcVerify = "strict"`. The full
+Stalwart setup, including the Sieve that files on `X-Klar-Label`, is in
+`stalwart/README.md`.
 
 ## Quick Start
 
@@ -175,7 +174,7 @@ See `config/example.toml` for a documented production config. Key settings:
 | `mode` | `tag` | tag / reject |
 | `profile` | `standard` | cautious (0.70) / standard (0.50) / aggressive (0.30) |
 | `fail_open` | `true` | Accept mail on engine failure |
-| `reject_threshold` | `0.995` | Score above which to reject (reject mode only) |
+| `reject_threshold` | `0.99` | Calibrated spam side (the artifact's knot on the 0.99 gate, before offsets) at or above which reject mode may bounce, together with a structural condemn. 0.99 is the gate itself; a label-smoothed head never reads above 0.9906 here |
 | `ip_blocklist_path` | `/var/lib/klar/model/ip_blocklist.bin` | Spamhaus DROP netblocks; empty disables the origin-IP signal |
 | `ip_blocklist_max_age_days` | `14` | Age past which the loaded list is reported stale |
 | `trusted_relay_cidrs` | `[]` | Relay hops you operate; enables reading the origin from `Received` |

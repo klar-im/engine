@@ -11,22 +11,6 @@
 
 namespace {
 
-spam_engine_status_t set_error_locked(
-    spam_engine_handle_t* handle,
-    spam_engine_status_t code,
-    const std::string& message) {
-  if (handle != nullptr) {
-    handle->last_error = message;
-  }
-  return code;
-}
-
-void clear_error_locked(spam_engine_handle_t* handle) {
-  if (handle != nullptr) {
-    handle->last_error.clear();
-  }
-}
-
 bool is_valid_label(int correct_label) {
   return correct_label >= 0 && correct_label <= 3;
 }

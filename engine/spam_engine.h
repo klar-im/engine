@@ -8,6 +8,8 @@
 
 #include "email_preprocessor.h"  // ExtractedThreadFeatures / ExtractedAuthFeatures
 
+class TrainableClassifierHead;
+
 namespace spam_engine {
 
 struct TranscriptMessage {
@@ -368,6 +370,13 @@ class SpamEngine {
                          const CustomerInfo& customer,
                          int correct_label);
   float train_embedding(const std::vector<float>& embedding, int correct_label);
+
+  // The loaded neural head itself, nullptr until load(). What a caller that
+  // drives the head outside classify/train (its own objective or optimizer,
+  // through the head's public training kernel) reaches it by; the head's
+  // label_index() is also how such a caller maps a label name to the head's
+  // own index, which is not the 0-3 semantic of train_embedding.
+  [[nodiscard]] TrainableClassifierHead* trainable_head() noexcept;
 
   // Trust-region telemetry (doc-26). `head_drift_saturation` is ‖w-w0‖ as a
   // fraction of the `max_drift` budget, maxed over the head's four tensors:

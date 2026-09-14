@@ -24,8 +24,13 @@ struct PolicyResult {
     float score_marketing = 0;
     float score_gibberish = 0;
     // Spam-side after the structural-offset fold (TASK-179). The junk/tag label
-    // thresholds on THIS; `score_spam` (raw) still gates the bounce/reject path.
+    // thresholds on THIS.
     float score_spam_adjusted = 0;
+    // Spam-side after the artifact's own calibration and BEFORE any offset
+    // (the engine's calibrated_spam_side): the model-independent scale on
+    // which reject_threshold is read. Raw `score_spam` is kept for logging
+    // and is per-model (a label-smoothed head never reaches 0.99 raw).
+    float score_spam_calibrated = 0;
 
     // Error info
     std::string error_code = "E_NONE";

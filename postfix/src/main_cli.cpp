@@ -200,13 +200,14 @@ static int cmd_classify(int argc, char* argv[]) {
 
     // Build JSON output
     char score_spam[32], score_regular[32], score_marketing[32], score_gibberish[32];
-    char score_spam_adjusted[32];
+    char score_spam_adjusted[32], score_spam_calibrated[32];
     char latency_buf[32];
     snprintf(score_spam, sizeof(score_spam), "%.6f", (double)pr.score_spam);
     snprintf(score_regular, sizeof(score_regular), "%.6f", (double)pr.score_regular);
     snprintf(score_marketing, sizeof(score_marketing), "%.6f", (double)pr.score_marketing);
     snprintf(score_gibberish, sizeof(score_gibberish), "%.6f", (double)pr.score_gibberish);
     snprintf(score_spam_adjusted, sizeof(score_spam_adjusted), "%.6f", (double)pr.score_spam_adjusted);
+    snprintf(score_spam_calibrated, sizeof(score_spam_calibrated), "%.6f", (double)pr.score_spam_calibrated);
     snprintf(latency_buf, sizeof(latency_buf), "%.2f", latency_ms);
 
     std::string action_str = klar::action_to_string(pr.action);
@@ -221,6 +222,7 @@ static int cmd_classify(int argc, char* argv[]) {
            "  \"score_marketing\": %s,\n"
            "  \"score_gibberish\": %s,\n"
            "  \"score_spam_adjusted\": %s,\n"
+           "  \"score_spam_calibrated\": %s,\n"
            "  \"label\": \"%s\",\n"
            "  \"class\": \"%s\",\n"
            "  \"action\": \"%s\",\n"
@@ -235,6 +237,7 @@ static int cmd_classify(int argc, char* argv[]) {
            escape_json_string(cfg.mode).c_str(),
            escape_json_string(cfg.profile).c_str(),
            score_spam, score_regular, score_marketing, score_gibberish, score_spam_adjusted,
+           score_spam_calibrated,
            escape_json_string(pr.label).c_str(),
            escape_json_string(pr.klass).c_str(),
            escape_json_string(action_str).c_str(),

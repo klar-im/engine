@@ -1,7 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -18,6 +22,15 @@ inline void check(bool condition, const std::string& message) {
   if (!condition) {
     throw std::runtime_error(message);
   }
+}
+
+// A file's bytes; empty when the file is missing or empty, which every
+// caller treats as the same failure.
+inline std::string read_binary_file(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  return {
+      std::istreambuf_iterator<char>(input),
+      std::istreambuf_iterator<char>()};
 }
 
 // The embedding width the loaded artifact DECLARES, in classifier_config.json.
@@ -68,14 +81,42 @@ inline ModelPaths model_paths() {
   return ModelPaths{source_dir, source_dir / "model"};
 }
 
+// The encoder file the artifact declares (classifier_config.json
+// `gguf_encoder_file`, the engine's own contract since gen3-v6 ships Q8_0),
+// falling back to the historical q4_k_m name for artifacts that predate the
+// key. Read with a regex rather than a JSON library so this header stays
+// dependency-free; the engine validates the real key on load.
+inline std::string declared_encoder_file(const ModelPaths& paths) {
+  const std::string text = read_binary_file(paths.model_path / "classifier_config.json");
+  if (!text.empty()) {
+    static const std::regex key(R"re("gguf_encoder_file"\s*:\s*"([^"]+)")re");
+    std::smatch match;
+    if (std::regex_search(text, match, key)) {
+      return match[1].str();
+    }
+  }
+  return "encoder-q4_k_m.gguf";
+}
+
 inline std::filesystem::path gguf_model_path(const ModelPaths& paths,
-                                              const std::string& variant = "encoder-q4_k_m.gguf") {
-  return paths.model_path / "gguf" / variant;
+                                              const std::string& variant = "") {
+  return paths.model_path / "gguf" / (variant.empty() ? declared_encoder_file(paths) : variant);
 }
 
 inline bool has_gguf_model(const ModelPaths& paths,
-                            const std::string& variant = "encoder-q4_k_m.gguf") {
+                            const std::string& variant = "") {
   return std::filesystem::exists(gguf_model_path(paths, variant));
+}
+
+// "High confidence" in a way that holds for any head this engine loads: the
+// class is the argmax and leads the runner-up by at least half the mass. A
+// raw `p > 0.90` was public-v0's number: a label-smoothed head (gen3-v6,
+// smoothing 0.1 over three classes) tops out near 0.90 on blatant spam and
+// 0.84 on blatant ham by construction, and the engine's own gate reads the
+// calibrated spam side, not the raw probability.
+inline bool confident_class(float top, float other_a, float other_b, float other_c) {
+  const float runner_up = std::max({other_a, other_b, other_c});
+  return top > runner_up && (top - runner_up) >= 0.5F;
 }
 
 inline bool has_model_assets(const ModelPaths& paths) {
@@ -179,6 +220,12 @@ inline std::string make_unique_suffix() {
   return std::to_string(now) + "-" + std::to_string(n);
 }
 
+// A fresh path under the temp directory: `prefix` plus a unique suffix. Not
+// created; the caller decides whether it is a file or a directory.
+inline std::filesystem::path unique_temp_path(const std::string& prefix) {
+  return std::filesystem::temp_directory_path() / (prefix + make_unique_suffix());
+}
+
 inline void copy_required_file(
     const std::filesystem::path& src,
     const std::filesystem::path& dst) {
@@ -233,8 +280,7 @@ class ScopedTempModelDir {
 inline ScopedTempModelDir create_temp_model_fixture(const std::filesystem::path& source_model_path) {
   namespace fs = std::filesystem;
 
-  const fs::path temp_path =
-      fs::temp_directory_path() / ("spam-engine-model-fixture-" + make_unique_suffix());
+  const fs::path temp_path = unique_temp_path("spam-engine-model-fixture-");
   fs::create_directories(temp_path);
 
   // GGUF encoder: hard-link to avoid duplicating the 150 MB model file.

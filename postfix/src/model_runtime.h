@@ -18,9 +18,16 @@ struct ClassifyResult {
     // Spam-side confidence after the engine decision layer folds the structural
     // offsets (spam+gibberish + free-host/throwaway DKIM-signer push − thread-header
     // ham bias), clamped to [0,1] — the SAME value the Apple extension thresholds on
-    // (TASK-179). Drives the junk/tag decision; the raw `spam` above still drives the
-    // bounce/reject gate so a structural prior never bounces mail.
+    // (TASK-179). Drives the junk/tag decision.
     float adjusted_spam = 0;
+    // Spam-side after the artifact's own calibration knot and BEFORE any offset
+    // (the engine's calibrated_spam_side). This is what the bounce/reject gate
+    // reads as "the content model is highly confident": model-independent
+    // (every artifact's knot lands on the same 0.99 gate) and free of the
+    // structural offsets, which are the reject rule's second factor and must not
+    // also be its first. The raw `spam` above is per-model: a label-smoothed
+    // head never reaches 0.99 raw.
+    float calibrated_spam = 0;
     // True if a spam-ward structural offset fired (free-host/throwaway DKIM
     // signer). An independent strong signal the reject/bounce gate requires as
     // corroboration (TASK-179) — a destructive bounce never rides on the content

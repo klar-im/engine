@@ -7,7 +7,6 @@ The engine is the core; milters embed it. This repo ships the engine, the
 milter built on it (`postfix/`, one daemon for Postfix, Stalwart and any
 libmilter MTA), and the Stalwart wiring (`stalwart/`: the objects that point
 Stalwart at the milter, the Sieve that files on its verdict, a compose stack).
-klar.im's own mail runs the Stalwart setup.
 
 This repo is the open-core of [Klar](https://klar.im), licensed AGPLv3 (see
 `LICENSE`).
@@ -23,13 +22,12 @@ This repo is the open-core of [Klar](https://klar.im), licensed AGPLv3 (see
 
 ## Run it behind your mail server
 
-![Stalwart hands the message to klar-milterd at DATA; the engine classifies it on your box; the milter adds X-Klar headers; the account's Sieve files on them.](stalwart/docs/klar-stalwart.png)
+![Your mail server hands the message to klar-milterd at DATA; the engine classifies it on the same box and answers with X-Klar headers; the server delivers and a rule files on the verdict.](postfix/docs/klar-milter.png)
 
 - **Stalwart**: [`stalwart/README.md`](stalwart/README.md). Four objects
   applied through `stalwart-cli` (`stalwart/scripts/apply.py`, idempotent), a
   per-mailbox Sieve include, and a shadow mode that keeps Stalwart scoring
-  beside Klar so you can compare the two on your own mail first. This is how
-  klar.im runs.
+  beside Klar so you can compare the two on your own mail first.
 - **Postfix**: [`postfix/README.md`](postfix/README.md). The same daemon with
   OpenDKIM and OpenDMARC ahead of it, a systemd unit, and a Docker end-to-end
   stack.
@@ -40,25 +38,32 @@ This repo is the open-core of [Klar](https://klar.im), licensed AGPLv3 (see
 ## The model is separate from the code
 
 The engine ships with no weights. You load a model directory at runtime. The
-default is the production model, the same classifier the Klar apps ship:
-[`icosha/spam-xlmr-v1`](https://huggingface.co/icosha/spam-xlmr-v1), public
-under CC-BY-NC-4.0 (free for non-commercial use with attribution; commercial
-use needs a paid licence, see `LICENSE-MODEL.md`).
+default is the production model, the same classifier the Klar apps ship,
+pinned by `postfix/model/released-manifest.json` and fetched by
+`fetch_model.sh` (today gen3-v6, Klar's fine-tune of the MIT-licensed
+`intfloat/multilingual-e5-base` encoder, a 304 MB Q8_0 GGUF plus a three-class
+head), distributed under CC-BY-NC-4.0 (free for non-commercial use with
+attribution; commercial use needs a paid licence, see `LICENSE-MODEL.md`).
 
 ```bash
 make setup                                   # C/C++ deps (llama.cpp, gmime, xxhash, json)
-make import                                  # Python deps + pull/convert the model
+KLAR_ACCEPT_MODEL_LICENSE=1 make model       # fetch the production model, verified against the pinned manifest
 make build
 ./engine/build/spam_classifier ./engine/model   # classify a built-in sample
 ```
 
-`import` installs the Python conversion deps (`engine/requirements-import.txt`)
-and needs `convert_hf_to_gguf.py` from llama.cpp (on PATH after `make setup` on
-macOS). Use a virtualenv if your distro marks the system Python externally-managed.
+`make model` downloads the seven files the manifest pins into `engine/model/`
+and checks every one by digest; it refuses to start until
+`KLAR_ACCEPT_MODEL_LICENSE=1` records that you accept `LICENSE-MODEL.md`. The
+same script is what the milter container runs on first start.
 
-`make import` downloads the model, converts the encoder to GGUF, and extracts
-the classifier head into `engine/model/`. Point `MODEL=` at any XLM-RoBERTa
-spam model to convert your own.
+To run your own classifier instead, `make import MODEL=<hf-repo>` converts any
+XLM-RoBERTa spam model from Hugging Face (encoder to GGUF, head extracted). It
+installs the Python conversion deps (`engine/requirements-import.txt`) and
+needs `convert_hf_to_gguf.py` from llama.cpp (on PATH after `make setup` on
+macOS); use a virtualenv if your distro marks the system Python
+externally-managed. `MODEL` defaults to Klar's first public model,
+`icosha/spam-xlmr-v1`, which is not the production model any more.
 
 ## Embed it
 

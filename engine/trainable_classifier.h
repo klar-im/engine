@@ -1,13 +1,14 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <nlohmann/json.hpp>
 // Anchor-set content fingerprint for the function-space trust region
@@ -222,44 +223,47 @@ public:
             throw std::invalid_argument(
                 "TrainableClassifierHead::forward: embedding shorter than hidden_size");
         }
+        std::vector<float> hidden;
+        std::vector<float> logits;
+        // A lambda, not the function's address, so the dot product is a
+        // known callee inlined into the row loop.
+        forward_layers(cls_embedding.data(), hidden, logits,
+                       [](float init, const float* a, const float* b, int n) {
+                           return sequential_dot(init, a, b, n);
+                       });
         if (cache_for_backward) {
             cached_input_ = cls_embedding;
-            cached_hidden_pre_activation_.resize(hidden_size_);
-            cached_hidden_.resize(hidden_size_);
-        }
-
-        // Dense layer: hidden_size -> hidden_size
-        std::vector<float> hidden(hidden_size_);
-        for (int i = 0; i < hidden_size_; ++i) {
-            float sum = dense_bias_[i];
-            for (int j = 0; j < hidden_size_; ++j) {
-                sum += cls_embedding[j] * dense_weight_[(i * hidden_size_) + j];
-            }
-            if (cache_for_backward) {
-                cached_hidden_pre_activation_[i] = sum;
-            }
-            // Tanh activation
-            hidden[i] = std::tanh(sum);
-            if (cache_for_backward) {
-                cached_hidden_[i] = hidden[i];
-            }
-        }
-
-        // Output projection: hidden_size -> num_labels
-        std::vector<float> logits(num_labels_);
-        for (int i = 0; i < num_labels_; ++i) {
-            float sum = out_proj_bias_[i];
-            for (int j = 0; j < hidden_size_; ++j) {
-                sum += hidden[j] * out_proj_weight_[(i * hidden_size_) + j];
-            }
-            logits[i] = sum;
-        }
-
-        if (cache_for_backward) {
+            cached_hidden_ = std::move(hidden);
             cached_logits_ = logits;
         }
-
         return logits;
+    }
+
+    // The two layers (dense + tanh, then the output projection),
+    // parameterised on the dot product so the topology is written once.
+    // `dot(init, a, b, n)` returns init + a·b. forward() passes
+    // sequential_dot: one accumulator seeded with the bias, the rounding
+    // every shipped verdict was measured on. A fit is not a verdict and may
+    // pass a faster one.
+    template <class Dot>
+    void forward_layers(const float* input, std::vector<float>& hidden,
+                        std::vector<float>& logits, Dot dot) const {
+        hidden.resize(static_cast<size_t>(hidden_size_));
+        logits.resize(static_cast<size_t>(num_labels_));
+        for (int i = 0; i < hidden_size_; ++i) {
+            hidden[i] = std::tanh(dot(dense_bias_[i], input,
+                dense_weight_.data() + (static_cast<size_t>(i) * hidden_size_), hidden_size_));
+        }
+        for (int i = 0; i < num_labels_; ++i) {
+            logits[i] = dot(out_proj_bias_[i], hidden.data(),
+                out_proj_weight_.data() + (static_cast<size_t>(i) * hidden_size_), hidden_size_);
+        }
+    }
+
+    static float sequential_dot(float init, const float* a, const float* b, int n) {
+        float sum = init;
+        for (int j = 0; j < n; ++j) { sum += a[j] * b[j]; }
+        return sum;
     }
 
     // The artifact's own declaration of what it is. Reported through the C ABI so
@@ -316,8 +320,6 @@ public:
         // If allocation fails, the enclosing RFC822 sample remains wholly
         // unapplied and can safely stay retryable in the correction database.
         std::vector<float> d_logits(num_labels_);
-        std::vector<float> d_hidden(hidden_size_, 0.0F);
-        std::vector<float> d_pre_activation(hidden_size_);
 
         // Cross-entropy loss
         float const loss = -std::log(probs[true_label] + 1e-10F);
@@ -328,11 +330,35 @@ public:
             d_logits[i] = probs[i] - (i == true_label ? 1.0F : 0.0F);
         }
 
+        backpropagate(cached_input_.data(), cached_hidden_, d_logits);
+        return loss;
+    }
+
+    // ------------------------------------------------- the training kernel
+    //
+    // The pieces backward() and step() are built from, public so a different
+    // objective or a different optimizer schedule can drive the same head
+    // without a second copy of the layers' gradients or of Adam. The
+    // on-device path above is exactly these pieces plus its guards.
+
+    // Everything below d_logits in the backward pass: out_proj gradients,
+    // the chain through tanh, dense gradients. `input` is the row's
+    // input_size() floats and `hidden` the tanh activations forward()
+    // computed for it; the gradients accumulate until step() or
+    // adam_step() consumes them.
+    void backpropagate(const float* input, const std::vector<float>& hidden,
+                       const std::vector<float>& d_logits) {
+        // Allocate every scratch buffer before mutating persistent gradients.
+        // If allocation fails, the enclosing RFC822 sample remains wholly
+        // unapplied and can safely stay retryable in the correction database.
+        std::vector<float> d_hidden(hidden_size_, 0.0F);
+        std::vector<float> d_pre_activation(hidden_size_);
+
         // Gradient w.r.t. out_proj weights and bias
         for (int i = 0; i < num_labels_; ++i) {
             out_proj_bias_grad_[i] += d_logits[i];
             for (int j = 0; j < hidden_size_; ++j) {
-                out_proj_weight_grad_[(i * hidden_size_) + j] += d_logits[i] * cached_hidden_[j];
+                out_proj_weight_grad_[(i * hidden_size_) + j] += d_logits[i] * hidden[j];
             }
         }
 
@@ -345,7 +371,7 @@ public:
 
         // Gradient through tanh: d_tanh/d_x = 1 - tanh(x)^2
         for (int i = 0; i < hidden_size_; ++i) {
-            float const tanh_val = cached_hidden_[i];
+            float const tanh_val = hidden[i];
             d_pre_activation[i] = d_hidden[i] * (1.0F - (tanh_val * tanh_val));
         }
 
@@ -353,20 +379,114 @@ public:
         for (int i = 0; i < hidden_size_; ++i) {
             dense_bias_grad_[i] += d_pre_activation[i];
             for (int j = 0; j < hidden_size_; ++j) {
-                dense_weight_grad_[(i * hidden_size_) + j] += d_pre_activation[i] * cached_input_[j];
+                dense_weight_grad_[(i * hidden_size_) + j] += d_pre_activation[i] * input[j];
             }
         }
-
-        return loss;
     }
 
+    // One trainable tensor with its gradient, Adam moments and frozen
+    // origin (the trust-region centre, never written). Pointers rather than
+    // references so the slot is copyable and stays out of clang-tidy's
+    // const-or-ref-data-members check.
+    struct ParameterSlot {
+        const char* name;  // the tensor's file stem: classifier_<name>.bin
+        std::vector<float>* value;
+        std::vector<float>* gradient;
+        std::vector<float>* adam_m;
+        std::vector<float>* adam_v;
+        const std::vector<float>* origin;
+    };
+
+    // The four tensors in a fixed order: dense_weight, dense_bias,
+    // out_proj_weight, out_proj_bias. step(), zero_grad(),
+    // reset_optimizer_state() and save() iterate this rather than naming
+    // each tensor.
+    [[nodiscard]] std::array<ParameterSlot, 4> parameters() noexcept {
+        return {{
+            {"dense_weight", &dense_weight_, &dense_weight_grad_, &dense_weight_m_, &dense_weight_v_,
+             &orig_dense_weight_},
+            {"dense_bias", &dense_bias_, &dense_bias_grad_, &dense_bias_m_, &dense_bias_v_,
+             &orig_dense_bias_},
+            {"out_proj_weight", &out_proj_weight_, &out_proj_weight_grad_, &out_proj_weight_m_,
+             &out_proj_weight_v_, &orig_out_proj_weight_},
+            {"out_proj_bias", &out_proj_bias_, &out_proj_bias_grad_, &out_proj_bias_m_,
+             &out_proj_bias_v_, &orig_out_proj_bias_},
+        }};
+    }
+
+    // ‖param - from‖ and ‖param‖², accumulated in double (see saturation_of
+    // for why float sums are not enough). The drift telemetry, the trust
+    // region and any measurement of a fit read distances through these.
+    static double drift_norm(const std::vector<float>& param,
+                             const std::vector<float>& from) {
+        double drift_sq = 0.0;
+        for (size_t i = 0; i < param.size(); ++i) {
+            const double d = static_cast<double>(param[i]) - static_cast<double>(from[i]);
+            drift_sq += d * d;
+        }
+        return std::sqrt(drift_sq);
+    }
+
+    static double squared_norm(const std::vector<float>& param) {
+        double sum = 0.0;
+        for (const float value : param) {
+            sum += static_cast<double>(value) * static_cast<double>(value);
+        }
+        return sum;
+    }
+
+    // Plain bias-corrected Adam on the accumulated gradients, which it then
+    // zeroes: no L2 pull, no clipping, no projection. step() is this plus
+    // the on-device guards.
+    void adam_step(float learning_rate) {
+        timestep_++;
+        const float bc1 = 1.0F - std::pow(kAdamBeta1, timestep_);
+        const float bc2 = 1.0F - std::pow(kAdamBeta2, timestep_);
+        for (const ParameterSlot& slot : parameters()) {
+            std::vector<float>& param = *slot.value;
+            std::vector<float>& grad = *slot.gradient;
+            for (size_t i = 0; i < param.size(); ++i) {
+                adam_coordinate(param[i], grad[i], (*slot.adam_m)[i], (*slot.adam_v)[i], bc1, bc2,
+                                learning_rate);
+                grad[i] = 0.0F;
+            }
+        }
+    }
+
+    // Adam's moments and step count back to zero.
+    void reset_optimizer_state() noexcept {
+        for (const ParameterSlot& slot : parameters()) {
+            std::fill(slot.adam_m->begin(), slot.adam_m->end(), 0.0F);
+            std::fill(slot.adam_v->begin(), slot.adam_v->end(), 0.0F);
+        }
+        timestep_ = 0;
+    }
+
+    // Whether step() bounds drift in output space on the frozen anchor set
+    // (TASK-193 AC#8/#9) rather than in weight space.
+    [[nodiscard]] bool function_space_enabled() const noexcept { return function_space_enabled_; }
+
+private:
+    // One Adam coordinate (torch's defaults: beta1 0.9, beta2 0.999, eps
+    // 1e-8, bias corrected), shared by step() and adam_step(), which differ
+    // only in what `g` is: clipped plus the L2 pull there, raw here.
+    static constexpr float kAdamBeta1 = 0.9F;
+    static constexpr float kAdamBeta2 = 0.999F;
+    static constexpr float kAdamEpsilon = 1e-8F;
+    static void adam_coordinate(float& param, float g, float& m, float& v,  // NOLINT(bugprone-easily-swappable-parameters)
+                                float bias_correction1, float bias_correction2,
+                                float learning_rate) {
+        m = (kAdamBeta1 * m) + ((1.0F - kAdamBeta1) * g);
+        v = (kAdamBeta2 * v) + ((1.0F - kAdamBeta2) * g * g);
+        const float m_hat = m / bias_correction1;
+        const float v_hat = v / bias_correction2;
+        param -= learning_rate * m_hat / (std::sqrt(v_hat) + kAdamEpsilon);
+    }
+
+public:
     // Apply gradients with Adam optimizer + L2 regularization + gradient clipping
     void step(int batch_size = 1) {
         timestep_++;
-        float beta1 = 0.9F;
-        float beta2 = 0.999F;
-        float epsilon = 1e-8F;
-
         // Gradient clipping: the clip decision has to be made on the AVERAGED
         // batch gradient, matching what actually gets applied below, or a
         // multipart (plain+HTML) correction's clipped step comes out
@@ -380,25 +500,23 @@ public:
         // the previous computation either way.
         const float inv_batch_size = 1.0F / static_cast<float>(batch_size);
         float grad_norm_sq = 0.0F;
-        for (float const g : dense_weight_grad_) { float const a = g * inv_batch_size; grad_norm_sq += a * a; }
-        for (float const g : dense_bias_grad_) { float const a = g * inv_batch_size; grad_norm_sq += a * a; }
-        for (float const g : out_proj_weight_grad_) { float const a = g * inv_batch_size; grad_norm_sq += a * a; }
-        for (float const g : out_proj_bias_grad_) { float const a = g * inv_batch_size; grad_norm_sq += a * a; }
+        for (const ParameterSlot& slot : parameters()) {
+            for (float const g : *slot.gradient) { float const a = g * inv_batch_size; grad_norm_sq += a * a; }
+        }
 
         float const grad_norm = std::sqrt(grad_norm_sq);
         float clip_coef = (grad_norm > max_grad_norm_) ? (max_grad_norm_ / grad_norm) : 1.0F;
 
         // Bias correction
-        float bc1 = 1.0F - std::pow(beta1, timestep_);
-        float bc2 = 1.0F - std::pow(beta2, timestep_);
+        float bc1 = 1.0F - std::pow(kAdamBeta1, timestep_);
+        float bc2 = 1.0F - std::pow(kAdamBeta2, timestep_);
 
         // Adam update with L2 regularization toward original weights (anti-forgetting)
         // + gradient clipping to prevent catastrophic updates
-        auto const adam_update_with_l2 = [&](std::vector<float>& param,
-                                       const std::vector<float>& orig_param,
-                                       std::vector<float>& grad,
-                                       std::vector<float>& m,
-                                       std::vector<float>& v) {
+        auto const adam_update_with_l2 = [&](const ParameterSlot& slot) {
+            std::vector<float>& param = *slot.value;
+            const std::vector<float>& orig_param = *slot.origin;
+            std::vector<float>& grad = *slot.gradient;
             for (size_t i = 0; i < param.size(); ++i) {
                 // Clip gradient (grad_norm/clip_coef above are already computed
                 // on this same averaged scale, so the clip fires on the actual
@@ -408,11 +526,8 @@ public:
                 float const l2_grad = 2.0F * l2_lambda_ * (param[i] - orig_param[i]);
                 float const g = clipped_grad + l2_grad;
 
-                m[i] = (beta1 * m[i]) + ((1.0F - beta1) * g);
-                v[i] = (beta2 * v[i]) + ((1.0F - beta2) * g * g);
-                float const m_hat = m[i] / bc1;
-                float const v_hat = v[i] / bc2;
-                param[i] -= learning_rate_ * m_hat / (std::sqrt(v_hat) + epsilon);
+                adam_coordinate(param[i], g, (*slot.adam_m)[i], (*slot.adam_v)[i], bc1, bc2,
+                                learning_rate_);
                 grad[i] = 0.0F;  // Reset gradient
             }
         };
@@ -431,14 +546,7 @@ public:
             pre_out_proj_bias = out_proj_bias_;
         }
 
-        adam_update_with_l2(dense_weight_, orig_dense_weight_,
-                            dense_weight_grad_, dense_weight_m_, dense_weight_v_);
-        adam_update_with_l2(dense_bias_, orig_dense_bias_,
-                            dense_bias_grad_, dense_bias_m_, dense_bias_v_);
-        adam_update_with_l2(out_proj_weight_, orig_out_proj_weight_,
-                            out_proj_weight_grad_, out_proj_weight_m_, out_proj_weight_v_);
-        adam_update_with_l2(out_proj_bias_, orig_out_proj_bias_,
-                            out_proj_bias_grad_, out_proj_bias_m_, out_proj_bias_v_);
+        for (const ParameterSlot& slot : parameters()) { adam_update_with_l2(slot); }
 
         if (function_space_enabled_) {
             // TASK-193 AC#9: bound drift by the change in the head's OUTPUT on
@@ -486,10 +594,9 @@ public:
             // 3,000 and leaves the ham fixes at 37 of 68 exactly. The uniform shift
             // comes from the WEIGHT tensors. See qualification/bias-probe/ and
             // HOW_TO_TRAIN_A_MODEL.md, "Two mitigations that do not work".
-            project_to_trust_region(dense_weight_, orig_dense_weight_);
-            project_to_trust_region(dense_bias_, orig_dense_bias_);
-            project_to_trust_region(out_proj_weight_, orig_out_proj_weight_);
-            project_to_trust_region(out_proj_bias_, orig_out_proj_bias_);
+            for (const ParameterSlot& slot : parameters()) {
+                project_to_trust_region(*slot.value, *slot.origin);
+            }
         }
     }
 
@@ -498,22 +605,24 @@ public:
     // step; if preparing a later representation fails, none of that partial
     // sample may leak into the next correction.
     void zero_grad() noexcept {
-        std::fill(dense_weight_grad_.begin(), dense_weight_grad_.end(), 0.0F);
-        std::fill(dense_bias_grad_.begin(), dense_bias_grad_.end(), 0.0F);
-        std::fill(out_proj_weight_grad_.begin(), out_proj_weight_grad_.end(), 0.0F);
-        std::fill(out_proj_bias_grad_.begin(), out_proj_bias_grad_.end(), 0.0F);
+        for (const ParameterSlot& slot : parameters()) {
+            std::fill(slot.gradient->begin(), slot.gradient->end(), 0.0F);
+        }
     }
 
     // Save updated weights
     void save(const std::string& model_dir) {
-        save_binary(model_dir + "/classifier_dense_weight.bin", dense_weight_);
-        save_binary(model_dir + "/classifier_dense_bias.bin", dense_bias_);
-        save_binary(model_dir + "/classifier_out_proj_weight.bin", out_proj_weight_);
-        save_binary(model_dir + "/classifier_out_proj_bias.bin", out_proj_bias_);
-        save_binary(model_dir + "/classifier_anchor_dense_weight.bin", orig_dense_weight_);
-        save_binary(model_dir + "/classifier_anchor_dense_bias.bin", orig_dense_bias_);
-        save_binary(model_dir + "/classifier_anchor_out_proj_weight.bin", orig_out_proj_weight_);
-        save_binary(model_dir + "/classifier_anchor_out_proj_bias.bin", orig_out_proj_bias_);
+        const auto file_for = [&](const char* prefix, const char* name) {
+            std::string path = model_dir;
+            path += prefix;
+            path += name;
+            path += ".bin";
+            return path;
+        };
+        for (const ParameterSlot& slot : parameters()) {
+            save_binary(file_for("/classifier_", slot.name), *slot.value);
+            save_binary(file_for("/classifier_anchor_", slot.name), *slot.origin);
+        }
     }
 
     void set_learning_rate(float lr) { learning_rate_ = lr; }
@@ -776,16 +885,10 @@ private:
     // ‖w - w0‖ / ‖w0‖ for one tensor.
     static float rel_drift_of(const std::vector<float>& param,
                               const std::vector<float>& orig_param) {
-        float drift_sq = 0.0F;
-        float orig_sq = 0.0F;
-        for (size_t i = 0; i < param.size(); ++i) {
-            const float d = param[i] - orig_param[i];
-            drift_sq += d * d;
-            orig_sq += orig_param[i] * orig_param[i];
-        }
-        if (orig_sq == 0.0F) { return 0.0F;
+        const double orig_sq = squared_norm(orig_param);
+        if (orig_sq == 0.0) { return 0.0F;
 }
-        return std::sqrt(drift_sq / orig_sq);
+        return static_cast<float>(drift_norm(param, orig_param) / std::sqrt(orig_sq));
     }
 
     // The trust-region budget for one tensor: `max_drift_steps` Adam steps.
@@ -797,17 +900,17 @@ private:
                std::sqrt(static_cast<float>(n));
     }
 
+    // Norms accumulate in double: the weights are float, but a float running
+    // sum over a million squares (public-v0's dense weight) or a three-element
+    // one at 1e-4 scale (an e5 head's out_proj bias) both round enough that a
+    // head projected exactly onto the boundary read back as 1.0004 to 1.0008
+    // of budget on gen3-v6 (2026-09-14), which is noise reported as a breach.
     [[nodiscard]] float saturation_of(const std::vector<float>& param,
                         const std::vector<float>& orig_param) const {
         const float budget = trust_budget(param.size());
         if (budget <= 0.0F) { return 0.0F;
 }
-        float drift_sq = 0.0F;
-        for (size_t i = 0; i < param.size(); ++i) {
-            const float d = param[i] - orig_param[i];
-            drift_sq += d * d;
-        }
-        return std::sqrt(drift_sq) / budget;
+        return static_cast<float>(drift_norm(param, orig_param) / budget);
     }
 
     // Project `param` back onto the ball of radius `trust_budget(n)` centred on
@@ -816,18 +919,14 @@ private:
                                  const std::vector<float>& orig_param) {
         if (max_drift_steps_ <= 0.0F) { return;
 }
-        float drift_sq = 0.0F;
-        for (size_t i = 0; i < param.size(); ++i) {
-            const float d = param[i] - orig_param[i];
-            drift_sq += d * d;
-        }
-        const float budget = trust_budget(param.size());
-        const float drift = std::sqrt(drift_sq);
-        if (drift <= budget || drift == 0.0F) { return;
+        const double budget = trust_budget(param.size());
+        const double drift = drift_norm(param, orig_param);
+        if (drift <= budget || drift == 0.0) { return;
 }
-        const float scale = budget / drift;
+        const double scale = budget / drift;
         for (size_t i = 0; i < param.size(); ++i) {
-            param[i] = orig_param[i] + ((param[i] - orig_param[i]) * scale);
+            const double d = static_cast<double>(param[i]) - static_cast<double>(orig_param[i]);
+            param[i] = static_cast<float>(static_cast<double>(orig_param[i]) + (d * scale));
         }
     }
 
@@ -894,7 +993,6 @@ private:
 
     // Cached values for backprop
     std::vector<float> cached_input_;
-    std::vector<float> cached_hidden_pre_activation_;
     std::vector<float> cached_hidden_;
     std::vector<float> cached_logits_;
 

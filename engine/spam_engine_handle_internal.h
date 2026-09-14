@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "spam_engine.h"
+#include "spam_engine_c_api.h"
 
 struct spam_engine_training_sample {
   std::string raw_email;
@@ -25,3 +26,22 @@ struct spam_engine_handle {
   std::vector<spam_engine_training_sample> pending_training_samples;
 };
 
+// The error contract every C ABI entry point shares: set (or clear) the
+// handle's last_error under its mutex and hand the status back, so a caller
+// can `return set_error_locked(...)` in one line. One definition here rather
+// than a copy per translation unit.
+inline spam_engine_status_t set_error_locked(
+    spam_engine_handle_t* handle,
+    spam_engine_status_t code,
+    const std::string& message) {
+  if (handle != nullptr) {
+    handle->last_error = message;
+  }
+  return code;
+}
+
+inline void clear_error_locked(spam_engine_handle_t* handle) {
+  if (handle != nullptr) {
+    handle->last_error.clear();
+  }
+}

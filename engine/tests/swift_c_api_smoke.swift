@@ -19,8 +19,12 @@ if CommandLine.arguments.count > 1 {
 
 let modelPath = "\(sourceDir)/model"
 
-if !FileManager.default.fileExists(atPath: "\(modelPath)/gguf/encoder-q4_k_m.gguf") {
-  print("[SKIP] Swift C API smoke: model assets not found")
+// The encoder file is whatever the artifact declares; run_swift_c_api_smoke.sh
+// reads classifier_config.json and hands the name over, so this cannot skip on
+// a filename the released set never had (gen3-v6 ships encoder-q8_0.gguf).
+let encoderFile = ProcessInfo.processInfo.environment["KLAR_ENCODER_FILE"] ?? "encoder-q4_k_m.gguf"
+if !FileManager.default.fileExists(atPath: "\(modelPath)/gguf/\(encoderFile)") {
+  print("[SKIP] Swift C API smoke: model assets not found (\(encoderFile))")
   exit(0)
 }
 

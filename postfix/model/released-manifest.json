@@ -1,41 +1,41 @@
 {
   "files": {
     "classifier_config.json": {
-      "md5_b64": "TZevL42Shr/MbxX4mlC3BA==",
-      "sha256": "bd799b915c9f9df1baa5e9aac15056ef363692e07dafcf09c53414a1ec807383",
-      "size": 146
+      "md5_b64": "E3J/Kj+V1HmDddZuCgdSIg==",
+      "sha256": "7f18250a29e61ac1ffc4ce5411d00df2063e2f1bebb9e793eaf66b07585740a2",
+      "size": 418
     },
     "classifier_dense_bias.bin": {
-      "md5_b64": "smw7t8qno84Umwa8uUjWnQ==",
-      "sha256": "eedc2d176f3aa6002ecc7c6b417914d6b5dc4b897f759b8355f0658a87b1d8e7",
-      "size": 4096
+      "md5_b64": "tQ1ALx824C3w9uBR0xrr3w==",
+      "sha256": "4719be392d525a948e42da88a588223752657c08df90463449518d28a66ce93e",
+      "size": 3072
     },
     "classifier_dense_weight.bin": {
-      "md5_b64": "HqpPIKZ4gG+XmJW7QYc/tQ==",
-      "sha256": "c93f75ac402b07a3ebee1efdeb3dba6ba132690a7a8a15138abffbb31fdb7d3b",
-      "size": 4194304
+      "md5_b64": "3vYGXma5xlosFms1tNqBzQ==",
+      "sha256": "8333fba52906b137303870ea8ffa0447bd60936456cacaed15e1097eacad54ea",
+      "size": 2359296
     },
     "classifier_out_proj_bias.bin": {
-      "md5_b64": "tllXd2xS51EKoIj76aj7Ow==",
-      "sha256": "d295088f3851d9fcdf4e49f54e2af7f18cf8dde768d264402c20117d025e7506",
-      "size": 16
+      "md5_b64": "ELEce/7Hkk/eq+JaIAgI3g==",
+      "sha256": "12e945a03cfa9c44a4507ec58444ade37a4501b9f1428bc727a14f6620d8bb90",
+      "size": 12
     },
     "classifier_out_proj_weight.bin": {
-      "md5_b64": "uwDzAuFDUWfcNF2IsYx9JQ==",
-      "sha256": "567ef2933c75506bc6bbc6c51dc6f4c631e5bfa720d15e46e9b50fa896c0896f",
-      "size": 16384
+      "md5_b64": "FNz2sn2YzIXDKbz0kqL0hQ==",
+      "sha256": "fd5ee6983c21fbe93deeeeb2a8f0587e5b3bde46af680b0b06a17930332d0ba4",
+      "size": 9216
     },
     "ftrl_baseline.bin": {
       "md5_b64": "B/IEn1DsFReGQZw5Rmmi4Q==",
       "sha256": "a08229f289a42eb9e4597b34b576b0272ac2a372fd2689d3e4d0a37630b787bf",
       "size": 8388652
     },
-    "gguf/encoder-q4_k_m.gguf": {
-      "md5_b64": "qwFhCv40c6omLMgTpuKayg==",
-      "sha256": "85707d2a714c2f019549a84378e4418cd30cf06b0ecbabc894fbbfacd148db4e",
-      "size": 406917696
+    "gguf/encoder-q8_0.gguf": {
+      "md5_b64": "J1P+WrTMP+rEVcWeJ5+AhA==",
+      "sha256": "7d6e0349cf22c46d927a6f1cc48d082dd8a89a896d228a3004b5e1dfc25e44ec",
+      "size": 303770112
     }
   },
-  "model_uuid": "21bcd2ff-beaf-41d4-aa84-8083083d3554",
-  "source_model": null
+  "model_uuid": "dab55c42-6eb5-464b-9e2a-271fd1867a19",
+  "source_model": "klar/e5-base-gen3-v6@training-run:ffa8fb6523e00a9a41636d69a18bda08b07b9df3e86c0312ad9d879fe88dd662"
 }

@@ -5,9 +5,14 @@ separately, under **CC-BY-NC-4.0**.
 
 ## Production model: CC-BY-NC-4.0 (non-commercial)
 
-The shipping classifier (the high-quality model the Klar apps use,
-[`icosha/spam-xlmr-v1`](https://huggingface.co/icosha/spam-xlmr-v1)) is
-published publicly under **CC-BY-NC-4.0**. It is **not** under the AGPL grant.
+The shipping classifier (the model the Klar apps use, named by
+`infra/released-model.env` in the private monorepo and pinned here as
+`postfix/model/released-manifest.json`: today **gen3-v6**, Klar's own
+fine-tune of the MIT-licensed `intfloat/multilingual-e5-base` encoder, fetched
+by `fetch_model.sh` from Klar's download bucket) is distributed under
+**CC-BY-NC-4.0**. It is **not** under the AGPL grant. Klar's first public
+model, [`icosha/spam-xlmr-v1`](https://huggingface.co/icosha/spam-xlmr-v1)
+(XLM-RoBERTa-large), carries the same terms.
 
 - **Non-commercial use is free**, with attribution to Klar: use it for personal
   self-hosting, research, and evaluation under the CC-BY-NC-4.0 terms.

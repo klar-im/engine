@@ -192,6 +192,10 @@ Napi::Object ModelInfoObject(Napi::Env env, const spam_engine_model_info_t& mi) 
   out.Set("rawInput", Napi::Boolean::New(env, mi.raw_input != 0));
   out.Set("structuralMarkers", Napi::Boolean::New(env, mi.structural_markers != 0));
   out.Set("attachmentContext", Napi::Boolean::New(env, mi.attachment_context != 0));
+  // 0 = undeclared (the identity map, public-v0). A declared knot is the raw
+  // spam side the artifact maps onto the 0.99 gate; the decision fold above
+  // applies it, and a consumer can check that it did.
+  out.Set("spamSideCalibrationKnot", Napi::Number::New(env, mi.spam_side_calibration_knot));
   return out;
 }
 
@@ -266,11 +270,6 @@ class ClassifyWorker : public Napi::AsyncWorker {
     // produces: folds the sender-auth / thread offsets onto the model's
     // spam-side and applies the standard threshold. For plain text there are no
     // headers, so signals_ is zeroed and no offset fires (verdict == neural).
-    spam_engine_decision_input_t din{};
-    spam_engine_decision_input_from_signals(&din, &result_.scores, &signals_);
-    din.profile = SPAM_ENGINE_PROFILE_STANDARD;
-    spam_engine_decide(&din, &decision_);
-
     // Which artifact produced this verdict, read here rather than by a separate
     // modelInfo() call afterwards. Under the mutex the answer is the model that
     // actually ran; outside it, a swap for the next request could already have
@@ -278,6 +277,18 @@ class ClassifyWorker : public Napi::AsyncWorker {
     // matters more than it sounds: the demo has silently changed model
     // underneath us before and nobody noticed for a month.
     has_model_ = spam_engine_model_info(g_engine.handle, &model_) == 1;
+
+    spam_engine_decision_input_t din{};
+    spam_engine_decision_input_from_signals(&din, &result_.scores, &signals_);
+    din.profile = SPAM_ENGINE_PROFILE_STANDARD;
+    // The artifact's own spam-side scale. spam_engine_classify_full fills this
+    // itself; a standalone spam_engine_decide caller has to copy it from the
+    // model info, and this one did not: with gen3-v6 (knot 0.8931, the
+    // label-smoothed head's raw spam side tops out near 0.90) every neural
+    // spam verdict on klar.im read as ham at 0.897 while the C API said 0.990.
+    // Public-v0 declares no knot, so the identity map hid it (2026-09-14).
+    din.spam_side_knot = has_model_ ? model_.spam_side_calibration_knot : 0.0;
+    spam_engine_decide(&din, &decision_);
 
     // Distinct link domains for the reputation/explanation panel (EML only).
     if (is_eml_) {

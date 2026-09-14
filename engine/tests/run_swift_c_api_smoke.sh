@@ -10,10 +10,16 @@ if ! command -v swiftc >/dev/null 2>&1; then
   exit 0
 fi
 
-if [ ! -f "$ENGINE_DIR/model/gguf/encoder-q4_k_m.gguf" ]; then
+# The encoder file is whatever the artifact declares (gen3-v6 ships q8_0).
+ENCODER_FILE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("gguf_encoder_file", "encoder-q4_k_m.gguf"))' \
+  "$ENGINE_DIR/model/classifier_config.json" 2>/dev/null || echo encoder-q4_k_m.gguf)"
+if [ ! -f "$ENGINE_DIR/model/gguf/$ENCODER_FILE" ]; then
   echo "[SKIP] Swift C API smoke: model assets not found"
   exit 0
 fi
+# The Swift side re-checks the same file, so it cannot skip on a name the
+# artifact never declared.
+export KLAR_ENCODER_FILE="$ENCODER_FILE"
 
 SWIFT_FILE="$SCRIPT_DIR/swift_c_api_smoke.swift"
 MODULE_DIR="$SCRIPT_DIR/swift_c_api_module"

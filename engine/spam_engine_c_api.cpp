@@ -14,22 +14,6 @@
 
 namespace {
 
-spam_engine_status_t set_error_locked(
-    spam_engine_handle_t* handle,
-    spam_engine_status_t code,
-    const std::string& message) {
-  if (handle != nullptr) {
-    handle->last_error = message;
-  }
-  return code;
-}
-
-void clear_error_locked(spam_engine_handle_t* handle) {
-  if (handle != nullptr) {
-    handle->last_error.clear();
-  }
-}
-
 // Writes `src`, truncated to `capacity`, into `out_buf` and sets *out_len to
 // src's true length so the caller can detect truncation and re-call with a
 // bigger buffer. out_buf is a length-prefixed byte copy, not expected to be

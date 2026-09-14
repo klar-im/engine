@@ -4,7 +4,7 @@ Run the Klar spam engine on a [Stalwart](https://stalw.art) mail server, in
 place of Stalwart's built-in rule filter. Stalwart hands every inbound message
 to `klar-milterd` over the milter protocol, the engine classifies it on your
 box (nothing leaves the server), and a per-mailbox Sieve rule files on the
-verdict. This is how [klar.im](https://klar.im)'s own mail runs.
+verdict.
 
 ![Stalwart hands the message to klar-milterd at DATA; the engine classifies it on your box; the milter adds X-Klar headers; the account's Sieve files on them. Stalwart's own filter keeps scoring and its verdict is recorded, never acted on.](docs/klar-stalwart.png)
 
@@ -12,14 +12,15 @@ verdict. This is how [klar.im](https://klar.im)'s own mail runs.
 
 Stalwart runs its own spam filter **before** the milters and records the
 outcome as a per-recipient flag that decides Junk filing at delivery
-(`crates/smtp/src/inbound/data.rs`, 0.16.18: filter at `:531`, flag at `:566`,
-`run_milters` at `:602`; `crates/email/src/message/ingest.rs:357` files on the
-flag). A header the milter adds cannot clear that flag, so two filters would
-run and the built-in one would win every disagreement. Turning it off is the
-whole point, not a side effect: on our own mail its rules junked Apple's
-TestFlight invitation at a score of 8.90 with DKIM, SPF and DMARC all passing
-(`SPOOF_REPLYTO` because Apple's Reply-To domain differs from its From domain,
-`MIME_MA_MISSING_TEXT` because the mail was HTML-only).
+(`crates/smtp/src/inbound/data.rs`: filter, flag, `run_milters`, in that
+order, at `:531`/`:566`/`:602` in 0.16.18 and `:525`/`:559`/`:595` in
+0.16.22; `crates/email/src/message/ingest.rs:357` files on the flag in both).
+A header the milter adds cannot clear that flag, so two filters would run and
+the built-in one would win every disagreement. Turning it off is the whole
+point, not a side effect. (Since 0.16.22 a user Sieve `fileinto` also clears
+the flag, `crates/email/src/sieve/ingest.rs`; the shipped `klar.sieve` files spam
+and marketing and lets regular mail fall through to the implicit keep, so it
+does not rely on that.)
 
 ## Install
 
@@ -67,21 +68,21 @@ commercial use). `fetch_model.sh` refuses to download it until
 `stalwart/config/klar-milterd.toml` is the milter's config for this
 deployment. Two settings differ from a Postfix install and both matter:
 
-- `auth_results = "ignore"`. Stalwart writes its `Authentication-Results`
-  **after** the milters run and hands the milter the message as the client
-  sent it, so any `Authentication-Results` the milter sees is the sender's own
-  claim. The engine reads that header and trusts the topmost one; a forged
-  `dkim=pass header.d=paypal.com` on a phish from `paypal.com` would buy it a
-  strong ham rescue. `ignore` drops every such header before the engine sees
-  the message. Do not set `trust-topmost` behind Stalwart.
+- `auth_results = "ignore"`. The engine reads `Authentication-Results` and
+  trusts the topmost one when told to. Stalwart adds its own after the milters
+  have run (`data.rs`, the queued prefix), so what a milter sees at DATA is
+  the message as the sender delivered it. `ignore` drops every such header
+  before the engine parses the message. Do not set `trust-topmost` behind
+  Stalwart; a failing DMARC is enforced by Stalwart itself
+  (`dmarcVerify = strict`, below).
 - `listen`. `127.0.0.1` when Stalwart is on the same host. In a container or
   another network namespace, bind an address Stalwart can reach
   (`inet:8891@0.0.0.0`); the Dockerfile does this.
 
 Sizing: about 700 MB of RSS with the model loaded, one classification at a
-time. Speed is the CPU's: on klar.im's 2-vCPU VPS (AMD EPYC 7281, shared with
-Stalwart and a website) the median is 6 s per message and the 90th percentile
-12 s, measured over a day of real mail; a desktop CPU is several times faster
+time. Speed is the CPU's: on a 2-vCPU VPS (AMD EPYC 7281, shared with the
+mail server and a website) the median is 6 s per message and the 90th
+percentile 12 s, measured over a day of real mail; a desktop CPU is several times faster
 and Apple Silicon classifies in tens of milliseconds. Stalwart waits 60 s for
 the milter (`timeoutData`) and delivers unclassified past that, never defers.
 `postfix/README.md` has the detail; the milter is the same daemon Postfix
@@ -154,28 +155,10 @@ is what Stalwart would have done to each message.
 
 Two ways to use it. As a **comparison window** when migrating: run shadow for
 a fortnight, count the disagreements, then re-run `apply.py` without
-`--shadow` to remove the tag and rule and turn the filter off. Or **keep it**,
-which is what klar.im does: every message we receive then carries two
-independent verdicts, ours deciding and Stalwart's recorded, and a filter you
-can compare yourself against on your own mail is worth the few milliseconds
-its rules cost. klar.im's count is `make company/mail-spam-audit
-ARGS="--exclude-tag KLAR_SHADOW"`; the first fortnight's result is in the launch
-post.
-
-## What the engine gives up behind Stalwart, and what closes it
-
-With `auth_results = "ignore"` the engine never sees a DMARC result. Where a
-brand's domain is forged directly and that brand publishes `p=reject`,
-Stalwart refuses the message before the milter (`dmarcVerify strict`). Where
-the brand publishes `p=quarantine` or `p=none`, the engine reads the message
-as unauthenticated: it still condemns on content, look-alike domains, display
-names and the rest, but the one signal it cannot have is "DMARC positively
-failed". Behind Postfix that signal comes from OpenDMARC stamping a trusted
-header ahead of the milter; Stalwart computes the same result and does not yet
-pass it to milters or MTA hooks (`hooks/message.rs` sends
-`server_headers: vec![]`). The proper fix is upstream, a small change that
-fills that field, and it is filed; until it ships, this paragraph is the
-residual.
+`--shadow` to remove the tag and rule and turn the filter off. Or **keep it**:
+every message then carries two independent verdicts, Klar's deciding and
+Stalwart's recorded, and a filter you can compare yourself against on your
+own mail is worth the few milliseconds its rules cost.
 
 ## Try it in one command
 

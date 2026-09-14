@@ -160,23 +160,20 @@ target_link_libraries(spam_engine_c_api
         spam_engine
 )
 
-# Training C ABI (premium feature, separate library). Closed-source: its source
-# is not part of the open-core (klar-im/engine) repo, so only build it when present.
-set(KLAR_HAVE_TRAINING OFF)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/spam_engine_training_c_api.cpp")
-    set(KLAR_HAVE_TRAINING ON)
-    add_library(spam_engine_training_c_api SHARED
-        spam_engine_training_c_api.cpp
-    )
-    target_include_directories(spam_engine_training_c_api
-        PUBLIC
-            ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    target_link_libraries(spam_engine_training_c_api
-        PRIVATE
-            spam_engine
-    )
-endif()
+# On-device training C ABI (learn from corrections), a separate library so a
+# consumer that never trains can leave it out of its bundle. Open since
+# 2026-07-04; every checkout has it.
+add_library(spam_engine_training_c_api SHARED
+    spam_engine_training_c_api.cpp
+)
+target_include_directories(spam_engine_training_c_api
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(spam_engine_training_c_api
+    PRIVATE
+        spam_engine
+)
 
 # Main executable
 add_executable(spam_classifier
@@ -201,14 +198,26 @@ target_link_libraries(spam_benchmark
 # Minimal API-level validation for the engine core. Some test sources are not
 # part of the open-core repo (they reference closed surfaces); build each only
 # when its source is present.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/spam_engine_tests.cpp")
-    add_executable(spam_engine_tests
-        tests/spam_engine_tests.cpp
-    )
-    target_compile_definitions(spam_engine_tests
+# One engine test binary that loads a model: the executable, the source-dir
+# define its fixtures resolve through, its ctest entry, and the llama library
+# path (CMAKE_BUILD_RPATH covers the executable but not the libggml-cpu-*.so
+# plugins dlopen'd at runtime, which resolve libggml-base.so through their
+# own rpath). Link libraries with target_link_libraries afterwards.
+function(klar_engine_test name source)
+    add_executable(${name} ${source})
+    target_compile_definitions(${name}
         PRIVATE
             SPAM_ENGINE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
+    add_test(NAME ${name} COMMAND ${name})
+    if(DEFINED LLAMA_INSTALL)
+        set_tests_properties(${name} PROPERTIES
+            ENVIRONMENT "LD_LIBRARY_PATH=${LLAMA_INSTALL}/lib")
+    endif()
+endfunction()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/spam_engine_tests.cpp")
+    klar_engine_test(spam_engine_tests tests/spam_engine_tests.cpp)
     # nlohmann is PRIVATE on spam_engine, so the test target links it directly.
     # The marker test authors a classifier_config.json fixture; it previously did
     # that by splicing a Gen 3 source_model literal, which made it depend on
@@ -223,25 +232,18 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/spam_engine_tests.cpp")
     # messages, which is what put the merge gate over its 900 s ctest timeout
     # (TASK-428 AC#5), so the label lets `make engine/test` exclude them and
     # `make engine/qualify` select them.
-    add_test(NAME spam_engine_tests COMMAND spam_engine_tests)
     add_test(NAME spam_engine_qualification
              COMMAND spam_engine_tests --qualification-only)
     set_tests_properties(spam_engine_qualification PROPERTIES
         LABELS qualification)
     if(DEFINED LLAMA_INSTALL)
-        set_tests_properties(spam_engine_tests spam_engine_qualification
-            PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${LLAMA_INSTALL}/lib")
+        set_tests_properties(spam_engine_qualification PROPERTIES
+            ENVIRONMENT "LD_LIBRARY_PATH=${LLAMA_INSTALL}/lib")
     endif()
 endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/spam_engine_c_api_tests.cpp")
-    add_executable(spam_engine_c_api_tests
-        tests/spam_engine_c_api_tests.cpp
-    )
-    target_compile_definitions(spam_engine_c_api_tests
-        PRIVATE
-            SPAM_ENGINE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-    )
+    klar_engine_test(spam_engine_c_api_tests tests/spam_engine_c_api_tests.cpp)
     target_link_libraries(spam_engine_c_api_tests
         PRIVATE
             spam_engine
@@ -252,15 +254,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/spam_engine_c_api_tests.cpp")
     # this TU, not just the library). Without this an incremental build can compile the
     # test against a stale committed brand_kb_data.h after an input change.
     add_dependencies(spam_engine_c_api_tests brand_kb_data)
-    if(KLAR_HAVE_TRAINING)
-        target_link_libraries(spam_engine_c_api_tests PRIVATE spam_engine_training_c_api)
-        target_compile_definitions(spam_engine_c_api_tests PRIVATE KLAR_HAVE_TRAINING)
-    endif()
-    add_test(NAME spam_engine_c_api_tests COMMAND spam_engine_c_api_tests)
-    if(DEFINED LLAMA_INSTALL)
-        set_tests_properties(spam_engine_c_api_tests PROPERTIES
-            ENVIRONMENT "LD_LIBRARY_PATH=${LLAMA_INSTALL}/lib")
-    endif()
+    target_link_libraries(spam_engine_c_api_tests PRIVATE spam_engine_training_c_api)
 endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/decision_layer_tests.cpp")
@@ -349,4 +343,13 @@ if(BASH_EXECUTABLE AND SWIFTC_EXECUTABLE)
         NAME spam_engine_swift_c_api_smoke
         COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_swift_c_api_smoke.sh ${CMAKE_CURRENT_BINARY_DIR}
     )
+endif()
+
+# Sources that ship only with the closed distribution. Absent from the public
+# mirror by design, and nothing above depends on them. A checkout that has
+# the closed publish lists but not this file is a monorepo checkout missing
+# it, which must fail here rather than configure a smaller build quietly.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/closed.cmake" OPTIONAL RESULT_VARIABLE KLAR_CLOSED_INCLUDED)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/publish/closed.txt" AND NOT KLAR_CLOSED_INCLUDED)
+    message(FATAL_ERROR "engine/cmake/closed.cmake is missing from a closed checkout")
 endif()

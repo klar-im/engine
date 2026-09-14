@@ -84,6 +84,8 @@ export interface ModelInfo {
 	/** false = the public-v0 legacy envelope, true = raw text. */
 	rawInput: boolean;
 	structuralMarkers: boolean;
+	/** The raw spam side the artifact maps onto the 0.99 gate; 0 = undeclared (identity). */
+	spamSideCalibrationKnot: number;
 }
 
 /**

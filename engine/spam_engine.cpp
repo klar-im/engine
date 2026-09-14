@@ -919,6 +919,10 @@ float SpamEngine::train_embedding(const std::vector<float>& embedding, int corre
   return loss;
 }
 
+TrainableClassifierHead* SpamEngine::trainable_head() noexcept {
+  return impl_ ? impl_->trainable_head.get() : nullptr;
+}
+
 float SpamEngine::head_drift_saturation() const {
   if (!impl_ || !impl_->trainable_head) { return 0.0F;
 }

@@ -221,10 +221,13 @@ gtube() {  # gtube <rcpt> <marker>
     echo "$TMP/$2.eml"
 }
 ham() {  # ham <rcpt> <marker>
-    # A personal note, far from the marketing boundary: 0.99 regular on the
-    # released model. The first fixture ("still on for lunch tomorrow at noon?
-    # I booked the usual place") sat at 0.57 regular / 0.43 marketing on one
-    # CPU and flipped to marketing on another, and the Sieve filed it there.
+    # A personal note, far from the marketing boundary: 0.99 regular / 0.00
+    # marketing on public-v0, 0.84 / 0.12 on gen3-v6 (a label-smoothed head
+    # never reads above about 0.84 on ham; the margin is what matters, see
+    # tests/test_e2e_fixtures.sh). The first fixture ("still on for lunch
+    # tomorrow at noon? I booked the usual place") sat at 0.57 regular / 0.43
+    # marketing on one CPU and flipped to marketing on another, and the Sieve
+    # filed it there.
     printf 'From: Dana <dana@sender.example>\r\nTo: %s\r\nSubject: Re: keys %s\r\nMessage-ID: <%s@sender.example>\r\n\r\nFound them, they were in the other coat. I will drop them off on my way to work tomorrow, around eight. Do you want me to bring the book back too?\r\n\r\nDana\r\n' "$1" "$2" "$2" > "$TMP/$2.eml"
     echo "$TMP/$2.eml"
 }

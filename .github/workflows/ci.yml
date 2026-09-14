@@ -67,14 +67,19 @@ jobs:
         run: make setup
 
       # The tests run against the RELEASED bytes, the same artifact klar.im's box
-      # and the container fetch: sha256-verified per file, 400 MB, seconds from
+      # and the container fetch: sha256-verified per file, 315 MB, seconds from
       # the cache. `make import` (HF download + GGUF conversion) stays the path for
       # converting your own model; its quantisation is not bit-identical to the
       # release, and boundary-adjacent fixtures flip on that, so it is not what
       # the suite is measured against. The licence acceptance is the CI's, for the
-      # test run only: nothing here redistributes the weights.
+      # test run only: nothing here redistributes the weights. `make model` is the
+      # same fetch the README's quick start runs; the encoder file it checks for
+      # is whatever classifier_config.json declares (gen3-v6 ships q8_0).
       - name: Fetch the released model
-        run: KLAR_ACCEPT_MODEL_LICENSE=1 postfix/scripts/fetch_model.sh engine/model
+        run: |
+          KLAR_ACCEPT_MODEL_LICENSE=1 make model
+          encoder="$(python3 -c 'import json; print(json.load(open("engine/model/classifier_config.json")).get("gguf_encoder_file", "encoder-q4_k_m.gguf"))')"
+          test -f "engine/model/gguf/$encoder" || { echo "[ci] missing declared encoder $encoder"; exit 1; }
 
       - name: Build engine + reference milter
         run: make build
@@ -154,6 +159,12 @@ jobs:
           set +e
           docker run --rm "ghcr.io/${{ github.repository_owner }}/klar-milterd:${GITHUB_REF_NAME}" >/dev/null 2>&1
           [ $? -eq 3 ] || { echo "the image must exit 3 without KLAR_ACCEPT_MODEL_LICENSE"; exit 1; }
+      # A package first pushed by this token is private and GitHub has no API to
+      # change that; the switch is one click in the package settings, once. This
+      # step is what makes a private package a red release instead of a reader's
+      # "docker pull says the image does not exist".
+      - name: Prove a stranger can pull it
+        run: IMAGE_OWNER=${{ github.repository_owner }} postfix/scripts/check_image_public.sh "$GITHUB_REF_NAME"
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

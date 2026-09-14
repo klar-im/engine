@@ -161,6 +161,7 @@ ClassifyResult ModelRuntime::classify_rfc822(const std::string& raw_email,
     spam_engine_decision_result_t dout{};
     if (spam_engine_decide(&din, &dout) == SPAM_ENGINE_STATUS_OK) {
         cr.adjusted_spam = static_cast<float>(dout.adjusted_spam_side);
+        cr.calibrated_spam = static_cast<float>(dout.calibrated_spam_side);
         cr.structural_condemn = (dout.condemn_offset_fired != 0);
         cr.fired_offsets = dout.fired_offsets;
         cr.flipped_by_offset = cr.fired_offsets.find('!') != std::string::npos;
@@ -168,6 +169,7 @@ ClassifyResult ModelRuntime::classify_rfc822(const std::string& raw_email,
         // Defensive: fall back to the bare spam-side (spam+gibberish) if the fold
         // somehow fails — never worse than the pre-TASK-179 behaviour.
         cr.adjusted_spam = result.scores.spam + result.scores.gibberish;
+        cr.calibrated_spam = cr.adjusted_spam;
         cr.structural_condemn = false;
     }
     return cr;
