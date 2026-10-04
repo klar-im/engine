@@ -84,11 +84,15 @@ else
 fi
 expected=$(cut -d' ' -f1 < "$tmp/sha256")
 actual=$(sha256sum "$tarball" | cut -d' ' -f1)
-[ -n "$expected" ] && [ "$expected" = "$actual" ] || die "sha256 mismatch for $tarball (expected $expected, got $actual)"
+if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    die "sha256 mismatch for $tarball (expected $expected, got $actual)"
+fi
 
 mkdir "$tmp/new"
 tar --no-same-owner -xzf "$tarball" -C "$tmp/new"
-[ -x "$tmp/new/bin/klar-milterd" ] && [ -d "$tmp/new/share" ] || die "$tarball is not a klar-milterd release tarball"
+if [ ! -x "$tmp/new/bin/klar-milterd" ] || [ ! -d "$tmp/new/share" ]; then
+    die "$tarball is not a klar-milterd release tarball"
+fi
 # Prove the binaries run on this system before replacing anything.
 LD_LIBRARY_PATH="$tmp/new/bin" "$tmp/new/bin/klar-policy-cli" --version >/dev/null 2>&1 \
     || die "the prebuilt binaries do not run here (they need glibc 2.35 or newer on x86_64, 2.39 on arm64; or use the container, ghcr.io/klar-im/klar-milterd); build from source: https://github.com/$REPO"
