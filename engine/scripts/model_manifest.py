@@ -25,6 +25,7 @@ import hashlib
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ENGINE_DIR = Path(__file__).resolve().parents[1]
@@ -167,6 +168,13 @@ def main() -> int:
         return 0
 
     manifest = build(model_dir)
+    # When this artifact was cut. On a user's Mac two apps each bundle a
+    # model and seed it into the shared App Group; `released_at` is how
+    # ModelStore (apple/Klar/KlarCore/ModelStore.swift) orders them, so an
+    # app still bundling last month's model never puts it back over a newer
+    # one. Preserved with the UUID while the bytes are unchanged; a manifest
+    # without it (public-v0) orders as the oldest.
+    released_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     if args.model_uuid:
         if UUID_RE.fullmatch(args.model_uuid) is None:
             parser.error("--model-uuid must be a canonical lowercase RFC 4122 UUID")
@@ -191,6 +199,8 @@ def main() -> int:
                 )
                 return 1
             manifest["model_uuid"] = previous_uuid
+            released_at = previous.get("released_at") or released_at
+    manifest["released_at"] = released_at
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     print(f"[manifest] wrote {manifest_path} ({len(manifest['files'])} artifacts, "
           f"source_model={manifest['source_model']})")

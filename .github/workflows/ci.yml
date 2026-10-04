@@ -1,15 +1,22 @@
 # Klar Engine — open-core CI.
 #
-# Runs ONLY on GitHub-hosted ubuntu-latest. This repo is public, so a self-hosted
-# runner must never execute its jobs: a fork PR could run arbitrary code on the
-# host. Two things keep that true — and this file is only one of them:
-#   1. This is the single workflow the publish pipeline ships; it pins
-#      `runs-on: ubuntu-latest` and uses no secrets.
+# Runs ONLY on GitHub-hosted runners (ubuntu-*, the arm64 ones included). This
+# repo is public, so a self-hosted runner must never execute its jobs: a fork
+# PR could run arbitrary code on the host. Two things keep that true — and this
+# file is only one of them:
+#   1. This is the single workflow the publish pipeline ships; every job pins a
+#      GitHub-hosted `runs-on`, and GITHUB_TOKEN is the only credential.
 #   2. The klar-im self-hosted runner lives in an org runner group restricted to
 #      private repos with "Allow public repositories" OFF, so even a malicious
 #      `runs-on: self-hosted` job added via PR cannot schedule onto it.
 # Also set Settings → Actions → "Require approval for all outside collaborators"
 # so fork PRs do not auto-run.
+#
+# What a stranger installs comes out of here: `package` builds the release
+# tarballs natively on x86_64 and arm64 (glibc floor 2.35 and 2.39, see the
+# job), `install-smoke` runs install.sh on each against a fresh runner, and a
+# tag v* publishes them with the multi-arch image, then runs the real one-liner
+# from raw.githubusercontent.com against the release it just made.
 name: Engine CI
 
 on:
@@ -87,16 +94,149 @@ jobs:
       - name: Run C ABI tests
         run: make test
 
+  # The release tarballs, built natively per architecture on the oldest image
+  # each can use: binaries link the glibc they are built against, so the floor
+  # is the builder's. x86_64 on ubuntu-22.04 (glibc 2.35: Debian 12, Ubuntu
+  # 22.04). arm64 on ubuntu-24.04-arm (glibc 2.39), because the pinned
+  # llama.cpp arm64 prebuilt itself calls glibc 2.38 symbols (__isoc23_strtol
+  # and friends; its x64 one stops at 2.34), so a 22.04 arm build cannot link
+  # it. A lower arm floor means building llama.cpp from source with a
+  # toolchain that knows its armv9 CPU variants. postfix/scripts/package.sh bundles
+  # every other library, ships no weights, and writes the .sha256 install.sh
+  # verifies. Runs on every push and PR, so a sync is proven installable before
+  # anyone tags it.
+  package:
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Keyed on the runner image: a llama.cpp tree from another architecture or
+      # a newer glibc would build and then fail to load on the target.
+      - name: Cache llama.cpp install
+        uses: actions/cache@v5
+        with:
+          path: engine/deps/llama-install
+          key: ${{ matrix.runner }}-llama-${{ hashFiles('engine/scripts/setup.sh') }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmilter-dev libsqlite3-dev
+
+      - name: Set up C/C++ deps (llama.cpp, cmake configure)
+        run: make setup
+
+      - name: Build engine + milter
+        run: make build
+
+      - name: Package (no weights)
+        env:
+          # The tag names the tarball on a release; otherwise git describe does.
+          KLAR_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: bash postfix/scripts/package.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: |
+            postfix/dist/klar-milterd-*.tar.gz
+            postfix/dist/klar-milterd-*.tar.gz.sha256
+          retention-days: 7
+
+  # install.sh on a runner that never built anything, on the same image as the
+  # build (the floor): the tarball has to carry its own libraries. Installs, asserts /readyz and a GTUBE verdict through
+  # the installed CLI as the service user, then runs the installer again over
+  # an operator-edited config and asserts it succeeds and leaves it alone.
+  install-smoke:
+    needs: package
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: shellcheck install.sh
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+          shellcheck -s sh install.sh
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: dist
+
+      # The model build-and-test caches, put where the installer fetches to, so
+      # fetch_model.sh takes its "already present and matching" path. A miss
+      # (first run on a new manifest) just downloads it.
+      - name: Restore the released model
+        uses: actions/cache/restore@v5
+        with:
+          path: engine/model
+          key: engine-model-${{ hashFiles('postfix/model/released-manifest.json') }}
+      - name: Seed /var/lib/klar/model from the cache
+        run: |
+          if [ -f engine/model/MANIFEST.json ]; then
+            sudo mkdir -p /var/lib/klar/model && sudo cp -a engine/model/. /var/lib/klar/model/
+          fi
+
+      - name: Install
+        run: |
+          tarball="$(ls dist/klar-milterd-*.tar.gz)"
+          sudo KLAR_ACCEPT_MODEL_LICENSE=1 KLAR_TARBALL="$PWD/$tarball" sh install.sh
+
+      - name: Ready, and GTUBE is spam
+        run: |
+          test "$(curl -fsS http://127.0.0.1:8892/readyz)" = ok
+          printf 'From: probe@example.com\nSubject: liveness\n\nXJS*C4JDBQADN1.NSBN3*2IDNEN*%s\n' \
+            'GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X' > /tmp/gtube.eml
+          out="$(sudo -u klarmilter env LD_LIBRARY_PATH=/opt/klar/bin /opt/klar/bin/klar-policy-cli \
+            --config /etc/klar/klar-milterd.toml --eml /tmp/gtube.eml --json)"
+          echo "$out"
+          test "$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["label"])')" = spam
+
+      - name: Re-run keeps an edited config and succeeds
+        run: |
+          echo '# operator edit' | sudo tee -a /etc/klar/klar-milterd.toml >/dev/null
+          before="$(sha256sum /etc/klar/klar-milterd.toml)"
+          tarball="$(ls dist/klar-milterd-*.tar.gz)"
+          sudo KLAR_ACCEPT_MODEL_LICENSE=1 KLAR_TARBALL="$PWD/$tarball" sh install.sh
+          test "$(sha256sum /etc/klar/klar-milterd.toml)" = "$before"
+          test "$(curl -fsS http://127.0.0.1:8892/readyz)" = ok
+
+      - name: Refuses without the licence flag
+        run: |
+          set +e
+          tarball="$(ls dist/klar-milterd-*.tar.gz)"
+          sudo KLAR_TARBALL="$PWD/$tarball" sh install.sh
+          test $? -eq 2
+
+      - name: Service log
+        if: failure()
+        run: sudo journalctl -u klar-milterd -n 100 --no-pager
+
   # Stalwart + klar-milterd, end to end (stalwart/scripts/test_e2e.sh): the
   # image built from this tree with no weights, the model fetched into its
   # volume on first start, upstream's Stalwart image beside it, both modes
   # (shadow and final) driven over SMTP and read back over JMAP. Needs docker
   # compose, which ubuntu-latest has, and ~400 MB from Klar's public bucket.
-  #
-  # The image is built ONCE here, through buildx with the Actions layer cache
-  # (the engine compile is the slow layer and rarely changes), then handed to
-  # the compose stack prebuilt and saved as an artifact for the release job,
-  # which retags what was tested rather than compiling a third time.
+  # Built through buildx with the Actions layer cache shared with the amd64
+  # half of `image` (scope amd64), so the release rebuild is cache hits.
   stalwart-e2e:
     timeout-minutes: 40
     runs-on: ubuntu-latest
@@ -110,50 +250,97 @@ jobs:
           file: postfix/docker/Dockerfile
           tags: klar-milterd:ci
           load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
       - name: Stalwart + klar-milterd end to end
         env:
           KLAR_MILTERD_IMAGE: klar-milterd:ci
         run: bash stalwart/scripts/test_e2e.sh
-      - name: Save the tested image for the release job
+
+  # The container, built natively per architecture (no QEMU: the engine
+  # compile under emulation would take an hour). On a push or PR this proves
+  # the Dockerfile builds on both; on a tag each half is pushed by digest and
+  # `image-release` joins them into one multi-arch tag. The login runs only on
+  # tags; a fork PR's token is read-only whatever this block says.
+  image:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to ghcr.io
         if: startsWith(github.ref, 'refs/tags/v')
-        run: docker save klar-milterd:ci | gzip > klar-milterd-image.tar.gz
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (push by digest on a tag)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: postfix/docker/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          outputs: ${{ startsWith(github.ref, 'refs/tags/v') && format('type=image,name=ghcr.io/{0}/klar-milterd,push-by-digest=true,name-canonical=true,push=true', github.repository_owner) || 'type=cacheonly' }}
+      - name: Record the digest
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: mkdir -p /tmp/digests && touch "/tmp/digests/${DIGEST#sha256:}"
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
         with:
-          name: klar-milterd-image
-          path: klar-milterd-image.tar.gz
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
           retention-days: 1
 
-  # A tag v* publishes the klar-milterd image the E2E just exercised to ghcr.io
-  # (no weights, licence-gated model fetch at first start) and opens a GitHub
-  # Release for it. GITHUB_TOKEN is the only credential and only this job may
-  # write; the two jobs above stay read-only.
-  release:
+  # A tag v* joins the two pushed digests into ghcr.io/klar-im/klar-milterd:<tag>
+  # and :latest (no weights; the model is fetched into the volume at first
+  # start, licence-gated), then proves the result refuses without the licence
+  # flag and is pullable by a stranger.
+  image-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-and-test, stalwart-e2e]
-    timeout-minutes: 20
+    needs: [build-and-test, stalwart-e2e, image]
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: write
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
         with:
-          name: klar-milterd-image
-      - name: Log in to ghcr.io
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Push the tested image
+          pattern: digest-*
+          merge-multiple: true
+          path: /tmp/digests
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: One multi-arch tag from the two digests
+        working-directory: /tmp/digests
         run: |
           IMAGE=ghcr.io/${{ github.repository_owner }}/klar-milterd
-          TAG=${GITHUB_REF_NAME}
-          docker load < klar-milterd-image.tar.gz
-          docker tag klar-milterd:ci "$IMAGE:$TAG"
-          docker tag klar-milterd:ci "$IMAGE:latest"
-          docker push "$IMAGE:$TAG"
-          docker push "$IMAGE:latest"
+          # shellcheck disable=SC2046  # one argument per digest file
+          docker buildx imagetools create -t "$IMAGE:$GITHUB_REF_NAME" -t "$IMAGE:latest" \
+            $(for d in *; do printf '%s@sha256:%s ' "$IMAGE" "$d"; done)
+          docker buildx imagetools inspect "$IMAGE:$GITHUB_REF_NAME"
       - name: Prove the pushed image refuses without the licence flag
         run: |
           set +e
@@ -165,9 +352,61 @@ jobs:
       # "docker pull says the image does not exist".
       - name: Prove a stranger can pull it
         run: IMAGE_OWNER=${{ github.repository_owner }} postfix/scripts/check_image_public.sh "$GITHUB_REF_NAME"
+
+  # The GitHub Release, with both tarballs and their .sha256 attached: what
+  # install.sh downloads. Re-running the job re-uploads them.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [install-smoke, image-release]
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tarball-*
+          merge-multiple: true
+          path: dist
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --title "klar-milterd $GITHUB_REF_NAME" --generate-notes \
-            --notes "Container image: \`ghcr.io/${{ github.repository_owner }}/klar-milterd:${GITHUB_REF_NAME}\` (built from this tag, no weights; first start fetches the CC-BY-NC-4.0 model with KLAR_ACCEPT_MODEL_LICENSE=1). Stalwart setup: stalwart/README.md. Postfix setup: postfix/README.md."
+          ls -l dist
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "klar-milterd $GITHUB_REF_NAME" --generate-notes \
+              --notes "Install on Linux (x86_64 or arm64, systemd): \`curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sudo KLAR_ACCEPT_MODEL_LICENSE=1 sh\` (KLAR_VERSION=$GITHUB_REF_NAME pins this release). Container image: \`ghcr.io/${{ github.repository_owner }}/klar-milterd:${GITHUB_REF_NAME}\` (linux/amd64 and linux/arm64). Neither carries weights: the CC-BY-NC-4.0 model is fetched at install or first start, only with KLAR_ACCEPT_MODEL_LICENSE=1. Stalwart setup: stalwart/README.md. Postfix setup: postfix/README.md."
+          fi
+
+  # The real one-liner, as a stranger runs it, on clean ubuntu-24.04 runners
+  # (a newer image than the x86_64 build's, the arm64 build's own): install.sh from
+  # raw.githubusercontent.com at this tag, the tarball from the release just
+  # made, the model from the public bucket. Also checks that releases/latest
+  # now resolves to this tag, which is what the unpinned one-liner installs.
+  release-smoke:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: The one-liner
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${GITHUB_REF_NAME}/install.sh" \
+            | sudo KLAR_ACCEPT_MODEL_LICENSE=1 KLAR_VERSION="$GITHUB_REF_NAME" sh
+      - name: Ready
+        run: test "$(curl -fsS http://127.0.0.1:8892/readyz)" = ok
+      - name: releases/latest is this tag
+        run: |
+          latest="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${{ github.repository }}/releases/latest")"
+          echo "$latest"
+          test "${latest##*/}" = "$GITHUB_REF_NAME"
+      - name: Service log
+        if: failure()
+        run: sudo journalctl -u klar-milterd -n 100 --no-pager

@@ -1,77 +1,94 @@
 #!/bin/bash
-set -e
+# Build the release tarball the one-line installer (engine/publish/install.sh,
+# install.sh at the public repo root) unpacks into /opt/klar:
+#
+#     klar-milterd-<version>-linux-<x86_64|arm64>.tar.gz  (+ .sha256)
+#       bin/    klar-milterd, klar-policy-cli and every shared library they load
+#               outside glibc, so it runs on any distro with the builder's glibc
+#               or newer (the release CI builds x86_64 on ubuntu-22.04, glibc
+#               2.35, and arm64 on ubuntu-24.04, glibc 2.39: ci.yml says why)
+#       share/  fetch_model.sh + the pinned manifest, the systemd unit, the
+#               Postfix config/snippet/Sieve, the Stalwart config, Sieve and
+#               scripts, the licences
+#
+# NO model weights, on purpose: the model is CC-BY-NC-4.0 (LICENSE-MODEL.md)
+# and is fetched at install time, sha256-verified, only once the operator has
+# accepted that licence. A tarball carrying it would redistribute it.
+#
+# Run after `make build` (public repo) or `make postfix/build`, on Linux.
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 POSTFIX_DIR="$(dirname "$SCRIPT_DIR")"
 REPO_ROOT="$(dirname "$POSTFIX_DIR")"
 DIST_DIR="$POSTFIX_DIR/dist"
+STAGE="$DIST_DIR/stage"
 VERSION="${KLAR_VERSION:-$(git -C "$REPO_ROOT" describe --tags --always 2>/dev/null || echo dev)}"
-ARCH="$(uname -m)"
+case "$(uname -m)" in
+    x86_64)        ARCH=x86_64 ;;
+    aarch64|arm64) ARCH=arm64 ;;
+    *) echo "error: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+[ "$(uname -s)" = Linux ] || { echo "error: the release tarball is Linux-only" >&2; exit 1; }
 
-echo "[postfix/package] Building package v${VERSION} for ${ARCH}..."
-
-# Verify binary exists
-if [ ! -f "$POSTFIX_DIR/build/klar-milterd" ]; then
-    echo "Error: klar-milterd not found. Run 'make postfix/build' first." >&2
-    exit 1
-fi
-
-# Create dist structure
+echo "[postfix/package] klar-milterd $VERSION for linux-$ARCH"
 rm -rf "$DIST_DIR"
-mkdir -p "$DIST_DIR/model" "$DIST_DIR/etc"
+mkdir -p "$STAGE/share"
 
-# bin/: the daemon, the CLI and every library they load, staged by install.sh,
-# the same tree an operator installs. One list of what the daemon loads; this
-# script used to keep a second one (and flattened the soname symlink chain).
-bash "$SCRIPT_DIR/install.sh" "$DIST_DIR" >/dev/null
+# bin/: the daemon, the CLI and the engine/llama.cpp libraries, staged by
+# install.sh, the same tree a source install gets. One list of what the daemon
+# loads lives there.
+bash "$SCRIPT_DIR/install.sh" "$STAGE" >/dev/null
+[ -x "$STAGE/bin/klar-policy-cli" ] || { echo "error: klar-policy-cli was not built" >&2; exit 1; }
 
-# Model files: the head plus the one encoder the artifact declares in its own
-# classifier_config.json (engine/scripts/model_manifest.py owns that list). A
-# fixed Q4 name here packaged a Q8_0 artifact with no encoder at all, and the
-# `-f` skip made it silent; a missing file is a broken milter, so it fails.
-mkdir -p "$DIST_DIR/model/gguf"
-for f in $(python3 - "$REPO_ROOT/engine/model" <<'PY'
-import json, sys
-from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve().parent / "scripts"))
-from model_manifest import artifacts_for
-config = json.loads((Path(sys.argv[1]) / "classifier_config.json").read_text())
-print("\n".join(artifacts_for(config, include_ftrl=False)))
-PY
-); do
-    if [ ! -f "$REPO_ROOT/engine/model/$f" ]; then
-        echo "error: engine/model/$f is missing; the artifact declares it" >&2
-        exit 1
-    fi
-    cp "$REPO_ROOT/engine/model/$f" "$DIST_DIR/model/$f"
+# The system libraries too (gmime, glib, libmilter, sqlite, libarchive, libgomp,
+# libstdc++ and what they pull in): every library ldd resolves outside glibc
+# itself, so the install needs no package manager and no distro's package
+# names. The unit's LD_LIBRARY_PATH=/opt/klar/bin makes this directory win.
+# The ggml CPU plugins are dlopen'ed, so every .so is walked, not just the two
+# executables. A "not found" fails the package rather than shipping a daemon
+# that cannot start.
+glibc='^(linux-vdso|ld-linux.*|libc|libm|libdl|libpthread|librt|libresolv|libutil)\.so'
+deps="$(for f in "$STAGE"/bin/klar-milterd "$STAGE"/bin/klar-policy-cli "$STAGE"/bin/*.so*; do
+    LD_LIBRARY_PATH="$STAGE/bin" ldd "$f"
+done)"
+if grep -q 'not found' <<<"$deps"; then
+    grep 'not found' <<<"$deps" | sort -u >&2
+    echo "error: unresolved libraries" >&2; exit 1
+fi
+awk '$2 == "=>" && $3 ~ /^\// { print $3 }' <<<"$deps" | sort -u | while read -r lib; do
+    name="${lib##*/}"
+    [[ "$name" =~ $glibc ]] && continue
+    [ -e "$STAGE/bin/$name" ] && continue
+    install -m 0644 "$(readlink -f "$lib")" "$STAGE/bin/$name"
 done
 
-# Origin-IP blocklist (TASK-113): optional, and deliberately copied separately
-# from the model files above — it is refreshed on its own cron cadence, not with
-# a model release. Absent just means the origin-IP signal is off.
-if [ -f "$REPO_ROOT/engine/model/ip_blocklist.bin" ]; then
-    cp "$REPO_ROOT/engine/model/ip_blocklist.bin" "$DIST_DIR/model/"
-fi
+# share/: everything the installer and the operator's next step need.
+SHARE="$STAGE/share"
+echo "$VERSION" > "$SHARE/VERSION"
+install -m 0755 "$SCRIPT_DIR/fetch_model.sh" "$SHARE/fetch_model.sh"
+install -m 0644 "$POSTFIX_DIR/model/released-manifest.json" "$SHARE/released-manifest.json"
+install -m 0644 "$POSTFIX_DIR/packaging/klar-milterd.service" "$SHARE/klar-milterd.service"
+mkdir -p "$SHARE/postfix" "$SHARE/stalwart/config" "$SHARE/stalwart/sieve" "$SHARE/stalwart/scripts"
+install -m 0644 "$POSTFIX_DIR/config/example.toml" "$SHARE/postfix/klar-milterd.toml"
+install -m 0644 "$POSTFIX_DIR/packaging/postfix-main.cf.snippet" "$SHARE/postfix/main.cf.snippet"
+install -m 0644 "$POSTFIX_DIR/packaging/klar.sieve" "$SHARE/postfix/klar.sieve"
+STALWART_DIR="$REPO_ROOT/stalwart"
+install -m 0644 "$STALWART_DIR"/config/* "$SHARE/stalwart/config/"
+install -m 0644 "$STALWART_DIR/sieve/klar.sieve" "$SHARE/stalwart/sieve/klar.sieve"
+install -m 0755 "$STALWART_DIR/scripts/apply.py" "$STALWART_DIR/scripts/sieve_activate.py" "$SHARE/stalwart/scripts/"
+# The licences sit at the public repo's root, and under engine/publish/ in the
+# monorepo it is published from.
+for f in LICENSE LICENSE-MODEL.md THIRD_PARTY_LICENSES.md; do
+    src="$REPO_ROOT/$f"; [ -f "$src" ] || src="$REPO_ROOT/engine/publish/$f"
+    install -m 0644 "$src" "$SHARE/$f"
+done
 
-if [ -f "$REPO_ROOT/engine/model/VERSION" ]; then
-    cp "$REPO_ROOT/engine/model/VERSION" "$DIST_DIR/model/"
-else
-    echo "$VERSION" > "$DIST_DIR/model/VERSION"
-fi
-
-# Config + systemd unit
-cp "$POSTFIX_DIR/config/example.toml" "$DIST_DIR/etc/klar-postfix.toml"
-cp "$POSTFIX_DIR/packaging/klar-milterd.service" "$DIST_DIR/etc/"
-cp "$POSTFIX_DIR/packaging/postfix-main.cf.snippet" "$DIST_DIR/etc/"
-
-# Create tarball
 TARBALL="klar-milterd-${VERSION}-linux-${ARCH}.tar.gz"
-echo "[postfix/package] Creating $TARBALL..."
-tar -czf "$DIST_DIR/$TARBALL" -C "$DIST_DIR" bin/ model/ etc/
+# root-owned entries: the builder's uid may be a real user on the target.
+tar --owner=0 --group=0 --numeric-owner -czf "$DIST_DIR/$TARBALL" -C "$STAGE" bin share
+(cd "$DIST_DIR" && sha256sum "$TARBALL" > "$TARBALL.sha256")
+rm -rf "$STAGE"
 
-# Summary
-echo "[postfix/package] Done."
-echo "  Tarball: $DIST_DIR/$TARBALL"
-du -sh "$DIST_DIR/$TARBALL"
-echo "  Contents:"
-tar -tzf "$DIST_DIR/$TARBALL" | head -20
+echo "[postfix/package] $DIST_DIR/$TARBALL ($(du -h "$DIST_DIR/$TARBALL" | cut -f1))"
+cat "$DIST_DIR/$TARBALL.sha256"

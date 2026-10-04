@@ -77,9 +77,9 @@ caught at the boundary and rejects the promise instead.
 import { classifyText, classifyEml } from '@klar/engine';
 
 await classifyText('cheap pills, click now to claim');
-// → { class: 'spam', confidence: 0.98, scores: { gibberish, marketing, regular, spam } }
+// → { class: 'spam', confidence: 0.98, scores: { marketing, regular, spam }, decision, ... }
 
-await classifyEml(rawRfc822Buffer); // same shape, via the engine's MIME parse path
+await classifyEml(rawRfc822Buffer); // same shape; text goes in as the body of a minimal message
 
 // A specific artifact. Swaps the resident model if it is not already loaded.
 // DEFAULT_MODEL_PATH is where this host's own model lives, so alternatives can
@@ -92,9 +92,10 @@ const alt = path.resolve(DEFAULT_MODEL_PATH, '..', 'models', uuid);
 await classifyText('cheap pills', 'ensemble', false, alt);
 ```
 
-All resolve to `{ class, confidence, scores, decidedBy, model }`, where `class`
-is one of `gibberish | marketing | regular | spam | unknown`, `scores` holds the
-per-class probabilities, and `model` names the artifact that produced it.
+All resolve to `{ class, confidence, scores, decision, signals, decidedBy, model }`
+from one `spam_engine_classify_full` call, where `class` is the argmax of
+`scores` (`marketing | regular | spam`), `decision.label` is the verdict after
+the structural fold, and `model` names the artifact that produced it.
 
 ## Layout
 

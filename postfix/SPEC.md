@@ -14,14 +14,11 @@ There is no quarantine. We are not an antivirus product. Messages are either del
 
 ## 2. Terminology
 
-1. `score.spam`: `result.scores.spam` from C ABI (raw model head).
-2. `score.spam_adjusted`: `score.spam` after the engine decision layer folds the parsed sender-auth signals (`spam_engine_decision_input_from_signals` + `spam_engine_decide`, TASK-179/231). All threshold labeling uses this value, not the raw head.
+1. `score.spam`: `ensemble_spam` from `spam_engine_classify_full` (the model's spam side before any structural offset).
+2. `score.spam_adjusted`: `score.spam` after the engine decision layer folds the parsed sender-auth signals and the milter's transport facts (`decision.adjusted_spam_side` from the same `spam_engine_classify_full` call, TASK-179/540). All threshold labeling uses this value, not the raw head.
 3. `structural_condemn`: decision-layer flag for a structural spam signal (e.g. free-host/throwaway DKIM signer) independent of the content model.
 4. `label`: binary decision (`spam` or `regular`).
-5. `profile`: threshold preset:
-   - `cautious=0.70`,
-   - `standard=0.50`,
-   - `aggressive=0.30`.
+5. `profile`: threshold preset, the product's (`engine/decision_layer.h`: `kThresholdCautious` 0.995, `kThresholdStandard` 0.99, `kThresholdAggressive` 0.95, the gates the Mac app applies to the same score). `decision_profiles.h` maps the name to the engine's constant and holds no number; `model-lab/test_decision_layer_sync.py` fails on one. (Until 2026-09-18 the milter carried 0.70 / 0.50 / 0.30 from its first commit, a gate half the product's on the same calibrated score: TASK-510.)
 6. `fail-open`: accept mail when scoring path fails.
 7. `allowlist`: sender/domain override that forces `TAG`.
 8. `blocklist`: sender/domain override that forces `REJECT`.
@@ -34,13 +31,14 @@ There is no quarantine. We are not an antivirus product. Messages are either del
 1. Message is always accepted.
 2. Headers added:
    - `X-Klar-Label` (`spam` or `regular`),
-   - `X-Klar-Class` (4-class argmax over the raw scores:
-     `regular|marketing|gibberish|spam`; informative companion to the binary
+   - `X-Klar-Class` (3-class argmax over the raw scores:
+     `regular|marketing|spam`; informative companion to the binary
      label, lets deployments file marketing separately),
    - `X-Klar-Score-Spam`,
    - `X-Klar-Score-Regular`,
    - `X-Klar-Score-Marketing`,
-   - `X-Klar-Score-Gibberish`,
+   - `X-Klar-Score-Gibberish` (always `0.000000` since the engine's scores
+     became three classes, TASK-540; kept so the header set does not change),
    - `X-Klar-Action` (`tag`, `reject`, or `bypass`),
    - `X-Klar-Model-Version`,
    - `X-Klar-Event-ID` (UUIDv4).
@@ -291,7 +289,7 @@ CREATE TABLE IF NOT EXISTS events (
   rcpt_count INTEGER NOT NULL, bytes_seen INTEGER NOT NULL,
   truncated INTEGER NOT NULL, model_version TEXT NOT NULL,
   score_spam REAL NOT NULL, score_regular REAL NOT NULL,
-  score_marketing REAL NOT NULL, score_gibberish REAL NOT NULL,
+  score_marketing REAL NOT NULL,
   label TEXT NOT NULL, action TEXT NOT NULL,
   latency_ms REAL NOT NULL, status TEXT NOT NULL,
   error_code TEXT NOT NULL, message_id_header TEXT NOT NULL,

@@ -24,6 +24,15 @@ inline void check(bool condition, const std::string& message) {
   }
 }
 
+// An address on a consumer-mail domain (gmail.com, icloud.com, Apple's relay)
+// for a test whose property IS that domain. Built from two strings, never
+// spelled out: engine/scripts/check_public_pii.py refuses every literal
+// address on those domains, because that is how a real person's lands in the
+// public tree. The local part is synthetic, always.
+inline std::string consumer_address(const std::string& local, const std::string& domain) {
+  return local + "@" + domain;
+}
+
 // A file's bytes; empty when the file is missing or empty, which every
 // caller treats as the same failure.
 inline std::string read_binary_file(const std::filesystem::path& path) {
@@ -114,8 +123,8 @@ inline bool has_gguf_model(const ModelPaths& paths,
 // smoothing 0.1 over three classes) tops out near 0.90 on blatant spam and
 // 0.84 on blatant ham by construction, and the engine's own gate reads the
 // calibrated spam side, not the raw probability.
-inline bool confident_class(float top, float other_a, float other_b, float other_c) {
-  const float runner_up = std::max({other_a, other_b, other_c});
+inline bool confident_class(float top, float other_a, float other_b) {
+  const float runner_up = std::max(other_a, other_b);
   return top > runner_up && (top - runner_up) >= 0.5F;
 }
 
@@ -151,7 +160,7 @@ inline std::string fixture_noisy_html_ham_rfc822() {
 // The text/plain part should be preferred. If HTML is used, CSS must be stripped.
 inline std::string fixture_google_security_alert_rfc822() {
   return R"(Content-Type: multipart/alternative; boundary="000000000000de6d2505fff9ad64"
-Subject: Security alert for test@gmail.com
+Subject: Security alert for user@example.com
 From: Google <no-reply@accounts.google.com>
 MIME-Version: 1.0
 

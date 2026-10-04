@@ -1,5 +1,4 @@
 export interface ClassifyScores {
-	gibberish: number;
 	marketing: number;
 	regular: number;
 	spam: number;
@@ -7,17 +6,16 @@ export interface ClassifyScores {
 
 export interface ClassifyResult {
 	/**
-	 * The engine's DELIVERY DECISION — in practice only `spam` or `regular`
-	 * (the decision layer folds marketing/gibberish into junk-vs-deliver). This
-	 * is NOT the 4-class argmax.
+	 * The model's predicted class: the argmax of `scores`. NOT the delivery
+	 * decision, which is `decision.label` (the structural fold's verdict).
 	 */
-	class: 'gibberish' | 'marketing' | 'regular' | 'spam' | 'unknown';
-	/** Confidence in the decision above — not necessarily `scores[class]`. */
+	class: 'marketing' | 'regular' | 'spam';
+	/** `scores[class]`. */
 	confidence: number;
 	/**
-	 * The 4-class scores. In `ensemble` mode `scores.spam` is the escalate-only
+	 * The 3-class scores. In `ensemble` mode `scores.spam` is the escalate-only
 	 * spam side `max(neural, w*ftrl+(1-w)*neural)` (NOT a normalized softmax); the
-	 * other three stay raw neural. For the predicted *class*, take the argmax.
+	 * other two stay raw neural. For the predicted *class*, take the argmax.
 	 */
 	scores: ClassifyScores;
 	/** Which scorers produced the verdict: "neural" | "ftrl+neural" | "ftrl". */

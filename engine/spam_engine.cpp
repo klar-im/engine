@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <stdexcept>
 #include <utility>
@@ -24,6 +25,47 @@
 #include "trainable_classifier.h"
 
 namespace spam_engine {
+
+namespace {
+
+// The one log sink of the process (engine_runtime.h says why it is defined
+// here and not inline in the header).
+struct LogSinkState {
+  std::mutex mutex;
+  LogSink fn = nullptr;
+  void* user = nullptr;
+};
+
+LogSinkState& log_sink_state() {
+  static LogSinkState state;
+  return state;
+}
+
+}  // namespace
+
+void set_log_sink(LogSink fn, void* user) {
+  auto& state = log_sink_state();
+  std::scoped_lock const lock(state.mutex);
+  state.fn = fn;
+  state.user = user;
+}
+
+void log_line(LogLevel level, const char* text) {
+  if (text == nullptr) { return; }
+  LogSink fn = nullptr;
+  void* user = nullptr;
+  {
+    auto& state = log_sink_state();
+    std::scoped_lock const lock(state.mutex);
+    fn = state.fn;
+    user = state.user;
+  }
+  if (fn != nullptr) {
+    fn(static_cast<int>(level), text, user);
+  } else {
+    std::fputs(text, stderr);
+  }
+}
 
 // Which quantized encoder an artifact ships, read from its own
 // classifier_config.json (`gguf_encoder_file`, written by
@@ -61,7 +103,7 @@ std::string default_gguf_encoder_file(const std::string& model_path) {
   return name;
 }
 
-// Parse "Foo Bar <foo@bar.com>" or "foo@bar.com" into (name, email).
+// Parse "Foo Bar <foo@example.com>" or "foo@example.com" into (name, email).
 // Public so the C ABI doesn't have to re-inline this logic.
 std::pair<std::string, std::string> parse_from_header(const std::string& from) {
   if (from.empty()) {
@@ -93,14 +135,14 @@ std::pair<std::string, std::string> parse_from_header(const std::string& from) {
 //   neither — caller-supplied values always win, since Apple Mail's
 //   MEMessage sender is more reliable than the parsed From for the cases
 //   where they differ.
-void apply_preprocessed_to_customer(
-    CustomerInfo& customer,
+void apply_preprocessed_to_sender(
+    SenderInfo& sender,
     const PreprocessedEmail& preprocessed) {
-  customer.replyto_differs = preprocessed.replyto_differs;
-  if (customer.name.empty() && customer.email.empty() && !preprocessed.from.empty()) {
+  sender.replyto_differs = preprocessed.replyto_differs;
+  if (sender.name.empty() && sender.email.empty() && !preprocessed.from.empty()) {
     auto parsed = parse_from_header(preprocessed.from);
-    customer.name = std::move(parsed.first);
-    customer.email = std::move(parsed.second);
+    sender.name = std::move(parsed.first);
+    sender.email = std::move(parsed.second);
   }
 }
 
@@ -112,39 +154,28 @@ void apply_preprocessed_to_customer(
 //   "User (email): <body>\n[Customer Info:\nName: ...\nEmail: ...]
 //    [ReplyToDiffers: yes]\n"
 //
-// Legacy public-v0 uses the envelope below; successor models use raw transcript
-// text. Optional legacy fields appear only when present.
+// Legacy public-v0 uses the envelope above (its wording is what that model was
+// trained on, so it stays byte-for-byte); successor models use the raw text.
+// Optional legacy fields appear only when present.
 
 CalibratedInputText build_input_text(
-    const std::vector<TranscriptMessage>& transcript,
-    const CustomerInfo& customer,
+    const std::string& text,
+    const SenderInfo& sender,
     ModelInputFormat format) {
-  std::string input_text;
-
   if (format == ModelInputFormat::kRaw) {
-    for (const auto& exchange : transcript) {
-      input_text += exchange.text;
-      input_text += '\n';
-    }
-    return CalibratedInputText(std::move(input_text));
+    return CalibratedInputText(text + '\n');
   }
 
-  for (const auto& exchange : transcript) {
-    std::string from_type = exchange.from_type;
-    if (!from_type.empty()) {
-      from_type[0] = static_cast<char>(std::toupper(from_type[0]));
-    }
-    input_text += from_type + " (" + exchange.origin + "): " + exchange.text + "\n";
-  }
-  const bool has_any_customer_signal =
-      !customer.name.empty() || !customer.email.empty() || customer.replyto_differs;
-  if (has_any_customer_signal) {
+  std::string input_text = "User (email): " + text + "\n";
+  const bool has_any_sender_signal =
+      !sender.name.empty() || !sender.email.empty() || sender.replyto_differs;
+  if (has_any_sender_signal) {
     input_text += "Customer Info:\n";
-    if (!customer.name.empty()) { input_text += "Name: " + customer.name + "\n";
+    if (!sender.name.empty()) { input_text += "Name: " + sender.name + "\n";
 }
-    if (!customer.email.empty()) { input_text += "Email: " + customer.email + "\n";
+    if (!sender.email.empty()) { input_text += "Email: " + sender.email + "\n";
 }
-    if (customer.replyto_differs) { input_text += "ReplyToDiffers: yes\n";
+    if (sender.replyto_differs) { input_text += "ReplyToDiffers: yes\n";
 }
   }
   return CalibratedInputText(std::move(input_text));
@@ -155,7 +186,31 @@ class SpamEngine::Impl {
   std::unique_ptr<GgmlEncoder> encoder;
   std::unique_ptr<TrainableClassifierHead> trainable_head;
   std::unique_ptr<FTRLClassifier> ftrl;
+  std::string model_uuid;  // from MANIFEST.json, read once at load; "" = unknown
 };
+
+namespace {
+
+// A missing or unreadable manifest yields "" rather than throwing: not knowing
+// which artifact this is must never be the reason a load (or a classify)
+// fails. The empty string is the honest answer and callers report it as
+// unknown.
+std::string read_manifest_uuid(const std::string& model_path) {
+  const std::filesystem::path manifest = std::filesystem::path(model_path) / "MANIFEST.json";
+  std::error_code ec;
+  if (!std::filesystem::exists(manifest, ec)) { return ""; }
+  try {
+    std::ifstream in(manifest);
+    nlohmann::json doc;
+    in >> doc;
+    return doc.value("model_uuid", "");
+  } catch (const std::exception& e) {
+    log_printf(LogLevel::kWarn, "[spam_engine] ignoring unreadable MANIFEST.json (%s)", e.what());
+    return "";
+  }
+}
+
+}  // namespace
 
 SpamEngine::SpamEngine() : impl_(std::make_unique<Impl>()) {}
 
@@ -221,13 +276,13 @@ void SpamEngine::load(const EngineConfig& config) {
   if (const char* env = std::getenv("SPAM_ENGINE_MAX_TOKENS")) {
     try {
       const int parsed = std::stoi(env);
-      std::fprintf(stderr,
-          "[spam_engine] SPAM_ENGINE_MAX_TOKENS=%s overrides encoder_max_tokens %d -> %d\n",
+      log_printf(LogLevel::kInfo,
+          "[spam_engine] SPAM_ENGINE_MAX_TOKENS=%s overrides encoder_max_tokens %d -> %d",
           env, config_.encoder_max_tokens, parsed);
       config_.encoder_max_tokens = parsed;
     } catch (const std::exception& e) {
-      std::fprintf(stderr,
-          "[spam_engine] ignoring invalid SPAM_ENGINE_MAX_TOKENS=%s (%s)\n", env, e.what());
+      log_printf(LogLevel::kWarn,
+          "[spam_engine] ignoring invalid SPAM_ENGINE_MAX_TOKENS=%s (%s)", env, e.what());
     }
   }
 
@@ -248,13 +303,14 @@ void SpamEngine::load(const EngineConfig& config) {
         throw std::invalid_argument("max_drift_steps contains trailing characters");
       }
       validate_max_drift_steps(parsed);
-      std::fprintf(stderr,
+      log_printf(LogLevel::kInfo,
           "[spam_engine] SPAM_ENGINE_MAX_DRIFT_STEPS=%s overrides max_drift_steps "
-          "%.3f -> %.3f\n", env, config_.max_drift_steps, parsed);
+          "%.3f -> %.3f", env, static_cast<double>(config_.max_drift_steps),
+          static_cast<double>(parsed));
       config_.max_drift_steps = parsed;
     } catch (const std::exception& e) {
-      std::fprintf(stderr,
-          "[spam_engine] ignoring invalid SPAM_ENGINE_MAX_DRIFT_STEPS=%s (%s)\n",
+      log_printf(LogLevel::kWarn,
+          "[spam_engine] ignoring invalid SPAM_ENGINE_MAX_DRIFT_STEPS=%s (%s)",
           env, e.what());
     }
   }
@@ -265,9 +321,9 @@ void SpamEngine::load(const EngineConfig& config) {
   // comment) so a stray shell variable can't half-enable the mechanism.
   // NOLINTNEXTLINE(concurrency-mt-unsafe) — see the getenv() note above.
   if (const char* env = std::getenv("SPAM_ENGINE_FUNCTION_SPACE_ANCHOR")) {
-    std::fprintf(stderr,
+    log_printf(LogLevel::kInfo,
         "[spam_engine] SPAM_ENGINE_FUNCTION_SPACE_ANCHOR=%s overrides "
-        "function_space_anchor_path\n", env);
+        "function_space_anchor_path", env);
     config_.function_space_anchor_path = env;
   }
   // NOLINTNEXTLINE(concurrency-mt-unsafe) — see the getenv() note above.
@@ -282,13 +338,14 @@ void SpamEngine::load(const EngineConfig& config) {
       if (!std::isfinite(parsed) || parsed < 0.0F) {
         throw std::invalid_argument("function_space_budget must be finite and >= 0");
       }
-      std::fprintf(stderr,
+      log_printf(LogLevel::kInfo,
           "[spam_engine] SPAM_ENGINE_FUNCTION_SPACE_BUDGET=%s overrides "
-          "function_space_budget %.6f -> %.6f\n", env, config_.function_space_budget, parsed);
+          "function_space_budget %.6f -> %.6f", env,
+          static_cast<double>(config_.function_space_budget), static_cast<double>(parsed));
       config_.function_space_budget = parsed;
     } catch (const std::exception& e) {
-      std::fprintf(stderr,
-          "[spam_engine] ignoring invalid SPAM_ENGINE_FUNCTION_SPACE_BUDGET=%s (%s)\n",
+      log_printf(LogLevel::kWarn,
+          "[spam_engine] ignoring invalid SPAM_ENGINE_FUNCTION_SPACE_BUDGET=%s (%s)",
           env, e.what());
     }
   }
@@ -324,13 +381,35 @@ void SpamEngine::load(const EngineConfig& config) {
     // zero) so the cold-start guard bypasses it, not a half-loaded one whose
     // bogus counts pass the guard (C3, TASK-251). load() is transactional, but
     // rebuild to guarantee a pristine cold state.
-    std::fprintf(stderr,
-        "[spam_engine] FTRL baseline load failed for %s; starting cold\n",
+    log_printf(LogLevel::kWarn,
+        "[spam_engine] FTRL baseline load failed for %s; starting cold",
         config_.ftrl_path.c_str());
     impl_->ftrl = std::make_unique<FTRLClassifier>();
   }
 
+  // The uuid is read once here, not per model_info() call: the extension
+  // asks for model_info on every classify, and a manifest that is present
+  // but unreadable would otherwise cost a parse and a WARN line (a row in
+  // Plus's logs table) per email. The directory is immutable for the life of
+  // a load; a new deploy is a new load.
+  impl_->model_uuid = read_manifest_uuid(config_.model_path);
+
   loaded_ = true;
+  // The one line that says which backend this process classifies on, from
+  // the engine at the moment it knows, so an appex log answers "did Metal
+  // fall back" without any caller re-deriving it. Last, after every throw
+  // above: a head that fails to load must not leave a "loaded" line behind.
+  const auto& runtime = impl_->encoder->runtime_info();
+  log_printf(LogLevel::kInfo,
+      "[spam_engine] loaded backend=%s device=\"%s\" max_tokens=%d fallback=%s",
+      runtime.backend.c_str(), runtime.device.c_str(), runtime.max_tokens,
+      encoder_fallback_name(runtime.fallback));
+  if (runtime.fallback == EncoderFallback::kContextInitFailed) {
+    std::string detail = runtime.fallback_detail;
+    std::replace(detail.begin(), detail.end(), '\n', '|');
+    log_printf(LogLevel::kWarn, "[spam_engine] GPU context init failed, on CPU: %s",
+        detail.c_str());
+  }
 }
 
 void SpamEngine::unload() noexcept {
@@ -349,8 +428,9 @@ int SpamEngine::n_embd() const noexcept {
   return (loaded_ && impl_->encoder) ? impl_->encoder->n_embd() : 0;
 }
 
-bool SpamEngine::uses_gpu() const noexcept {
-  return loaded_ && impl_->encoder && impl_->encoder->uses_gpu();
+EncoderRuntimeInfo SpamEngine::runtime_info() const {
+  if (!loaded_ || !impl_->encoder) { return {}; }
+  return impl_->encoder->runtime_info();
 }
 
 SpamEngine::ModelInfo SpamEngine::model_info() const {
@@ -366,39 +446,22 @@ SpamEngine::ModelInfo SpamEngine::model_info() const {
   info.structural_markers = head.uses_structural_markers();
   info.attachment_context = head.uses_attachment_context();
   info.spam_side_calibration_knot = head.spam_side_calibration_knot();
-
-  // A missing or unreadable manifest leaves uuid empty rather than throwing: not
-  // knowing which artifact this is must never be the reason a classify call
-  // fails. The empty string is the honest answer and callers report it as
-  // unknown.
-  const std::filesystem::path manifest =
-      std::filesystem::path(config_.model_path) / "MANIFEST.json";
-  std::error_code ec;
-  if (!std::filesystem::exists(manifest, ec)) { return info;
-}
-  try {
-    std::ifstream in(manifest);
-    nlohmann::json doc;
-    in >> doc;
-    info.uuid = doc.value("model_uuid", "");
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "[spam_engine] ignoring unreadable MANIFEST.json (%s)\n", e.what());
-  }
+  info.uuid = impl_->model_uuid;  // read once at load, see read_manifest_uuid
   return info;
 }
 
 CalibratedInputText SpamEngine::calibrate_input(
-    const std::vector<TranscriptMessage>& transcript,
-    const CustomerInfo& customer) const {
+    const std::string& text,
+    const SenderInfo& sender) const {
   ensure_loaded();
-  return build_input_text(transcript, customer, input_format_);
+  return build_input_text(text, sender, input_format_);
 }
 
 CalibratedInputText SpamEngine::calibrate_preprocessed_input(
     const std::string& normalized_text,
     const std::string& marker_prefix,
     const std::string& attachment_context,
-    const CustomerInfo& customer) const {
+    const SenderInfo& sender) const {
   ensure_loaded();
   std::string model_text = normalized_text;
   if (structural_markers_ && !marker_prefix.empty() && !model_text.empty()) {
@@ -421,8 +484,7 @@ CalibratedInputText SpamEngine::calibrate_preprocessed_input(
       }
     }
   }
-  return build_input_text(
-      {{"user", std::move(model_text), "email"}}, customer, input_format_);
+  return build_input_text(model_text, sender, input_format_);
 }
 
 void SpamEngine::ensure_loaded() const {
@@ -432,11 +494,22 @@ void SpamEngine::ensure_loaded() const {
 }
 
 std::vector<float> SpamEngine::embed(const CalibratedInputText& input) {
-  auto batch_result = embed_batch({input});
-  return batch_result.empty() ? std::vector<float>() : std::move(batch_result[0]);
+  auto batch_result = embed_inputs({input});
+  return batch_result.empty() ? std::vector<float>() : std::move(batch_result[0].values);
 }
 
 std::vector<std::vector<float>> SpamEngine::embed_batch(
+    const std::vector<CalibratedInputText>& inputs) {
+  auto embeddings = embed_inputs(inputs);
+  std::vector<std::vector<float>> values;
+  values.reserve(embeddings.size());
+  for (auto& embedding : embeddings) {
+    values.push_back(std::move(embedding.values));
+  }
+  return values;
+}
+
+std::vector<EncoderEmbedding> SpamEngine::embed_inputs(
     const std::vector<CalibratedInputText>& inputs) {
   ensure_loaded();
   if (inputs.empty()) { return {};
@@ -480,20 +553,23 @@ ClassScores SpamEngine::classify_embedding(
     return index < 0 ? 0.0F : probabilities[static_cast<size_t>(index)];
   };
 
+  // A legacy 4-label head (public-v0) also has a gibberish row, which the fold
+  // always counted on the spam side (spam + gibberish). Adding it here, at the
+  // one place labels are mapped, keeps that spam side exact and leaves the
+  // product taxonomy three classes everywhere downstream (TASK-540).
   return ClassScores{
-      probability("gibberish"),
       probability("marketing"),
       probability("regular"),
-      probability("spam"),
+      probability("spam") + probability("gibberish"),
   };
 }
 
 ClassificationResult SpamEngine::decision_from_scores(const ClassScores& scores) {
-  // Shared with the C-ABI decide-input builder so the binary label the fold reads
+  // Shared with the fold's input builder so the binary label the fold reads
   // as "what the model said" is identical across the engine, the C ABI, and Swift
   // (TASK-251 C5).
   const decision::NeuralDecision nd = decision::neural_decision(
-      {scores.gibberish, scores.marketing, scores.regular, scores.spam});
+      {scores.marketing, scores.regular, scores.spam});
   return ClassificationResult{nd.label, static_cast<float>(nd.confidence), scores,
                               "neural", -1.0F};
 }
@@ -521,7 +597,7 @@ ClassificationResult SpamEngine::combine_scores(
     return ClassificationResult{
         is_spam ? "spam" : "regular",
         is_spam ? ftrl_score : 1.0F - ftrl_score,
-        {0.0F, 0.0F, 1.0F - ftrl_score, ftrl_score},
+        {0.0F, 1.0F - ftrl_score, ftrl_score},
         "ftrl", ftrl_score};
   }
 
@@ -559,9 +635,11 @@ ClassificationResult SpamEngine::classify(
     const std::string& sender_name,
     const std::string& sender_email,
     const ClassifyOptions& options) {
-  return classify_transcript(
-      {{"user", text, "email"}},
-      CustomerInfo{sender_name, sender_email, /*replyto_differs=*/false},
+  validate_mode(options.mode);
+  const SenderInfo sender{sender_name, sender_email, /*replyto_differs=*/false};
+  return classify_inputs(
+      calibrate_input(text, sender),
+      build_input_text(text, sender, ModelInputFormat::kLegacyWrapped),
       options);
 }
 
@@ -574,8 +652,8 @@ ClassificationResult SpamEngine::classify_rfc822(
   auto preprocessed = preprocess_rfc822(
       raw_rfc822, attachment_context_ || extract_attachment_signals);
 
-  CustomerInfo customer{sender_name, sender_email, /*replyto_differs=*/false};
-  apply_preprocessed_to_customer(customer, preprocessed);
+  SenderInfo sender{sender_name, sender_email, /*replyto_differs=*/false};
+  apply_preprocessed_to_sender(sender, preprocessed);
 
   // The decision logic has several early returns; run it through a lambda so we
   // can stamp the structural features (computed during the preprocess parse —
@@ -589,9 +667,9 @@ ClassificationResult SpamEngine::classify_rfc822(
       const auto plain_input = calibrate_preprocessed_input(
           preprocessed.normalized_plain_text,
           preprocessed.structural_marker_prefix,
-          preprocessed.attachment_features.context, customer);
+          preprocessed.attachment_features.context, sender);
       const auto ftrl_input = build_input_text(
-          {{"user", preprocessed.normalized_plain_text, "email"}}, customer,
+          preprocessed.normalized_plain_text, sender,
           ModelInputFormat::kLegacyWrapped);
 
       // FTRL P(spam) on the plain body (always present in multipart), unless
@@ -610,18 +688,21 @@ ClassificationResult SpamEngine::classify_rfc822(
       const auto html_input = calibrate_preprocessed_input(
           preprocessed.normalized_html_text,
           preprocessed.structural_marker_prefix,
-          preprocessed.attachment_features.context, customer);
-      const auto embeddings = embed_batch({plain_input, html_input});
-      const auto plain_scores = classify_embedding(embeddings[0], false);
-      const auto html_scores = classify_embedding(embeddings[1], false);
+          preprocessed.attachment_features.context, sender);
+      const auto embeddings = embed_inputs({plain_input, html_input});
+      const auto plain_scores = classify_embedding(embeddings[0].values, false);
+      const auto html_scores = classify_embedding(embeddings[1].values, false);
       const auto& best_scores = (html_scores.spam > plain_scores.spam) ? html_scores : plain_scores;
-      return combine_scores(best_scores, ftrl_score, options.mode);
+      auto combined = combine_scores(best_scores, ftrl_score, options.mode);
+      combined.encoder_truncated_sequences =
+          (embeddings[0].truncated ? 1U : 0U) + (embeddings[1].truncated ? 1U : 0U);
+      return combined;
     }
 
     // Single-part: preserve the RFC822 artifact contract as well as the
-    // independent legacy FTRL input. Routing through classify_transcript here
-    // would silently drop structural_marker_prefix because a generic text
-    // transcript has no parsed RFC822 structure attached to it.
+    // independent legacy FTRL input. Routing through classify(text) here would
+    // silently drop structural_marker_prefix because generic text has no
+    // parsed RFC822 structure attached to it.
     const std::string& body = !preprocessed.normalized_plain_text.empty()
         ? preprocessed.normalized_plain_text
         : !preprocessed.normalized_html_text.empty()
@@ -630,10 +711,8 @@ ClassificationResult SpamEngine::classify_rfc822(
     return classify_inputs(
         calibrate_preprocessed_input(
             body, preprocessed.structural_marker_prefix,
-            preprocessed.attachment_features.context, customer),
-        build_input_text(
-            {{"user", body, "email"}}, customer,
-            ModelInputFormat::kLegacyWrapped),
+            preprocessed.attachment_features.context, sender),
+        build_input_text(body, sender, ModelInputFormat::kLegacyWrapped),
         options);
   }();
 
@@ -645,18 +724,6 @@ ClassificationResult SpamEngine::classify_rfc822(
   result.body_features = preprocessed.body_features;
   result.attachment_features = std::move(preprocessed.attachment_features);
   return result;
-}
-
-ClassificationResult SpamEngine::classify_transcript(
-    const std::vector<TranscriptMessage>& transcript,
-    const CustomerInfo& customer,
-    const ClassifyOptions& options) {
-  validate_mode(options.mode);
-  const auto input_text = calibrate_input(transcript, customer);
-  const auto ftrl_input = build_input_text(
-      transcript, customer, ModelInputFormat::kLegacyWrapped);
-
-  return classify_inputs(input_text, ftrl_input, options);
 }
 
 ClassificationResult SpamEngine::classify_inputs(
@@ -676,10 +743,15 @@ ClassificationResult SpamEngine::classify_inputs(
 
   // mode=ftrl skips the (expensive) neural forward pass entirely.
   ClassScores neural{};
+  bool truncated = false;
   if (options.mode != "ftrl") {
-    neural = classify_embedding(embed(neural_input), false);
+    const auto embeddings = embed_inputs({neural_input});
+    neural = classify_embedding(embeddings[0].values, false);
+    truncated = embeddings[0].truncated;
   }
-  return combine_scores(neural, ftrl_score, options.mode);
+  auto result = combine_scores(neural, ftrl_score, options.mode);
+  result.encoder_truncated_sequences = truncated ? 1U : 0U;
+  return result;
 }
 
 float SpamEngine::train_inputs(
@@ -717,18 +789,17 @@ float SpamEngine::train_prepared_input(
 }
 
 float SpamEngine::train_text(const std::string& text, int correct_label) {
-  const std::vector<TranscriptMessage> transcript{{"user", text, "email"}};
-  const CustomerInfo customer{};
+  const SenderInfo sender{};
   return train_inputs(
-      calibrate_input(transcript, customer),
-      build_input_text(transcript, customer, ModelInputFormat::kLegacyWrapped),
+      calibrate_input(text, sender),
+      build_input_text(text, sender, ModelInputFormat::kLegacyWrapped),
       correct_label);
 }
 
 std::vector<std::pair<CalibratedInputText, CalibratedInputText>>
 SpamEngine::prepare_rfc822_training_inputs(
     const std::string& raw_rfc822,
-    const CustomerInfo& customer) const {
+    const SenderInfo& sender) const {
   // Mirror classify_rfc822 exactly: multipart trains on both plain and
   // html parts wrapped via the canonical builder; single-part trains on
   // whichever body the preprocessor produced. The CalibratedInputText
@@ -736,17 +807,16 @@ SpamEngine::prepare_rfc822_training_inputs(
   // way to skip it.
   const auto preprocessed = preprocess_rfc822(raw_rfc822, attachment_context_);
 
-  CustomerInfo c = customer;
-  apply_preprocessed_to_customer(c, preprocessed);
+  SenderInfo s = sender;
+  apply_preprocessed_to_sender(s, preprocessed);
 
   std::vector<std::pair<CalibratedInputText, CalibratedInputText>> inputs;
   const auto add_inputs = [&](const std::string& text) {
-    const std::vector<TranscriptMessage> transcript{{"user", text, "email"}};
     inputs.emplace_back(
         calibrate_preprocessed_input(
             text, preprocessed.structural_marker_prefix,
-            preprocessed.attachment_features.context, c),
-        build_input_text(transcript, c, ModelInputFormat::kLegacyWrapped));
+            preprocessed.attachment_features.context, s),
+        build_input_text(text, s, ModelInputFormat::kLegacyWrapped));
   };
   // build_normalized_text() includes the subject even when its body argument is
   // empty. Gate on the actual MIME part as well, otherwise a text/plain-only
@@ -771,9 +841,9 @@ SpamEngine::prepare_rfc822_training_inputs(
 }
 
 float SpamEngine::train_rfc822(const std::string& raw_rfc822,
-                               const CustomerInfo& customer,
+                               const SenderInfo& sender,
                                int correct_label) {
-  const auto inputs = prepare_rfc822_training_inputs(raw_rfc822, customer);
+  const auto inputs = prepare_rfc822_training_inputs(raw_rfc822, sender);
 
   // Prepare every fallible input before applying the correction. A bad second
   // part must not leave the first part applied while the caller records the
@@ -824,7 +894,7 @@ float SpamEngine::train_rfc822(const std::string& raw_rfc822,
 }
 
 void SpamEngine::train_ftrl_rfc822(const std::string& raw_rfc822,
-                                   const CustomerInfo& customer,
+                                   const SenderInfo& sender,
                                    int correct_label) {
   ensure_loaded();
   if (correct_label < 0 || correct_label > 3) {
@@ -834,7 +904,7 @@ void SpamEngine::train_ftrl_rfc822(const std::string& raw_rfc822,
     throw std::runtime_error("FTRL-only training requires a loaded FTRL model");
   }
 
-  const auto inputs = prepare_rfc822_training_inputs(raw_rfc822, customer);
+  const auto inputs = prepare_rfc822_training_inputs(raw_rfc822, sender);
   // Classification and the joint head+FTRL path both use the first available
   // representation for FTRL (plain preferred, otherwise HTML/combined). Keep
   // that contract here so choosing the learner cannot change its features.
@@ -883,10 +953,9 @@ std::map<uint32_t, float> SpamEngine::extract_contribution(
   if (scrubbed.empty()) { return {};
 }
 
-  CustomerInfo c{sender_name, sender_email, /*replyto_differs=*/false};
-  apply_preprocessed_to_customer(c, preprocessed);
-  const auto input = build_input_text(
-      {{"user", scrubbed, "email"}}, c, ModelInputFormat::kLegacyWrapped);
+  SenderInfo s{sender_name, sender_email, /*replyto_differs=*/false};
+  apply_preprocessed_to_sender(s, preprocessed);
+  const auto input = build_input_text(scrubbed, s, ModelInputFormat::kLegacyWrapped);
 
   std::map<uint32_t, float> bag;
   if (impl_->ftrl) {

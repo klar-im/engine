@@ -70,7 +70,7 @@ void test_constants() {
   check(dl::kNoContactInstruction >= dl::kThresholdStandard,
         "the no-contact instruction CAN carry a message the model likes over the "
         "gate: the genre's model floor is 0.0268, so a corroborating weight would "
-        "change no verdict at all. The 0-of-21,291 bound is what licenses it, and "
+        "change no verdict at all. The 0-of-17,348 bound is what licenses it, and "
         "the bounce allowlist is what still holds it back (TASK-460)");
   check(near(dl::kThresholdStandard, 0.99), "threshold standard == 0.99");
   check(near(dl::kThresholdCautious, 0.995), "threshold cautious == 0.995");
@@ -125,7 +125,6 @@ void test_spam_side_calibration() {
   // because the gate never moved. A raised gate breaks exactly this.
   dl::Scores clean_ham;
   clean_ham.spam = 0.0;
-  clean_ham.gibberish = 0.0;
   clean_ham.regular = 1.0;
   std::vector<dl::Offset> const gtube{
       {"gtube_test", dl::kGtubeTest, dl::Direction::Spam}};
@@ -143,8 +142,8 @@ void test_spam_side_calibration() {
   // standalone spam_engine_decide caller must do the same; postfix's
   // ModelRuntime::classify does, and TASK-222 covers the Swift and Node folds.
   dl::Scores just_under_the_knot;
-  just_under_the_knot.spam = 0.99979;   // above the 0.99 gate on the RAW scale,
-  just_under_the_knot.gibberish = 0.0;  // below it once calibrated at 0.9998
+  // Above the 0.99 gate on the RAW scale, below it once calibrated at 0.9998.
+  just_under_the_knot.spam = 0.99979;
   just_under_the_knot.regular = 0.00021;
   const std::vector<dl::Offset> none;
   const dl::Verdict calibrated =
@@ -200,19 +199,20 @@ void test_profile_threshold() {
   check(near(dl::threshold_for_profile(dl::Profile::Standard), 0.99), "standard 0.99");
   check(near(dl::threshold_for_profile(dl::Profile::Cautious), 0.995), "cautious 0.995");
   check(near(dl::threshold_for_profile(dl::Profile::Learning), 0.995), "learning 0.995");
+  check(near(dl::threshold_for_profile(dl::Profile::Aggressive), 0.95), "aggressive 0.95");
 }
 
 void test_refine_non_spam() {
   std::printf("[refine non-spam label]\n");
-  check(dl::refine_non_spam_label({0.0, 0.7, 0.3, 0.0}) == "marketing", "marketing>regular -> marketing");
-  check(dl::refine_non_spam_label({0.0, 0.2, 0.8, 0.0}) == "ham", "regular>=marketing -> ham");
+  check(dl::refine_non_spam_label({0.7, 0.3, 0.0}) == "marketing", "marketing>regular -> marketing");
+  check(dl::refine_non_spam_label({0.2, 0.8, 0.0}) == "ham", "regular>=marketing -> ham");
 }
 
 // ── Golden fold cases ───────────────────────────────────────────────────────
 void test_fold_clean_keep() {
   std::printf("[fold: clean keep]\n");
   // Model kept it, no offsets fire -> not spam, marketing recovered.
-  dl::Scores const s{0.0, 0.7, 0.2, 0.05};  // gib, mkt, reg, spam
+  dl::Scores const s{0.7, 0.2, 0.05};  // mkt, reg, spam
   auto const v = dl::fold(s, {}, 0.90, "regular", 0.7);
   check(v.label == "marketing", "label marketing");
   check(v.train_ml, "train_ml true");
@@ -221,7 +221,7 @@ void test_fold_clean_keep() {
 
 void test_fold_model_spam_kept() {
   std::printf("[fold: model spam, no offsets]\n");
-  dl::Scores const s{0.0, 0.0, 0.05, 0.95};
+  dl::Scores const s{0.0, 0.05, 0.95};
   auto const v = dl::fold(s, {}, 0.90, "spam", 0.95);
   check(v.label == "spam", "stays spam");
   check(near(v.confidence, 0.95), "confidence == adjusted spam side");
@@ -231,7 +231,7 @@ void test_fold_model_spam_kept() {
 void test_fold_free_host_condemn() {
   std::printf("[fold: free-host condemn of a leaked promo]\n");
   // Marketing-leak: spam-side ~0.09, model says marketing (not spam-side).
-  dl::Scores const s{0.04, 0.91, 0.0, 0.05};
+  dl::Scores const s{0.91, 0.0, 0.09};
   std::vector<dl::Offset> const offs = {spamward("sender_auth", 0.90)};
   auto v = dl::fold(s, offs, 0.90, "marketing", 0.91);
   check(near(v.adjusted_spam_side, std::min(1.0, 0.09 + 0.90)), "adjusted clamps toward 0.99");
@@ -245,7 +245,7 @@ void test_fold_raw_ip_corroborates() {
   std::printf("[fold: raw-IP link corroborates a borderline spam over the gate]\n");
   // Model kept it just under the gate (spam-side 0.65, label "regular"); a bare-IP
   // body link pushes it over. The 0.30 offset is what causes the condemn.
-  dl::Scores const s{0.0, 0.10, 0.25, 0.65};
+  dl::Scores const s{0.10, 0.25, 0.65};
   std::vector<dl::Offset> const offs = {spamward("url_raw_ip", dl::kUrlRawIp)};
   auto v = dl::fold(s, offs, 0.90, "regular", 0.55);
   check(near(v.adjusted_spam_side, 0.95), "0.65 + 0.30 = 0.95");
@@ -260,7 +260,7 @@ void test_fold_connect_ip_drop_solo_condemns() {
   // read as clean (spam-side 0.02) still gets condemned, because the offset is a
   // fact about the peer, not a claim inside attacker-authored content. Mail from
   // a hijacked netblock is not mail we are grading on its merits.
-  dl::Scores const s{0.0, 0.08, 0.90, 0.02};
+  dl::Scores const s{0.08, 0.90, 0.02};
   std::vector<dl::Offset> const offs = {spamward("connect_ip_drop", dl::kOriginIpDrop)};
   auto v = dl::fold(s, offs, dl::kThresholdStandard, "regular", 0.98);
   check(near(v.adjusted_spam_side, 1.0), "0.02 + 0.99 clamps to 1.0");
@@ -275,14 +275,14 @@ void test_fold_header_ip_drop_cannot_solo_condemn() {
   // The deliberate contrast with connect_ip_drop: same evidence, worse
   // provenance (it depends on the operator's trusted-relay list, not on the
   // socket), so a clean-scoring message survives it. 0.02 + 0.30 = 0.32.
-  dl::Scores const s{0.0, 0.08, 0.90, 0.02};
+  dl::Scores const s{0.08, 0.90, 0.02};
   std::vector<dl::Offset> const offs = {spamward("header_ip_drop", dl::kOriginIpDropHeader)};
   auto const v = dl::fold(s, offs, dl::kThresholdStandard, "regular", 0.98);
   check(near(v.adjusted_spam_side, 0.32), "0.02 + 0.30 = 0.32");
   check(v.label != "spam", "not condemned");
   check(v.train_ml, "train_ml true (no offset-driven condemn)");
   // ...but it does carry a message the model already put near the gate.
-  dl::Scores const near_gate{0.0, 0.10, 0.20, 0.70};
+  dl::Scores const near_gate{0.10, 0.20, 0.70};
   auto const v2 = dl::fold(near_gate, offs, dl::kThresholdStandard, "regular", 0.60);
   check(v2.label == "spam", "it does carry a near-gate suspicion over");
 }
@@ -291,7 +291,7 @@ void test_fold_raw_ip_cannot_solo_condemn_clean() {
   std::printf("[fold: raw-IP alone can't flip a clean score over the gate]\n");
   // A clean-ish message (spam-side 0.30) with a lone bare-IP link stays delivered:
   // 0.30 + 0.30 = 0.60 < 0.90. Proves the modest magnitude corroborates only.
-  dl::Scores const s{0.0, 0.20, 0.50, 0.30};
+  dl::Scores const s{0.20, 0.50, 0.30};
   std::vector<dl::Offset> const offs = {spamward("url_raw_ip", dl::kUrlRawIp)};
   auto v = dl::fold(s, offs, 0.90, "regular", 0.70);
   check(near(v.adjusted_spam_side, 0.60), "0.30 + 0.30 = 0.60");
@@ -303,7 +303,7 @@ void test_fold_raw_ip_cannot_solo_condemn_clean() {
 void test_fold_ham_rescue() {
   std::printf("[fold: ham rescue by sender history]\n");
   // Model says spam (spam-side 0.95) but the user has emailed this sender a lot.
-  dl::Scores const s{0.0, 0.0, 0.05, 0.95};
+  dl::Scores const s{0.0, 0.05, 0.95};
   std::vector<dl::Offset> const offs = {ham("sender_history", 0.40)};
   auto v = dl::fold(s, offs, 0.90, "spam", 0.95);
   check(near(v.adjusted_spam_side, 0.55), "0.95 - 0.40 = 0.55");
@@ -318,7 +318,7 @@ void test_fold_soft_ham_rescue_ceiling() {
 
   // At the ceiling, neither a forged thread header nor a guessed known sender
   // may exonerate what the calibrated model considers near-certain spam.
-  dl::Scores const at_ceiling{0.0, 0.0, 0.001, 0.999};
+  dl::Scores const at_ceiling{0.0, 0.001, 0.999};
   std::vector<dl::Offset> const spoofable = {
       ham("thread_headers", dl::kInReplyTo),
       ham("sender_history", dl::kSenderHistoryRepeat),
@@ -332,7 +332,7 @@ void test_fold_soft_ham_rescue_ceiling() {
 
   // Immediately below the ceiling the same priors retain their product value:
   // they are corroborators for borderline false positives, not disabled.
-  dl::Scores const below{0.0, 0.0, 0.0011, 0.9989};
+  dl::Scores const below{0.0, 0.0011, 0.9989};
   auto const allowed = dl::fold(below, spoofable, dl::kThresholdStandard,
                           "spam", 0.9989);
   check(allowed.label == "ham", "borderline spam-side can still be rescued");
@@ -343,7 +343,7 @@ void test_fold_soft_ham_rescue_ceiling() {
 
   // The ceiling is evaluated after per-artifact calibration. A raw 0.99 under
   // this knot maps to exactly 0.999 and must therefore be blocked.
-  dl::Scores const candidate_scale{0.0, 0.0, 0.01, 0.99};
+  dl::Scores const candidate_scale{0.0, 0.01, 0.99};
   auto const calibrated = dl::fold(candidate_scale,
                              {ham("sender_history", dl::kSenderHistoryRepeat)},
                              dl::kThresholdStandard, "spam", 0.99, 0.90);
@@ -354,7 +354,7 @@ void test_fold_soft_ham_rescue_ceiling() {
 
 void test_fold_spamward_no_condemn_when_model_already_spam() {
   std::printf("[fold: spam-ward fires but model already spam -> not a condemn]\n");
-  dl::Scores const s{0.0, 0.0, 0.02, 0.98};
+  dl::Scores const s{0.0, 0.02, 0.98};
   std::vector<dl::Offset> const offs = {spamward("sender_auth", 0.90)};
   auto v = dl::fold(s, offs, 0.90, "spam", 0.98);
   check(v.label == "spam", "spam");
@@ -367,7 +367,7 @@ void test_fold_condemn_counterfactual_score_already_over() {
   // Model kept it (label "regular") but the raw spam side is already >= threshold,
   // AND a spam-ward offset also fires. The offset did NOT cause the condemn, so it
   // gets no flip credit and the sample still trains (TASK-251 counterfactual).
-  dl::Scores const s{0.45, 0.0, 0.10, 0.50};  // raw spam side 0.95 >= 0.90
+  dl::Scores const s{0.0, 0.10, 0.95};  // raw spam side 0.95 >= 0.90
   std::vector<dl::Offset> const offs = {spamward("sender_auth", 0.90)};
   auto v = dl::fold(s, offs, 0.90, "regular", 0.55);
   check(v.label == "spam", "condemned to spam (score carried it)");
@@ -381,7 +381,7 @@ void test_fold_rescue_counterfactual_score_already_under() {
   // Model said spam (spam 0.60) but the raw side is already below the 0.90
   // threshold, so it delivers regardless; a small ham offset that also fires did
   // NOT rescue it and must get no flip credit (TASK-251 counterfactual).
-  dl::Scores const s{0.0, 0.0, 0.40, 0.60};  // raw spam side 0.60 < 0.90
+  dl::Scores const s{0.0, 0.40, 0.60};  // raw spam side 0.60 < 0.90
   std::vector<dl::Offset> const offs = {ham("sender_history", 0.10)};
   auto v = dl::fold(s, offs, 0.90, "spam", 0.60);
   check(v.label == "ham", "delivered as ham (score already under threshold)");
@@ -391,7 +391,7 @@ void test_fold_rescue_counterfactual_score_already_under() {
 
 void test_fold_clamp_and_zero_offsets() {
   std::printf("[fold: clamp + zero-magnitude offsets skipped]\n");
-  dl::Scores const s{0.0, 0.0, 0.0, 1.0};
+  dl::Scores const s{0.0, 0.0, 1.0};
   // A zero-magnitude offset (disabled signal) must not appear in fired.
   std::vector<dl::Offset> const offs = {ham("thread_headers", 0.0), spamward("sender_auth", 0.90)};
   auto const v = dl::fold(s, offs, 0.90, "spam", 1.0);

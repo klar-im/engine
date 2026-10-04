@@ -15,18 +15,18 @@
 // WHY THIS PREDICATE AND NOT THE OBVIOUS ONES. Measured before anything was
 // written (model-lab/scripts/measure_secured_account_shape.py), over the spam
 // fixtures, an authored nine-message family, 153,806 trap messages, five ham
-// fixtures and 21,291 real ham messages from the founder's mailboxes:
+// fixtures and 17,348 distinct real ham messages:
 //
-//   rule                      recall(9)  ham fixt(5)  corpus ham(21,291)  trap
+//   rule                      recall(9)  ham fixt(5)  corpus ham(17,348)  trap
 //   no_contact                 9 (100%)      0             0                1
 //   beneficiary + no_contact   8 ( 89%)      0             0                0
 //   security_id                8 ( 89%)      4 (80%)    0.03-0.10%        224
 //   iban                       7 ( 78%)      0          0.38-0.75%         77
 //
-// 21,291 is the DISTINCT ham-labelled population of the four source mailboxes.
-// An earlier draft said 25,982 by summing the census's ham rows, two of which
-// re-scan mailboxes the others already cover; the census now computes the
-// distinct figure so a magnitude cannot be derived off a double count again.
+// 17,348 is the DISTINCT ham-labelled population of the four source mailboxes,
+// de-duplicated by Message-ID. Two earlier figures double-counted: 25,982 summed
+// the census's ham rows, and 21,291 summed the mailboxes, one of which is a copy
+// of another (decision_layer.h, kNoContactInstruction, has the arithmetic).
 //
 // Every other candidate keys on something a REAL BANK ALSO DOES. `iban` fires on
 // 0.38-0.75% of real mail because every European invoice carries the seller's
@@ -57,7 +57,7 @@
 // French and false in English: "the caller told me to stay on the line and not
 // to phone my branch" is reported speech and was junked at 0.99, as were a
 // conference-bridge invitation, a support-queue hold and an airline booking
-// update. The census bound did not see it because 21,291 mostly-French messages
+// update. The census bound did not see it because 17,348 mostly-French messages
 // contain no English call-service mail. **A rule-of-three bound is a bound on
 // the population measured, and the population is chosen, not given.** Those
 // phrases are now corroborators (see call_management_phrases below) and the
@@ -213,7 +213,7 @@ inline const std::vector<std::string>& instruction_phrases() {
 // The last one is the tell. The possessive discriminator documented in the
 // header block is real but guards the CLAUSE path only, so this list was a hole
 // straight through it: an English victim recounting the scam was junked while
-// the French one was not. The 0-of-21,291 census bound did not catch it because
+// the French one was not. The 0-of-17,348 census bound did not catch it because
 // that population is overwhelmingly French and holds no English call-service
 // mail. A rule-of-three bound is only ever a bound ON THE POPULATION MEASURED.
 //
@@ -298,7 +298,7 @@ inline const std::vector<std::string>& en_objects() {
 // the one ham fixture in that register scored 0 only because it happens to
 // phrase its advice positively ("contactez votre agence si vous avez un doute").
 //
-// The 0-of-21,291 bound did not see it for the same reason it did not see the
+// The 0-of-17,348 bound did not see it for the same reason it did not see the
 // English call-service mail: the corpus is thin in that genre. THAT IS THREE
 // TIMES the population bound has been quoted for coverage it does not have.
 //

@@ -8,6 +8,7 @@
 #include <system_error>
 
 #include "brand_reputation.h"
+#include "decision_input.h"
 #include "decision_layer.h"
 #include "email_preprocessor.h"
 #include "spam_engine_handle_internal.h"
@@ -30,7 +31,6 @@ void copy_length_prefixed(const std::string& src, char* out_buf, size_t capacity
 void fill_result(const spam_engine::ClassificationResult& result, spam_engine_result_t* out_result) {
   out_result->label = spam_engine::SpamEngine::label_from_string(result.class_name);
   out_result->confidence = result.confidence;
-  out_result->scores.gibberish = result.scores.gibberish;
   out_result->scores.marketing = result.scores.marketing;
   out_result->scores.regular = result.scores.regular;
   out_result->scores.spam = result.scores.spam;
@@ -124,10 +124,6 @@ void fill_attachment_features(
 
 extern "C" {
 
-const char* spam_engine_label_name(int label) {
-  return spam_engine::SpamEngine::label_name(label);
-}
-
 spam_engine_handle_t* spam_engine_create(void) {
   try {
     return new spam_engine_handle_t();
@@ -151,22 +147,26 @@ spam_engine_status_t spam_engine_load(
     const char* model_path,
     float learning_rate,
     const char* ftrl_path) {
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
+  // NULL gguf_model_path = the encoder the artifact declares.
+  return spam_engine_load_ggml(handle, model_path, nullptr, learning_rate, ftrl_path);
+}
 
-  try {
-    std::scoped_lock const lock(handle->mutex);
-
+spam_engine_status_t spam_engine_load_ggml(
+    spam_engine_handle_t* handle,
+    const char* model_path,
+    const char* gguf_model_path,
+    float learning_rate,
+    const char* ftrl_path) {
+  return guarded(handle, "spam_engine_load_ggml", [&] {
     if (model_path == nullptr || model_path[0] == '\0') {
       return set_error_locked(
           handle, SPAM_ENGINE_STATUS_INVALID_ARGUMENT, "model_path cannot be null or empty");
     }
-
     clear_error_locked(handle);
 
     spam_engine::EngineConfig config;
     config.model_path = model_path;
+    config.gguf_model_path = (gguf_model_path != nullptr) ? gguf_model_path : "";
     config.learning_rate = learning_rate;
     config.ftrl_path = (ftrl_path != nullptr) ? ftrl_path : "";
     try {
@@ -182,81 +182,16 @@ spam_engine_status_t spam_engine_load(
     }
     handle->pending_training_samples.clear();
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;  // lock itself failed — handle may be invalid, don't touch it
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, "Unknown runtime error in spam_engine_load");
-  }
-}
-
-spam_engine_status_t spam_engine_load_ggml(
-    spam_engine_handle_t* handle,
-    const char* model_path,
-    const char* gguf_model_path,
-    float learning_rate,
-    const char* ftrl_path) {
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
-
-  try {
-    std::scoped_lock const lock(handle->mutex);
-
-    if (model_path == nullptr || model_path[0] == '\0') {
-      return set_error_locked(
-          handle, SPAM_ENGINE_STATUS_INVALID_ARGUMENT, "model_path cannot be null or empty");
-    }
-
-    clear_error_locked(handle);
-
-    spam_engine::EngineConfig config;
-    config.model_path = model_path;
-    config.gguf_model_path = (gguf_model_path != nullptr) ? gguf_model_path : "";
-    config.learning_rate = learning_rate;
-    config.ftrl_path = (ftrl_path != nullptr) ? ftrl_path : "";
-    try {
-      handle->engine.load(config);
-    } catch (const std::system_error& e) {
-      // See spam_engine_load: a system_error from inside load is thrown while the
-      // lock is held, so report it rather than surfacing an empty "Unknown error".
-      return set_error_locked(
-          handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-          std::string("system error during model load: ") + e.what());
-    }
-    handle->pending_training_samples.clear();
-    return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;  // lock itself failed — handle may be invalid, don't touch it
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, "Unknown runtime error in spam_engine_load_ggml");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_unload(spam_engine_handle_t* handle) {
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
-
-  try {
-    std::scoped_lock const lock(handle->mutex);
+  return guarded(handle, "spam_engine_unload", [&] {
     clear_error_locked(handle);
     handle->engine.unload();
     handle->pending_training_samples.clear();
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, "Unknown runtime error in spam_engine_unload");
-  }
+  });
 }
 
 int spam_engine_is_loaded(const spam_engine_handle_t* handle) {
@@ -325,17 +260,48 @@ int spam_engine_model_info(const spam_engine_handle_t* handle,
   }
 }
 
-int spam_engine_uses_gpu(const spam_engine_handle_t* handle) {
-  if (handle == nullptr) {
+// The C log levels are the C++ ones by value, so the int crosses the ABI as-is.
+static_assert(static_cast<int>(spam_engine::LogLevel::kDebug) == SPAM_ENGINE_LOG_DEBUG);
+static_assert(static_cast<int>(spam_engine::LogLevel::kInfo) == SPAM_ENGINE_LOG_INFO);
+static_assert(static_cast<int>(spam_engine::LogLevel::kWarn) == SPAM_ENGINE_LOG_WARN);
+static_assert(static_cast<int>(spam_engine::LogLevel::kError) == SPAM_ENGINE_LOG_ERROR);
+
+// The engine caps the detail at what this buffer holds with its NUL, so the
+// tail it captured arrives whole.
+static_assert(sizeof(spam_engine_runtime_info_t::fallback_detail) ==
+              spam_engine::EncoderRuntimeInfo::kFallbackDetailBytes + 1);
+
+int spam_engine_runtime_info(const spam_engine_handle_t* handle,
+                             spam_engine_runtime_info_t* out) {
+  if (handle == nullptr || out == nullptr) {
     return 0;
   }
 
   try {
     std::scoped_lock const lock(handle->mutex);
-    return handle->engine.uses_gpu() ? 1 : 0;
+    // Same rule as model_info: an unloaded handle has no backend to report,
+    // and a zeroed struct would read as "cpu, no fallback".
+    if (!handle->engine.is_loaded()) {
+      return 0;
+    }
+    const auto info = handle->engine.runtime_info();
+    copy_fixed(out->backend, sizeof(out->backend), info.backend);
+    copy_fixed(out->device, sizeof(out->device), info.device);
+    copy_fixed(out->fallback, sizeof(out->fallback),
+               spam_engine::encoder_fallback_name(info.fallback));
+    copy_fixed(out->fallback_detail, sizeof(out->fallback_detail), info.fallback_detail);
+    out->max_tokens = info.max_tokens;
+    out->sequences_embedded = info.sequences_embedded;
+    out->sequences_truncated = info.sequences_truncated;
+    out->sequences_failed = info.sequences_failed;
+    return 1;
   } catch (...) {
     return 0;
   }
+}
+
+void spam_engine_set_log_callback(spam_engine_log_fn fn, void* user) {
+  spam_engine::set_log_sink(fn, user);
 }
 
 namespace {
@@ -398,8 +364,7 @@ spam_engine_status_t spam_engine_embed_rfc822(
   if (out_plain_embedding == nullptr && out_html_embedding == nullptr) {
     return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
   }
-  try {
-    std::scoped_lock const lock(handle->mutex);
+  return guarded(handle, "spam_engine_embed_rfc822", [&] {
     clear_error_locked(handle);
 
     if (auto const s = check_embed_capacity_locked(handle, out_capacity, out_n_embd);
@@ -415,19 +380,19 @@ spam_engine_status_t spam_engine_embed_rfc822(
     const auto preprocessed = spam_engine::preprocess_rfc822(
         std::string(raw_email, raw_email_len),
         handle->engine.uses_attachment_context());
-    spam_engine::CustomerInfo customer{
+    spam_engine::SenderInfo sender{
         sender_name != nullptr ? sender_name : "",
         sender_email != nullptr ? sender_email : "",
         false,
     };
-    spam_engine::apply_preprocessed_to_customer(customer, preprocessed);
+    spam_engine::apply_preprocessed_to_sender(sender, preprocessed);
 
     bool filled_any = false;
     if (out_plain_embedding != nullptr && !preprocessed.normalized_plain_text.empty()) {
       const auto wrapped = handle->engine.calibrate_preprocessed_input(
           preprocessed.normalized_plain_text,
           preprocessed.structural_marker_prefix,
-          preprocessed.attachment_features.context, customer);
+          preprocessed.attachment_features.context, sender);
       const auto emb = handle->engine.embed(wrapped);
       std::copy(emb.begin(), emb.end(), out_plain_embedding);
       if (out_plain_filled != nullptr) { *out_plain_filled = 1;
@@ -439,7 +404,7 @@ spam_engine_status_t spam_engine_embed_rfc822(
       const auto wrapped = handle->engine.calibrate_preprocessed_input(
           preprocessed.normalized_html_text,
           preprocessed.structural_marker_prefix,
-          preprocessed.attachment_features.context, customer);
+          preprocessed.attachment_features.context, sender);
       const auto emb = handle->engine.embed(wrapped);
       std::copy(emb.begin(), emb.end(), out_html_embedding);
       if (out_html_filled != nullptr) { *out_html_filled = 1;
@@ -454,7 +419,7 @@ spam_engine_status_t spam_engine_embed_rfc822(
       const auto wrapped = handle->engine.calibrate_preprocessed_input(
           preprocessed.normalized_text,
           preprocessed.structural_marker_prefix,
-          preprocessed.attachment_features.context, customer);
+          preprocessed.attachment_features.context, sender);
       const auto emb = handle->engine.embed(wrapped);
       // Write to whichever buffer the caller provided (prefer plain).
       float* dest = out_plain_embedding != nullptr ? out_plain_embedding : out_html_embedding;
@@ -466,12 +431,7 @@ spam_engine_status_t spam_engine_embed_rfc822(
     }
 
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-                             "Unknown error in spam_engine_embed_rfc822");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_embed_text(
@@ -487,8 +447,7 @@ spam_engine_status_t spam_engine_embed_text(
     return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
   }
   *out_n_embd = 0;
-  try {
-    std::scoped_lock const lock(handle->mutex);
+  return guarded(handle, "spam_engine_embed_text", [&] {
     clear_error_locked(handle);
     // Reject an undersized buffer before the (expensive) inference, same as
     // spam_engine_embed_rfc822.
@@ -496,20 +455,14 @@ spam_engine_status_t spam_engine_embed_text(
         s != SPAM_ENGINE_STATUS_OK) {
       return s;
     }
-    spam_engine::CustomerInfo const customer{
+    spam_engine::SenderInfo const sender{
         sender_name != nullptr ? sender_name : "",
         sender_email != nullptr ? sender_email : "",
         false,
     };
-    const auto calibrated = handle->engine.calibrate_input(
-        {{"user", text, "email"}}, customer);
+    const auto calibrated = handle->engine.calibrate_input(text, sender);
     return embed_calibrated_locked(handle, calibrated, out_embedding);
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-                             "Unknown error in spam_engine_embed_text");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_classify(
@@ -519,13 +472,7 @@ spam_engine_status_t spam_engine_classify(
     const char* sender_email,
     const char* mode,
     spam_engine_result_t* out_result) {
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
-
-  try {
-    std::scoped_lock const lock(handle->mutex);
-
+  return guarded(handle, "spam_engine_classify", [&] {
     if (text == nullptr) {
       return set_error_locked(handle, SPAM_ENGINE_STATUS_INVALID_ARGUMENT, "text cannot be null");
     }
@@ -547,14 +494,7 @@ spam_engine_status_t spam_engine_classify(
         spam_engine::ClassifyOptions{mode});
     fill_result(result, out_result);
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, "Unknown runtime error in spam_engine_classify");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_classify_rfc822(
@@ -571,13 +511,7 @@ spam_engine_status_t spam_engine_classify_rfc822(
   if (out_signals != nullptr) { std::memset(out_signals, 0, sizeof(*out_signals));
 }
 
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
-
-  try {
-    std::scoped_lock const lock(handle->mutex);
-
+  return guarded(handle, "spam_engine_classify_rfc822", [&] {
     if (raw_email == nullptr) {
       return set_error_locked(
           handle, SPAM_ENGINE_STATUS_INVALID_ARGUMENT, "raw_email cannot be null");
@@ -611,16 +545,7 @@ spam_engine_status_t spam_engine_classify_rfc822(
       fill_attachment_features(result.attachment_features, &out_signals->attachment);
     }
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle,
-        SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-        "Unknown runtime error in spam_engine_classify_rfc822");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_extract_contribution(
@@ -637,13 +562,7 @@ spam_engine_status_t spam_engine_extract_contribution(
   if (out_count != nullptr) { *out_count = 0;
 }
 
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
-
-  try {
-    std::scoped_lock const lock(handle->mutex);
-
+  return guarded(handle, "spam_engine_extract_contribution", [&] {
     if (raw_rfc822 == nullptr || raw_rfc822_len == 0) {
       return set_error_locked(
           handle, SPAM_ENGINE_STATUS_INVALID_ARGUMENT, "raw_rfc822 cannot be empty");
@@ -675,16 +594,7 @@ spam_engine_status_t spam_engine_extract_contribution(
       ++i;
     }
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle,
-        SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-        "Unknown runtime error in spam_engine_extract_contribution");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_scrub_rfc822(
@@ -697,13 +607,7 @@ spam_engine_status_t spam_engine_scrub_rfc822(
   if (out_len != nullptr) { *out_len = 0;
 }
 
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
-
-  try {
-    std::scoped_lock const lock(handle->mutex);
-
+  return guarded(handle, "spam_engine_scrub_rfc822", [&] {
     if (raw_rfc822 == nullptr || raw_rfc822_len == 0) {
       return set_error_locked(
           handle, SPAM_ENGINE_STATUS_INVALID_ARGUMENT, "raw_rfc822 cannot be empty");
@@ -720,16 +624,7 @@ spam_engine_status_t spam_engine_scrub_rfc822(
 
     copy_length_prefixed(scrubbed, out_buf, capacity, out_len);
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle,
-        SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-        "Unknown runtime error in spam_engine_scrub_rfc822");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_html_to_text(
@@ -994,11 +889,10 @@ void spam_engine_decision_input_from_signals(
 }
   din->scores = *scores;
   // The fold reads ml_label as the model's own spam-side DECISION, not a raw
-  // argmax: a gibberish-argmax mail the engine scores as a deliver must not set
-  // ml_said_spam here when it doesn't in the engine and Swift (TASK-251 C5). Use
-  // the shared neural_decision so all three paths agree.
+  // argmax (TASK-251 C5). Use the shared neural_decision so the engine, this
+  // builder and Swift agree.
   const spam_engine::decision::NeuralDecision nd = spam_engine::decision::neural_decision(
-      {scores->gibberish, scores->marketing, scores->regular, scores->spam});
+      {scores->marketing, scores->regular, scores->spam});
   din->ml_label = nd.label;
   din->ml_confidence = static_cast<float>(nd.confidence);
   din->has_in_reply_to = signals->thread.has_in_reply_to;
@@ -1028,9 +922,8 @@ void spam_engine_decision_input_from_signals(
 void spam_engine_get_abi_sizes(spam_engine_abi_sizes_t* out) {
   if (out == nullptr) { return;
 }
-  out->field_count = 8;
+  out->field_count = static_cast<uint32_t>((sizeof(spam_engine_abi_sizes_t) / sizeof(uint32_t)) - 1);
   out->parsed_signals = static_cast<uint32_t>(sizeof(spam_engine_parsed_signals_t));
-  out->decision_input = static_cast<uint32_t>(sizeof(spam_engine_decision_input_t));
   out->decision_result = static_cast<uint32_t>(sizeof(spam_engine_decision_result_t));
   out->caller_state = static_cast<uint32_t>(sizeof(spam_engine_caller_state_t));
   out->full_result = static_cast<uint32_t>(sizeof(spam_engine_full_result_t));
@@ -1051,6 +944,11 @@ void spam_engine_get_abi_sizes(spam_engine_abi_sizes_t* out) {
   out->caller_state_attachment_risk_enabled =
       static_cast<uint32_t>(offsetof(spam_engine_caller_state_t,
                                      attachment_risk_enabled));
+  out->runtime_info = static_cast<uint32_t>(sizeof(spam_engine_runtime_info_t));
+  out->caller_state_replied_to_own_sent =
+      static_cast<uint32_t>(offsetof(spam_engine_caller_state_t, replied_to_own_sent));
+  out->caller_state_header_ip_blocked =
+      static_cast<uint32_t>(offsetof(spam_engine_caller_state_t, header_ip_blocked));
 }
 
 int spam_engine_decide(const spam_engine_decision_input_t* in,
@@ -1063,7 +961,6 @@ int spam_engine_decide(const spam_engine_decision_input_t* in,
   namespace dl = spam_engine::decision;
 
   dl::Scores scores;
-  scores.gibberish = in->scores.gibberish;
   scores.marketing = in->scores.marketing;
   scores.regular = in->scores.regular;
   scores.spam = in->scores.spam;
@@ -1091,8 +988,43 @@ int spam_engine_decide(const spam_engine_decision_input_t* in,
   // The flag is computed in extract_auth_features (dictionary-filtered brand-name
   // match vs the From org-domain); strong magnitude to carry a low-neural phish
   // (the Scaleway clone scored 0.06) over the gate, like the free-host push.
+  //
+  // VETOED by a verified reply to our own mail. phase2_match means the inbound's
+  // In-Reply-To or first Reference is a Message-ID we hold; with dmarc_pass the
+  // receiver has also verified who sent it. That pair is the one piece of ground
+  // truth a spam filter cannot be talked out of: an attacker would need a
+  // Message-ID we generated and never published, AND the receiver's own verdict
+  // on a domain they do not control. It is strictly stronger than the
+  // reputable_aligned precondition that already vetoes this same flag upstream.
+  //
+  // Why a veto and not another ham-ward offset: dl::fold SUMS each direction, so
+  // -0.30 (thread_history) plus -0.25 (thread_headers) against +0.99 still lands
+  // spam-ward. On 2026-09-17 a two-line reply to mail the user had sent
+  // was junked at an adjusted 0.78 because the sender's surname is a hotel chain
+  // (TASK-510). Even with the Message-ID hit
+  // it would have come to 0.48, which is the right answer by two hundredths --
+  // a number that decides whether someone sees their own reply should not be
+  // the residue of four magnitudes. A brand claim is a guess about identity;
+  // a Message-ID we issued is a fact about it, and the fact wins outright.
+  // Two routes to the same fact, both requiring the receiver's own dmarc=pass so
+  // the address cannot simply be asserted. replied_to_own_sent is the exact one:
+  // the reply names a Message-ID the user's own outbound mail carried.
+  // exact_send_count >= 2 is the one that works when the Message-ID was never
+  // capturable (Mail assigns it after the compose hook runs), and it is the
+  // repo's own measured-safe line -- 0 of 12,807 spam reach it
+  // (model-lab/scripts/measure_replied_senders.py), the same threshold
+  // sender_history already pays kSenderHistoryRepeat for. Someone the user has
+  // written to twice is not a stranger.
+  //
+  // NOT phase2_match, which is the weaker superset: it also fires on a parent
+  // WE classified as ham, and an attacker manufactures that by sending one
+  // benign message and replying to their own thread, which would hand them a
+  // switch for the strongest condemn the engine has. Caught by Codex on #888.
+  const bool replied_to_our_own_mail =
+      in->dmarc_pass != 0 && (in->replied_to_own_sent != 0 || in->exact_send_count >= 2);
   offsets.push_back({"display_impersonation",
-                     in->display_impersonation != 0 ? dl::kDisplayImpersonation : 0.0,
+                     (in->display_impersonation != 0 && !replied_to_our_own_mail)
+                         ? dl::kDisplayImpersonation : 0.0,
                      dl::Direction::Spam});
   // Bare-IP body link (TASK-257): a structural phishing tell. Modest magnitude,
   // it corroborates rather than solo-condemns a clean message (a lone raw-IP link
@@ -1107,7 +1039,7 @@ int spam_engine_decide(const spam_engine_decision_input_t* in,
   //
   // The auth condition is measured, not assumed, and it was added after the
   // first version of this offset had been written without it. Over 3,621
-  // invoice-ish messages from the founder's four real mailboxes:
+  // invoice-ish real ham messages:
   //
   //   billing + phone + no_link                 15 false positives (0.4%)
   //   billing + phone + no_link + no dmarc=pass  0 false positives, same 203 hits
@@ -1220,7 +1152,7 @@ int spam_engine_decide(const spam_engine_decision_input_t* in,
   // personalization below the 0.97 ceiling). Bounded + rare (brand-signed mail
   // the user marked spam); the ceiling backstops the confident cases. Revisit if
   // the flywheel shows brand-signed graymail the user keeps re-marking.
-  const double raw_spam_side = in->scores.spam + in->scores.gibberish;
+  const double raw_spam_side = in->scores.spam;
   offsets.push_back({"sender_reputation",
                      spam_engine::brand_reputation::brand_reputation_offset(
                          signer, raw_spam_side, dl::is_free_host_signed(signer),
@@ -1244,6 +1176,7 @@ int spam_engine_decide(const spam_engine_decision_input_t* in,
   dl::Profile profile = dl::Profile::Standard;
   if (in->profile == SPAM_ENGINE_PROFILE_CAUTIOUS) { profile = dl::Profile::Cautious;
   } else if (in->profile == SPAM_ENGINE_PROFILE_LEARNING) { profile = dl::Profile::Learning;
+  } else if (in->profile == SPAM_ENGINE_PROFILE_AGGRESSIVE) { profile = dl::Profile::Aggressive;
 }
 
   const std::string ml_label = in->ml_label != nullptr ? in->ml_label : "";
@@ -1313,13 +1246,11 @@ spam_engine_status_t spam_engine_classify_full(
     spam_engine_full_result_t* out) {
   if (out != nullptr) { std::memset(out, 0, sizeof(*out));
 }
-  if (handle == nullptr || out == nullptr) {
+  if (out == nullptr) {
     return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
   }
 
-  try {
-    std::scoped_lock const lock(handle->mutex);
-
+  return guarded(handle, "spam_engine_classify_full", [&] {
     if (raw_email == nullptr || raw_email_len == 0) {
       return set_error_locked(
           handle, SPAM_ENGINE_STATUS_INVALID_ARGUMENT, "raw_email cannot be empty");
@@ -1343,7 +1274,6 @@ spam_engine_status_t spam_engine_classify_full(
         spam_engine::ClassifyOptions{mode}, attachment_risk_enabled);
 
     out->ftrl_score = r.ftrl_score;
-    out->neural_scores.gibberish = r.scores.gibberish;
     out->neural_scores.marketing = r.scores.marketing;
     out->neural_scores.regular = r.scores.regular;
     // scores.spam is the ensemble-blended spam side; neural_spam is the pre-blend
@@ -1357,13 +1287,13 @@ spam_engine_status_t spam_engine_classify_full(
     fill_url_features(r.url_features, &out->signals.url);
     fill_body_features(r.body_features, &out->signals.body);
     fill_attachment_features(r.attachment_features, &out->signals.attachment);
+    out->encoder_truncated_sequences = r.encoder_truncated_sequences;
 
-    // Stage 3: fold the structural offsets onto the ENSEMBLE spam side. Reuse
-    // spam_engine_decide so the fold can never drift from the standalone path.
-    // Fold uses the engine's scores as-is: gibberish/marketing/regular are raw
-    // neural and scores.spam is already the ensemble-blended side (combine_scores).
-    const spam_engine_scores_t scores = {r.scores.gibberish, r.scores.marketing,
-                                         r.scores.regular, r.scores.spam};
+    // Stage 3: fold the structural offsets onto the ENSEMBLE spam side.
+    // Fold uses the engine's scores as-is: marketing/regular are raw neural and
+    // scores.spam is already the ensemble-blended side (combine_scores).
+    const spam_engine_scores_t scores = {r.scores.marketing, r.scores.regular,
+                                         r.scores.spam};
     spam_engine_decision_input_t din{};
     spam_engine_decision_input_from_signals(&din, &scores, &out->signals);
     // The loaded artifact's own scale. Undeclared (0) is the identity, so
@@ -1374,23 +1304,17 @@ spam_engine_status_t spam_engine_classify_full(
     din.spam_side_knot = handle->engine.model_info().spam_side_calibration_knot;
     if (caller_state != nullptr) {
       din.phase2_match = caller_state->phase2_match;
+      din.replied_to_own_sent = caller_state->replied_to_own_sent;
       din.exact_send_count = caller_state->exact_send_count;
       din.domain_send_count = caller_state->domain_send_count;
       din.profile = caller_state->profile;
       din.connect_ip_blocked = caller_state->connect_ip_blocked;
+      din.header_ip_blocked = caller_state->header_ip_blocked;
       din.attachment_risk_enabled = caller_state->attachment_risk_enabled;
     }
     spam_engine_decide(&din, &out->decision);
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-        "Unknown runtime error in spam_engine_classify_full");
-  }
+  });
 }
 
 }  // extern "C"

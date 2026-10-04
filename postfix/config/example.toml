@@ -16,8 +16,10 @@ listen = "inet:8891@127.0.0.1"
 # Start with "tag" until you trust the model, then switch to "reject".
 mode = "tag"
 
-# Sensitivity profile: cautious (0.70), standard (0.50), aggressive (0.30)
-# This is the spam score threshold above which mail is labeled "spam".
+# Sensitivity profile: cautious | standard | aggressive, the same three gates
+# the Klar Mac app applies (0.995 / 0.99 / 0.95 on the calibrated,
+# offset-adjusted spam side; the numbers live in the engine, not here).
+# "standard" is the product's default.
 profile = "standard"
 
 # Override the profile threshold with a custom value (0.0 to 1.0).

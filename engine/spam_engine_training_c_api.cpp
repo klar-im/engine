@@ -15,9 +15,9 @@ bool is_valid_label(int correct_label) {
   return correct_label >= 0 && correct_label <= 3;
 }
 
-spam_engine::CustomerInfo customer_from_c_strings(
+spam_engine::SenderInfo sender_from_c_strings(
     const char* sender_name, const char* sender_email) {
-  return spam_engine::CustomerInfo{
+  return spam_engine::SenderInfo{
       sender_name != nullptr ? sender_name : "",
       sender_email != nullptr ? sender_email : "",
       false,
@@ -50,48 +50,6 @@ spam_engine_status_t validate_rfc822_training_input_locked(
 
 extern "C" {
 
-spam_engine_status_t spam_engine_train(
-    spam_engine_handle_t* handle,
-    const char* text,
-    int correct_label,
-    float* out_loss) {
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
-
-  try {
-    std::scoped_lock const lock(handle->mutex);
-
-    if (text == nullptr) {
-      return set_error_locked(
-          handle, SPAM_ENGINE_STATUS_INVALID_ARGUMENT, "text cannot be null");
-    }
-    if (!is_valid_label(correct_label)) {
-      return set_error_locked(
-          handle,
-          SPAM_ENGINE_STATUS_INVALID_ARGUMENT,
-          "correct_label must be 0-3 (gibberish/marketing/regular/spam)");
-    }
-
-    clear_error_locked(handle);
-
-    // The loaded artifact selects the same neural representation used by
-    // inference; FTRL independently retains its legacy envelope.
-    const float loss = handle->engine.train_text(text, correct_label);
-    if (out_loss != nullptr) {
-      *out_loss = loss;
-    }
-    return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, "Unknown runtime error in spam_engine_train");
-  }
-}
-
 spam_engine_status_t spam_engine_train_rfc822(
     spam_engine_handle_t* handle,
     const char* raw_email,
@@ -117,7 +75,7 @@ spam_engine_status_t spam_engine_train_rfc822(
 
     const float loss = handle->engine.train_rfc822(
         std::string(raw_email, raw_email_len),
-        customer_from_c_strings(sender_name, sender_email),
+        sender_from_c_strings(sender_name, sender_email),
         correct_label);
     if (out_loss != nullptr) {
       *out_loss = loss;
@@ -212,14 +170,14 @@ spam_engine_status_t spam_engine_train_incremental_mode(
     try {
       for (; processed < samples.size(); ++processed) {
         const auto& sample = samples[processed];
-        const auto customer = spam_engine::CustomerInfo{
+        const auto sender = spam_engine::SenderInfo{
             sample.sender_name, sample.sender_email, false};
         if (mode == SPAM_ENGINE_TRAIN_FTRL_ONLY) {
           handle->engine.train_ftrl_rfc822(
-              sample.raw_email, customer, sample.correct_label);
+              sample.raw_email, sender, sample.correct_label);
         } else {
           loss_sum += handle->engine.train_rfc822(
-              sample.raw_email, customer, sample.correct_label);
+              sample.raw_email, sender, sample.correct_label);
         }
       }
     } catch (...) {
@@ -352,21 +310,6 @@ spam_engine_status_t spam_engine_save_model(
     spam_engine_handle_t* handle,
     const char* model_path) {
   return spam_engine_save(handle, model_path);
-}
-
-int spam_engine_label_from_string(const char* label) {
-  if (label == nullptr) {
-    return -1;
-  }
-  return spam_engine::SpamEngine::label_from_string(label);
-}
-
-const char* spam_engine_label_to_string(int label) {
-  static const char* labels[] = {"gibberish", "marketing", "regular", "spam"};
-  if (label < 0 || label > 3) {
-    return nullptr;
-  }
-  return labels[label];
 }
 
 }  // extern "C"

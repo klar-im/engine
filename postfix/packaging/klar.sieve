@@ -15,7 +15,7 @@
 #   }
 #
 # The milter stamps X-Klar-Label (spam|regular) and X-Klar-Class
-# (regular|marketing|gibberish|spam, the 4-class argmax). The spam LABEL wins:
+# (regular|marketing|spam, the 3-class argmax). The spam LABEL wins:
 # a spam-labelled message goes to Junk even if its class was marketing.
 
 require ["fileinto"];

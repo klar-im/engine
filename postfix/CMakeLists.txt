@@ -159,6 +159,19 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tests/config_tests.cpp")
     add_test(NAME config_tests COMMAND config_tests)
 endif()
 
+# The label is the product's gate (TASK-510): evaluate_policy and
+# resolve_policy against the thresholds decision_profiles.h reads from the
+# engine's header-only decision_layer.h. Links policy.cpp alone: no engine
+# library, no model, no config parser.
+if(EXISTS "${CMAKE_SOURCE_DIR}/tests/policy_tests.cpp")
+    add_executable(policy_tests
+        tests/policy_tests.cpp
+        src/policy.cpp
+    )
+    target_include_directories(policy_tests PRIVATE src ${ENGINE_DIR})
+    add_test(NAME policy_tests COMMAND policy_tests)
+endif()
+
 # The auth_results = "ignore" switch (TASK-503): header predicate, whole-message
 # strip, and its config validation. Links config.cpp for validate_config, so the
 # same origin_ip_blocklist.cpp dependency as config_tests, and nothing heavier.
@@ -173,9 +186,9 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tests/auth_results_tests.cpp")
     add_test(NAME auth_results_tests COMMAND auth_results_tests)
 endif()
 
-# ModelRuntime drives the lower-level classify + decide API because the milter
-# adds connection-origin facts between the two calls. Stub the C API here so the
-# test can pin calibration propagation without loading a 400 MiB model.
+# ModelRuntime classifies through spam_engine_classify_full, handing it the
+# connection-origin facts the milter observed. Stub the C API here so the test
+# can pin that caller state and the result mapping without a 400 MiB model.
 if(EXISTS "${CMAKE_SOURCE_DIR}/tests/model_runtime_calibration_tests.cpp")
     add_executable(model_runtime_calibration_tests
         tests/model_runtime_calibration_tests.cpp

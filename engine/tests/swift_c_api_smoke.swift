@@ -40,7 +40,7 @@ if spam_engine_is_loaded(handle) != 0 {
 var result = spam_engine_result_t(
   label: 0,
   confidence: 0,
-  scores: spam_engine_scores_t(gibberish: 0, marketing: 0, regular: 0, spam: 0),
+  scores: spam_engine_scores_t(marketing: 0, regular: 0, spam: 0),
   decided_by: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
   ftrl_score: -1
 )
@@ -52,9 +52,31 @@ if statusOK(preLoadStatus) {
   fail("classify before load should fail")
 }
 
+// The log callback, installed the way the appex installs it: a @convention(c)
+// function with the receiver behind `user`. The engine's own load line must
+// arrive; ggml's chatter arrives as DEBUG (TASK-505 L).
+final class LogSpy {
+  var sawLoadLine = false
+  var sawNativeLine = false
+}
+let spy = LogSpy()
+let spyPointer = Unmanaged.passUnretained(spy).toOpaque()
+spam_engine_set_log_callback({ level, text, user in
+  guard let text, let user else { return }
+  let line = String(cString: text)
+  let receiver = Unmanaged<LogSpy>.fromOpaque(user).takeUnretainedValue()
+  if level == SPAM_ENGINE_LOG_INFO.rawValue && line.hasPrefix("[spam_engine] loaded backend=") {
+    receiver.sawLoadLine = true
+  }
+  if level == SPAM_ENGINE_LOG_DEBUG.rawValue && !line.contains("[spam_engine]") {
+    receiver.sawNativeLine = true
+  }
+}, spyPointer)
+
 let loadStatus = modelPath.withCString { modelPathCString in
   spam_engine_load(handle, modelPathCString, 0.001, nil)
 }
+spam_engine_set_log_callback(nil, nil)
 if !statusOK(loadStatus) {
   if let err = spam_engine_get_last_error(handle) {
     fail("load failed: \(String(cString: err))")
@@ -64,6 +86,33 @@ if !statusOK(loadStatus) {
 
 if spam_engine_is_loaded(handle) != 1 {
   fail("handle should be loaded after load")
+}
+
+if !spy.sawLoadLine {
+  fail("the engine's '[spam_engine] loaded backend=' line never reached the log callback")
+}
+if !spy.sawNativeLine {
+  fail("no ggml/llama line reached the log callback as DEBUG")
+}
+
+// The runtime record is runtime evidence, read through the same Swift import
+// the app uses (TASK-505 L). Under SPAM_ENGINE_NO_GPU the reason must be
+// requested_cpu; on the Metal path a CI sandbox may fall back, so only the
+// record's own consistency is asserted there.
+var runtime = spam_engine_runtime_info_t()
+if spam_engine_runtime_info(handle, &runtime) != 1 {
+  fail("runtime_info should succeed on a loaded handle")
+}
+let backend = withUnsafeBytes(of: &runtime.backend) { String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self)) }
+let fallback = withUnsafeBytes(of: &runtime.fallback) { String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self)) }
+if (backend == "cpu") != (fallback != "none") {
+  fail("backend '\(backend)' disagrees with fallback '\(fallback)'")
+}
+if ProcessInfo.processInfo.environment["SPAM_ENGINE_NO_GPU"] != nil && fallback != "requested_cpu" {
+  fail("SPAM_ENGINE_NO_GPU set but fallback reads '\(fallback)'")
+}
+if runtime.max_tokens <= 0 || runtime.sequences_embedded != 0 || runtime.sequences_truncated != 0 {
+  fail("runtime_info after load: cap=\(runtime.max_tokens) embedded=\(runtime.sequences_embedded) truncated=\(runtime.sequences_truncated)")
 }
 
 let classifyStatus = "Hi team, just sharing tomorrow's meeting agenda.".withCString { text in
@@ -80,8 +129,7 @@ if !statusOK(classifyStatus) {
   fail("classify failed without error")
 }
 
-let scoreSum = result.scores.gibberish
-  + result.scores.marketing
+let scoreSum = result.scores.marketing
   + result.scores.regular
   + result.scores.spam
 if abs(scoreSum - 1.0) > 0.001 {
@@ -95,6 +143,10 @@ if !statusOK(unloadStatus) {
 
 if spam_engine_is_loaded(handle) != 0 {
   fail("handle should be unloaded after unload")
+}
+runtime.max_tokens = -1
+if spam_engine_runtime_info(handle, &runtime) != 0 || runtime.max_tokens != -1 {
+  fail("runtime_info on an unloaded handle must fail and leave out untouched")
 }
 
 let postUnloadStatus = "BUY VIAGRA NOW".withCString { text in

@@ -30,12 +30,12 @@ The base transformer encoder stays frozen in all current C++ executables.
 Primary API surface:
 
 - `load(config)`
-- `classify(...)` / `classify_rfc822(...)` / `classify_transcript(...)`
+- `classify(...)` / `classify_rfc822(...)`
 - `embed(text)` / `embed_batch(texts, progress_callback)`
 - `train(...)` / `train_embedding(...)`
 - `save(...)`
 
-The C ABI in [spam_engine_c_api.h](spam_engine_c_api.h) is the integration boundary for Swift-side consumption (and any other FFI).
+The C ABI in [spam_engine_c_api.h](spam_engine_c_api.h) is the integration boundary for Swift-side consumption (and any other FFI). A consumer reaches a verdict through one call, `spam_engine_classify_full` (parse, score, structural fold); the header's product section is what shipping consumers call, its measurement section what model-lab and the tests call.
 
 ### 1) Model Assets (`/engine/model`)
 
@@ -74,7 +74,7 @@ The C ABI in [spam_engine_c_api.h](spam_engine_c_api.h) is the integration bound
 
 ### 5) Executables
 
-- `spam_classifier` ([main.cpp](main.cpp)) — minimal inference CLI/demo using `spam_engine`.
+- `spam_classifier` ([main.cpp](main.cpp)) — `spam_classifier <model_dir> <message.eml>`: classifies one message through `spam_engine_classify_full` and prints the verdict.
 - `spam_benchmark` ([benchmark.cpp](benchmark.cpp)) — encoder timing harness.
 
 ## Runtime Data Flow
@@ -142,9 +142,11 @@ engine runs:
   brand layer exonerates a sender that IS on a KB-canonical domain (it assumes the
   MTA would have caught a forgery). So a direct From-forgery of a canonical brand
   domain passes the brand layer on an un-authenticated message.
-- The topmost `Authentication-Results` header is trusted. An attacker who can
-  inject headers (i.e. the message reaches the engine before a trusted MTA has
-  stamped and sanitized AR) can supply a forged `dkim=pass; dmarc=pass`.
+- The receiving MTA's `Authentication-Results` are trusted: its run of headers
+  from the top, each method from the first header that reports it
+  (`edge_authentication_results`). An attacker who can inject headers (i.e.
+  the message reaches the engine before a trusted MTA has stamped and sanitized
+  AR) can supply a forged `dkim=pass; dmarc=pass`.
 
 This is FINE behind iCloud Mail or Gmail (the Apple Mail / companion deployments):
 the provider has already authenticated and rewritten `Authentication-Results`

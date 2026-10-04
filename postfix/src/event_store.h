@@ -17,7 +17,6 @@ struct DecisionEvent {
     float score_spam = 0;
     float score_regular = 0;
     float score_marketing = 0;
-    float score_gibberish = 0;
     std::string label;           // "spam" or "regular"
     std::string action;          // "tag", "reject", "bypass"
     double latency_ms = 0;

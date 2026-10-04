@@ -314,15 +314,18 @@ static sfsistat xxfi_eom(SMFICTX* ctx) {
                             g_ip_blocklist->contains(origin);
     }
 
+    // The policy in force for these recipients, resolved once: the engine
+    // folds at its profile and evaluate_policy thresholds the label at it.
+    const EffectivePolicy eff = resolve_policy(*cfg, session->rcpt_to);
     ClassifyResult cr = g_runtime->classify_rfc822(
         session->raw_rfc822,
         session->from_header_name,
         session->mail_from,
-        connect_ip_blocked, header_ip_blocked);
+        connect_ip_blocked, header_ip_blocked, eff.engine_profile);
 
     // Evaluate policy
     PolicyResult pr = evaluate_policy(
-        *cfg, cr, session->mail_from, session->rcpt_to,
+        *cfg, eff, cr, session->mail_from,
         !cr.ok, session->bypass_due_overload);
 
     // Latency
@@ -345,7 +348,6 @@ static sfsistat xxfi_eom(SMFICTX* ctx) {
     ev.score_spam     = pr.score_spam;
     ev.score_regular  = pr.score_regular;
     ev.score_marketing = pr.score_marketing;
-    ev.score_gibberish = pr.score_gibberish;
     ev.label          = pr.label;
     ev.action         = action_to_string(pr.action);
     ev.latency_ms     = latency_ms;
@@ -372,7 +374,10 @@ static sfsistat xxfi_eom(SMFICTX* ctx) {
     add_hdr("X-Klar-Score-Spam",     fmt_score(pr.score_spam));
     add_hdr("X-Klar-Score-Regular",  fmt_score(pr.score_regular));
     add_hdr("X-Klar-Score-Marketing", fmt_score(pr.score_marketing));
-    add_hdr("X-Klar-Score-Gibberish", fmt_score(pr.score_gibberish));
+    // The engine's scores are three classes (TASK-540). The header stays, at
+    // the 0 every three-class model already wrote, so a filter rule or parser
+    // reading the header set sees the same headers it saw before.
+    add_hdr("X-Klar-Score-Gibberish", fmt_score(0.0f));
     add_hdr("X-Klar-Action",         action_to_string(pr.action));
     add_hdr("X-Klar-Model-Version",  g_runtime->loaded_model_version());
     // Only stamped when it fires: the scores above explain a content-driven

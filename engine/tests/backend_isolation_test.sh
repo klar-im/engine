@@ -16,12 +16,13 @@
 # there; only the plugin directory the loader enumerates is denied, which is the
 # appex condition.
 #
-# Usage: backend_isolation_test.sh <spam_classifier> <model_dir> <ggml_backend_dir>
+# Usage: backend_isolation_test.sh <spam_classifier> <model_dir> <ggml_backend_dir> <message.eml>
 set -eu
 
 BIN=${1:?binary}
 MODEL=${2:?model dir}
 DENY_DIR=${3:?ggml backend dir}
+EML=${4:?message to classify}
 
 if [ "$(uname -s)" != "Darwin" ]; then
     echo "SKIP: sandbox-exec is macOS-only"
@@ -47,7 +48,7 @@ BIN_DIR=$(cd "$(dirname "$BIN")" && pwd)
 # regression on its own: with ggml_backend_load_all() called first, ggml reports
 # "loaded BLAS backend from /opt/homebrew/Cellar/ggml/<v>/libexec/..." and this
 # fails immediately.
-OUTPUT=$("$BIN" "$MODEL" 2>&1) || {
+OUTPUT=$("$BIN" "$MODEL" "$EML" 2>&1) || {
     echo "FAIL: engine could not load a model at all."
     printf '%s\n' "$OUTPUT"
     exit 1
@@ -86,7 +87,7 @@ if ! sandbox-exec -f "$PROFILE" /usr/bin/true >/dev/null 2>&1; then
 fi
 
 set +e
-OUTPUT=$(sandbox-exec -f "$PROFILE" "$BIN" "$MODEL" 2>&1)
+OUTPUT=$(sandbox-exec -f "$PROFILE" "$BIN" "$MODEL" "$EML" 2>&1)
 STATUS=$?
 set -e
 
@@ -97,8 +98,8 @@ if [ $STATUS -ne 0 ]; then
     printf '%s\n' "$OUTPUT"
     exit 1
 fi
-if ! printf '%s\n' "$OUTPUT" | grep -q "Model loaded successfully"; then
-    echo "FAIL: exit 0 but the model did not report a successful load."
+if ! printf '%s\n' "$OUTPUT" | grep -q "^adjusted_spam_side: "; then
+    echo "FAIL: exit 0 but the classifier printed no verdict."
     printf '%s\n' "$OUTPUT"
     exit 1
 fi

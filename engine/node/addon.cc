@@ -46,17 +46,26 @@ namespace {
 //
 // So: check at module load, and refuse to export anything on a mismatch. A
 // startup error naming the stale file is recoverable; a corrupted heap is not.
-const char* kAbiFieldNames[] = {"parsed_signals", "decision_input",
-                                "decision_result", "caller_state",
-                                "full_result",     "result",
-                                "scores", "attachment_features"};
-constexpr uint32_t kAbiFieldCount = 8;
+const char* kAbiFieldNames[] = {"parsed_signals", "decision_result",
+                                "caller_state",   "full_result",
+                                "result",         "scores",
+                                "attachment_features"};
+// The structs this addon mirrors by size: the first seven size fields after
+// field_count. The descriptor carries more (caller_state offsets, then the
+// runtime_info size), which this addon does not read.
+constexpr uint32_t kMirroredStructs = 7;
 // The names and the count are edited by hand and read together in the loop
 // below, so a struct added to one and not the other would walk off the end of
-// the names. The header asks for exactly this ("adding a struct here means
-// adding a field here AND bumping field_count"); this is that rule, enforced.
-static_assert(sizeof(kAbiFieldNames) / sizeof(*kAbiFieldNames) == kAbiFieldCount,
-              "kAbiFieldNames and kAbiFieldCount disagree");
+// the names.
+static_assert(sizeof(kAbiFieldNames) / sizeof(*kAbiFieldNames) == kMirroredStructs,
+              "kAbiFieldNames and kMirroredStructs disagree");
+// field_count is every uint32_t after itself, so the header this addon was
+// compiled against says what to expect; a literal here would be the stale
+// mirror the check exists to catch (it was, at 8, when the engine went to 15).
+constexpr uint32_t kExpectedFieldCount =
+    static_cast<uint32_t>(sizeof(spam_engine_abi_sizes_t) / sizeof(uint32_t)) - 1;
+static_assert(kExpectedFieldCount >= kMirroredStructs,
+              "the descriptor must carry at least the structs this addon mirrors");
 
 // Returns "" when this build agrees with the loaded engine, else what differs.
 std::string CheckAbi() {
@@ -69,15 +78,14 @@ std::string CheckAbi() {
   spam_engine_get_abi_sizes(reinterpret_cast<spam_engine_abi_sizes_t*>(raw));
 
   const uint32_t engine_field_count = raw[0];
-  if (engine_field_count != kAbiFieldCount) {
+  if (engine_field_count != kExpectedFieldCount) {
     return "the engine describes " + std::to_string(engine_field_count) +
-           " ABI structs, this addon knows " + std::to_string(kAbiFieldCount) +
+           " ABI fields, this addon knows " + std::to_string(kExpectedFieldCount) +
            "; the addon was built against a different spam_engine_c_api.h";
   }
 
-  const uint32_t ours[kAbiFieldCount] = {
+  const uint32_t ours[kMirroredStructs] = {
       static_cast<uint32_t>(sizeof(spam_engine_parsed_signals_t)),
-      static_cast<uint32_t>(sizeof(spam_engine_decision_input_t)),
       static_cast<uint32_t>(sizeof(spam_engine_decision_result_t)),
       static_cast<uint32_t>(sizeof(spam_engine_caller_state_t)),
       static_cast<uint32_t>(sizeof(spam_engine_full_result_t)),
@@ -87,7 +95,7 @@ std::string CheckAbi() {
   };
 
   std::string bad;
-  for (uint32_t i = 0; i < kAbiFieldCount; ++i) {
+  for (uint32_t i = 0; i < kMirroredStructs; ++i) {
     // raw[0] is field_count, so the i-th size sits at raw[i + 1].
     const uint32_t theirs = raw[i + 1];
     if (theirs == ours[i]) continue;
@@ -199,8 +207,8 @@ Napi::Object ModelInfoObject(Napi::Env env, const spam_engine_model_info_t& mi) 
   return out;
 }
 
-// AsyncWorker that runs one classify (text or rfc822) off the JS thread and
-// resolves a promise with {class, confidence, scores}.
+// AsyncWorker that runs one spam_engine_classify_full (text or rfc822) off the
+// JS thread and resolves a promise with {class, scores, decision, ...}.
 class ClassifyWorker : public Napi::AsyncWorker {
  public:
   ClassifyWorker(Napi::Env env, std::string payload, bool is_eml,
@@ -247,29 +255,31 @@ class ClassifyWorker : public Napi::AsyncWorker {
       return;
     }
 
-    spam_engine_status_t st;
-    if (is_eml_) {
-      // Capture the structural signals (sender-auth + thread) the same parse
-      // already produces, so we can run the decision-layer fold and show them.
-      // mode_ defaults to "ensemble" (neural head + low-weight FTRL blend,
-      // TASK-219); the /demo ?mode= override can force "neural"/"ftrl".
-      st = spam_engine_classify_rfc822(g_engine.handle, payload_.data(),
-                                       payload_.size(), "", "", mode_.c_str(),
-                                       &result_, &signals_);
-    } else {
-      st = spam_engine_classify(g_engine.handle, payload_.c_str(), "", "",
-                                mode_.c_str(), &result_);
-    }
+    // One call, the same verdict the milter and the Apple extension reach:
+    // parse, score (mode_ defaults to "ensemble"; the /demo ?mode= override
+    // can force "neural"/"ftrl"), then the structural fold at the Standard
+    // profile with the artifact's own calibration knot (TASK-540). The
+    // hand-assembled fold this replaced once skipped the knot and read every
+    // gen3-v6 spam verdict on klar.im as ham at 0.897 (2026-09-14).
+    //
+    // Pasted text has no headers, so it goes in as the body of a minimal
+    // message: no signal fires, and the model sees it exactly as it sees the
+    // body of a mail with no subject.
+    const std::string raw =
+        is_eml_ ? payload_
+                : "MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                  "Content-Transfer-Encoding: 8bit\r\n\r\n" + payload_;
+    spam_engine_caller_state_t caller{};
+    caller.profile = SPAM_ENGINE_PROFILE_STANDARD;
+    const spam_engine_status_t st =
+        spam_engine_classify_full(g_engine.handle, raw.data(), raw.size(), "", "",
+                                  mode_.c_str(), &caller, &full_);
     if (st != SPAM_ENGINE_STATUS_OK) {
       const char* err = spam_engine_get_last_error(g_engine.handle);
       SetError(err && *err ? err : "classification failed");
       return;
     }
 
-    // Structural decision-layer fold — the SAME verdict the Apple extension
-    // produces: folds the sender-auth / thread offsets onto the model's
-    // spam-side and applies the standard threshold. For plain text there are no
-    // headers, so signals_ is zeroed and no offset fires (verdict == neural).
     // Which artifact produced this verdict, read here rather than by a separate
     // modelInfo() call afterwards. Under the mutex the answer is the model that
     // actually ran; outside it, a swap for the next request could already have
@@ -277,18 +287,6 @@ class ClassifyWorker : public Napi::AsyncWorker {
     // matters more than it sounds: the demo has silently changed model
     // underneath us before and nobody noticed for a month.
     has_model_ = spam_engine_model_info(g_engine.handle, &model_) == 1;
-
-    spam_engine_decision_input_t din{};
-    spam_engine_decision_input_from_signals(&din, &result_.scores, &signals_);
-    din.profile = SPAM_ENGINE_PROFILE_STANDARD;
-    // The artifact's own spam-side scale. spam_engine_classify_full fills this
-    // itself; a standalone spam_engine_decide caller has to copy it from the
-    // model info, and this one did not: with gen3-v6 (knot 0.8931, the
-    // label-smoothed head's raw spam side tops out near 0.90) every neural
-    // spam verdict on klar.im read as ham at 0.897 while the C API said 0.990.
-    // Public-v0 declares no knot, so the identity map hid it (2026-09-14).
-    din.spam_side_knot = has_model_ ? model_.spam_side_calibration_knot : 0.0;
-    spam_engine_decide(&din, &decision_);
 
     // Distinct link domains for the reputation/explanation panel (EML only).
     if (is_eml_) {
@@ -309,23 +307,34 @@ class ClassifyWorker : public Napi::AsyncWorker {
 
   void OnOK() override {
     Napi::Env env = Env();
+    // The spam slot is the ensemble spam side the fold started from (== the
+    // neural score unless warm FTRL escalated); the others are raw neural.
+    const spam_engine_scores_t& neural = full_.neural_scores;
+    const struct { const char* name; float score; } classes[] = {
+        {"marketing", neural.marketing},
+        {"regular", neural.regular},
+        {"spam", full_.ensemble_spam},
+    };
     Napi::Object scores = Napi::Object::New(env);
-    scores.Set("gibberish", Napi::Number::New(env, result_.scores.gibberish));
-    scores.Set("marketing", Napi::Number::New(env, result_.scores.marketing));
-    scores.Set("regular", Napi::Number::New(env, result_.scores.regular));
-    scores.Set("spam", Napi::Number::New(env, result_.scores.spam));
+    const auto* top = &classes[0];
+    for (const auto& c : classes) {
+      scores.Set(c.name, Napi::Number::New(env, c.score));
+      if (c.score > top->score) top = &c;
+    }
+    const spam_engine_parsed_signals_t& sig = full_.signals;
+    const spam_engine_decision_result_t& fold = full_.decision;
 
     // Sender-authentication + thread signals (zeroed for plain text).
     Napi::Object auth = Napi::Object::New(env);
-    auth.Set("dkimSigningDomain", Napi::String::New(env, signals_.auth.dkim_signing_domain));
-    auth.Set("fromOrgDomain", Napi::String::New(env, signals_.auth.from_org_domain));
-    auth.Set("dmarcAligned", Napi::Boolean::New(env, signals_.auth.dmarc_aligned != 0));
-    auth.Set("signerThrowaway", Napi::Boolean::New(env, signals_.auth.signer_throwaway != 0));
-    auth.Set("displayImpersonation", Napi::Boolean::New(env, signals_.auth.display_impersonation != 0));
+    auth.Set("dkimSigningDomain", Napi::String::New(env, sig.auth.dkim_signing_domain));
+    auth.Set("fromOrgDomain", Napi::String::New(env, sig.auth.from_org_domain));
+    auth.Set("dmarcAligned", Napi::Boolean::New(env, sig.auth.dmarc_aligned != 0));
+    auth.Set("signerThrowaway", Napi::Boolean::New(env, sig.auth.signer_throwaway != 0));
+    auth.Set("displayImpersonation", Napi::Boolean::New(env, sig.auth.display_impersonation != 0));
 
     Napi::Object thread = Napi::Object::New(env);
-    thread.Set("hasInReplyTo", Napi::Boolean::New(env, signals_.thread.has_in_reply_to != 0));
-    thread.Set("referencesCount", Napi::Number::New(env, signals_.thread.references_count));
+    thread.Set("hasInReplyTo", Napi::Boolean::New(env, sig.thread.has_in_reply_to != 0));
+    thread.Set("referencesCount", Napi::Number::New(env, sig.thread.references_count));
 
     Napi::Array urls = Napi::Array::New(env, url_domains_.size());
     for (size_t i = 0; i < url_domains_.size(); ++i) {
@@ -339,19 +348,19 @@ class ClassifyWorker : public Napi::AsyncWorker {
 
     // The structural fold = what Klar actually does with the message.
     Napi::Object decision = Napi::Object::New(env);
-    decision.Set("label", Napi::String::New(env, decision_.label));
-    decision.Set("confidence", Napi::Number::New(env, decision_.confidence));
-    decision.Set("adjustedSpamSide", Napi::Number::New(env, decision_.adjusted_spam_side));
-    decision.Set("condemnOffsetFired", Napi::Boolean::New(env, decision_.condemn_offset_fired != 0));
+    decision.Set("label", Napi::String::New(env, fold.label));
+    decision.Set("confidence", Napi::Number::New(env, fold.confidence));
+    decision.Set("adjustedSpamSide", Napi::Number::New(env, fold.adjusted_spam_side));
+    decision.Set("condemnOffsetFired", Napi::Boolean::New(env, fold.condemn_offset_fired != 0));
 
     Napi::Object out = Napi::Object::New(env);
-    out.Set("class", Napi::String::New(env, spam_engine_label_name(result_.label)));
-    out.Set("confidence", Napi::Number::New(env, result_.confidence));
+    out.Set("class", Napi::String::New(env, top->name));
+    out.Set("confidence", Napi::Number::New(env, top->score));
     out.Set("scores", scores);
     out.Set("isEml", Napi::Boolean::New(env, is_eml_));
     out.Set("signals", signals);
     out.Set("decision", decision);
-    out.Set("decidedBy", Napi::String::New(env, result_.decided_by));
+    out.Set("decidedBy", Napi::String::New(env, full_.decided_by));
     // Null only if the engine refused to describe itself, which is a fault
     // worth seeing rather than papering over with the last model we knew about.
     out.Set("model", has_model_ ? ModelInfoObject(env, model_).As<Napi::Value>() : env.Null());
@@ -363,7 +372,7 @@ class ClassifyWorker : public Napi::AsyncWorker {
     if (debug_) {
       Napi::Object dbg = Napi::Object::New(env);
       dbg.Set("mode", Napi::String::New(env, mode_));
-      dbg.Set("ftrlScore", Napi::Number::New(env, result_.ftrl_score));
+      dbg.Set("ftrlScore", Napi::Number::New(env, full_.ftrl_score));
       out.Set("debug", dbg);
     }
     deferred_.Resolve(out);
@@ -380,9 +389,7 @@ class ClassifyWorker : public Napi::AsyncWorker {
   std::string model_path_;
   std::string mode_;
   bool debug_;
-  spam_engine_result_t result_{};
-  spam_engine_parsed_signals_t signals_{};
-  spam_engine_decision_result_t decision_{};
+  spam_engine_full_result_t full_{};
   spam_engine_model_info_t model_{};
   bool has_model_ = false;
   std::vector<std::string> url_domains_;

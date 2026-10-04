@@ -182,7 +182,7 @@ add_executable(spam_classifier
 
 target_link_libraries(spam_classifier
     PRIVATE
-        spam_engine
+        spam_engine_c_api
 )
 
 # Benchmark harness for engine speed experiments.
@@ -248,6 +248,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/spam_engine_c_api_tests.cpp")
         PRIVATE
             spam_engine
             spam_engine_c_api
+            nlohmann_json::nlohmann_json  # measured-misses.json beside the demo samples
     )
     # The test TU #includes brand_kb.h -> brand_kb_data.h directly, so it must also wait
     # for the generator (linking spam_engine is not enough -- the header is compiled into
@@ -331,6 +332,7 @@ if(GGML_BACKEND_PLUGINS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/backend_is
                 $<TARGET_FILE:spam_classifier>
                 ${CMAKE_CURRENT_SOURCE_DIR}/model
                 ${GGML_BACKEND_DIR}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/demo-samples/ham.en.eml
     )
 endif()
 

@@ -51,7 +51,7 @@ The milter only stamps headers; it never moves mail. Filing is Dovecot's job,
 driven by two headers:
 
 - `X-Klar-Label` (`spam`|`regular`) → spam to Junk.
-- `X-Klar-Class` (`regular`|`marketing`|`gibberish`|`spam`, the 4-class
+- `X-Klar-Class` (`regular`|`marketing`|`spam`, the 3-class
   argmax) → non-spam marketing to a Marketing folder, so users get a
   Gmail-style "Promotions" split without losing anything to Junk. The spam
   label wins: a spam-labelled message goes to Junk even if its class was
@@ -95,7 +95,43 @@ enforces at SMTP time with `SenderAuth.dmarcVerify = "strict"`. The full
 Stalwart setup, including the Sieve that files on `X-Klar-Label`, is in
 `stalwart/README.md`.
 
-## Quick Start
+## Install
+
+One command on Linux x86_64 or arm64 with systemd, from the prebuilt release
+binaries (glibc 2.35 or newer on x86_64, 2.39 on arm64; every other library
+is bundled):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/klar-im/engine/main/install.sh | sudo KLAR_MTA=postfix KLAR_ACCEPT_MODEL_LICENSE=1 sh
+```
+
+It installs `klar-milterd` and `klar-policy-cli` into `/opt/klar/bin`, creates
+the `klarmilter` user, writes `/etc/klar/klar-milterd.toml` from
+`config/example.toml` if there is none (`KLAR_MTA=postfix` picks it; without
+it you get the Stalwart config), fetches the model into `/var/lib/klar/model`
+after `KLAR_ACCEPT_MODEL_LICENSE=1` records that you accept its CC-BY-NC-4.0
+licence, enables and starts the unit from `packaging/klar-milterd.service`, and
+waits for `/readyz`. It ends by printing the `main.cf` lines
+(`packaging/postfix-main.cf.snippet`; put the milter after OpenDKIM/OpenDMARC,
+see the ordering section above), then `postfix reload`. The filing Sieve is at
+`/opt/klar/share/postfix/klar.sieve`. Run it again to upgrade; your config is
+kept. `KLAR_VERSION=v0.2.0` pins a release.
+
+Or the container (linux/amd64 and linux/arm64, no weights; the model is
+fetched into the volume on first start). It ships the Stalwart-shaped config,
+so mount your own Postfix one over it:
+
+```bash
+docker run -d --name klar-milterd --restart unless-stopped -e KLAR_ACCEPT_MODEL_LICENSE=1 \
+  -v klar-data:/var/lib/klar -v /etc/klar/klar-milterd.toml:/etc/klar/klar-milterd.toml:ro \
+  -p 127.0.0.1:8891:8891 -p 127.0.0.1:8892:8892 ghcr.io/klar-im/klar-milterd:latest
+```
+
+In that file, `listen = "inet:8891@0.0.0.0"` and `health_listen = "0.0.0.0:8892"`
+with `health_allow_public = true`, since the container's loopback is not the
+host's.
+
+## Build from source
 
 ```bash
 make postfix/setup    # Install deps, build engine
@@ -116,48 +152,9 @@ make postfix/test-e2e       # Docker: full Postfix + Dovecot + milter pipeline
 make postfix/test-stress    # Docker: random SMTP sessions, leak detection
 ```
 
-### Staging MX (postfix.klar.im): real internet mail, continuously
-
 The Docker E2E is hermetic: canned fixtures, no DNS/MX hop, and the
 Authentication-Results the engine trusts are fixture-carried, never computed.
-The staging MX closes that gap with real mail on the prod VPS:
-
-```
-  internet ──▶ Stalwart :25 (owns the port) ──relay postfix.klar.im──▶ pod 10.88.0.200:25
-                                                                          │
-                                              klar-staging podman pod: Postfix
-                                              (+ OpenDKIM/OpenDMARC verify+stamp)
-                                              ──▶ klar-milterd ──▶ Dovecot
-```
-
-- DNS: `postfix.klar.im` A record → the VPS (implicit MX). Stalwart accepts
-  the domain at RCPT and relays it to the pod (`infra/scripts/
-  stalwart-setup.sh` section 2.9).
-- The pod's Postfix strips inbound `Authentication-Results` and runs
-  OpenDKIM + OpenDMARC ahead of klar-milterd, so the AR chain the engine
-  reads is computed on the box: the "Required ordering" above, for real.
-- An hourly probe (a systemd timer on the staging box; the rig is ours and
-  not in this tree) runs five
-  legs: a signed ham must land in INBOX with `dkim=pass` computed here; a
-  KB-brand From-forgery with no DKIM must land in Junk with `dmarc=fail`; a
-  promo-shaped message must be filed to Marketing via `X-Klar-Class`; a
-  blocklisted envelope sender must be refused 550 at end-of-data; and moving
-  the ham to Junk must record an imapsieve feedback row in the event store.
-  Success pings healthchecks.io (`klar-postfix-probe`); a silent stack pages
-  within two beats.
-- Known fidelity artifact: the relay hop connects from the podman bridge
-  gateway (10.88.0.1), so `spf=` at our hop reflects that hop, not the
-  original client. DMARC still evaluates correctly via DKIM alignment.
-  (The pod has a static bridge IP because Stalwart's outbound relay refuses
-  loopback targets.)
-
-```bash
-make postfix/staging-deploy   # rsync + build on the VPS + (re)start pod + timer
-make postfix/staging-probe    # run one probe now, print the journal
-```
-
-PR CI stays hermetic and credential-free (`linux-gate.yml`); the staging
-box tests deployment truth on a schedule instead of per-PR.
+Run the milter on a real MX before you trust it with production mail.
 
 ### Training
 
@@ -172,9 +169,9 @@ See `config/example.toml` for a documented production config. Key settings:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `mode` | `tag` | tag / reject |
-| `profile` | `standard` | cautious (0.70) / standard (0.50) / aggressive (0.30) |
+| `profile` | `standard` | cautious / standard / aggressive: the product's three gates on the calibrated, offset-adjusted spam side (0.995 / 0.99 / 0.95, `engine/decision_layer.h` `kThreshold*`, the same numbers the Mac app applies; the milter reads them through `decision_profiles.h` and carries none of its own) |
 | `fail_open` | `true` | Accept mail on engine failure |
-| `reject_threshold` | `0.99` | Calibrated spam side (the artifact's knot on the 0.99 gate, before offsets) at or above which reject mode may bounce, together with a structural condemn. 0.99 is the gate itself; a label-smoothed head never reads above 0.9906 here |
+| `reject_threshold` | `0.995` (`example.toml` sets `0.99`) | Calibrated spam side (the artifact's knot on the 0.99 gate, before offsets) at or above which reject mode may bounce, together with a structural condemn. 0.99 is the gate itself; a label-smoothed head never reads above 0.9906 here |
 | `ip_blocklist_path` | `/var/lib/klar/model/ip_blocklist.bin` | Spamhaus DROP netblocks; empty disables the origin-IP signal |
 | `ip_blocklist_max_age_days` | `14` | Age past which the loaded list is reported stale |
 | `trusted_relay_cidrs` | `[]` | Relay hops you operate; enables reading the origin from `Received` |
@@ -200,9 +197,9 @@ the accepting hop can write at will.
 
 #### Behind a relay
 
-A milter behind a relay never sees the internet: our own staging MX is exactly
-that shape (Stalwart owns `:25` and relays into the Postfix pod, so
-`xxfi_connect` reports the podman bridge gateway `10.88.0.1`) and the check above
+A milter behind a relay never sees the internet: a Postfix container behind
+another MTA is exactly that shape (the front MTA owns `:25` and relays into the
+container, so `xxfi_connect` reports the bridge gateway) and the check above
 is inert there. Set `trusted_relay_cidrs` to the ranges you operate and the daemon
 walks the `Received` chain instead: skip hops that are yours, take the first that
 is not. That hop was written by a host you trust; everything below it is

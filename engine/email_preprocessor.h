@@ -18,9 +18,9 @@ struct ExtractedThreadFeatures {
   std::string self_message_id;   // own Message-ID:, brackets stripped (for Phase 2 DB)
 };
 
-// Sender-authentication signals parsed from the receiving MTA's topmost
-// Authentication-Results header (the one our trusted hop added — a spammer can
-// inject lower A-R headers but not the top). The DKIM *signing domain*
+// Sender-authentication signals parsed from the receiving MTA's
+// Authentication-Results, as edge_authentication_results (email_preprocessor.cpp)
+// reads them: the trusted hop's run of headers, never the sender's. The DKIM *signing domain*
 // (header.d / header.i) is the domain that cryptographically signed the
 // message: unforgeable, unlike a From-header suffix. The Swift
 // SenderAuthClassifier uses it as a soft decision-layer offset — a free-hosting
@@ -48,7 +48,7 @@ struct ExtractedAuthFeatures {
   // offline reference implementation.
   bool        signer_throwaway = false;
   // The From DISPLAY NAME claims a distinctive Tranco brand the From org-domain
-  // is NOT (e.g. display "Scaleway", From depilacionlasercanarias.com) — the
+  // is NOT (e.g. display "Scaleway", From a compromised clinic's domain) — the
   // display-name impersonation tell. Precision-first (dictionary-filtered brand
   // names): measured 0/51 ham FP, catches the Scaleway/LeroyMerlin phish
   // (TASK-214). Kept in sync with the Swift mirror.
@@ -127,7 +127,7 @@ struct PreprocessedEmail {
   std::string structural_marker_prefix;
   // True if the message has a Reply-To header that differs from the From
   // header. Common spam pattern (legitimate senders rarely need to differ).
-  // Surfaced via CustomerInfo so the head can learn from it; see
+  // Surfaced via SenderInfo so the head can learn from it; see
   // engine/PARITY_PLAN.md for the full list of planned signals.
   bool replyto_differs = false;
   // Recipient identifiers (To/Cc/Bcc/Delivered-To/Envelope-To/X-Original-To

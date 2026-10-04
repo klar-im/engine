@@ -34,7 +34,27 @@ hostname and domain, then restart.
 
 ### 1. The milter
 
-Build from source on the host (Ubuntu/Debian shown; `make setup` prints the
+One command on the host, Linux x86_64 or arm64 with systemd:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/klar-im/engine/main/install.sh | sudo KLAR_ACCEPT_MODEL_LICENSE=1 sh
+```
+
+It downloads the latest release's prebuilt tarball for your architecture and
+checks its sha256, installs the daemon and its bundled libraries into
+`/opt/klar/bin` (glibc 2.35 or newer on x86_64: Debian 12, Ubuntu 22.04 and
+later; 2.39 on arm64: Debian 13, Ubuntu 24.04; older hosts use the container
+below), this directory's scripts, config and Sieve into
+`/opt/klar/share/stalwart`, creates the `klarmilter` user, writes
+`/etc/klar/klar-milterd.toml` from `config/klar-milterd.toml` if there is
+none, fetches the model into `/var/lib/klar/model`, enables and starts the
+`klar-milterd` unit, and waits for `/readyz`. It needs `curl`, `python3` and
+`sha256sum`. Run it again to upgrade: your config is kept and model files that
+already match are not downloaded again. `KLAR_VERSION=v0.2.0` pins a release.
+The binaries are built by this repo's CI from the tagged tree; `install.sh` is
+at the repo root if you want to read it first.
+
+Or build from source on the host (Ubuntu/Debian shown; `make setup` prints the
 package list for others):
 
 ```bash
@@ -51,14 +71,20 @@ sudo systemctl enable --now klar-milterd
 curl -fsS http://127.0.0.1:8892/readyz                     # "ok" once the model is loaded
 ```
 
-Or the container, which builds the same binary and fetches the same model into
-its volume on first start (the image carries no weights):
+Or the container, built from the same tree by this repo's CI for linux/amd64
+and linux/arm64 (docker pulls the right one); it fetches the same model into
+its volume on first start and carries no weights itself:
 
 ```bash
-docker build -f postfix/docker/Dockerfile -t klar-milterd .
-docker run -d --name klar-milterd -e KLAR_ACCEPT_MODEL_LICENSE=1 \
-  -v klar-data:/var/lib/klar -p 8891:8891 -p 127.0.0.1:8892:8892 klar-milterd
+docker run -d --name klar-milterd --restart unless-stopped -e KLAR_ACCEPT_MODEL_LICENSE=1 \
+  -v klar-data:/var/lib/klar -p 127.0.0.1:8891:8891 -p 127.0.0.1:8892:8892 \
+  ghcr.io/klar-im/klar-milterd:latest
 ```
+
+The ports are bound to loopback for a Stalwart on the same host. When Stalwart
+runs in a container too, put both on one Docker network instead and pass
+`--milter-host klar-milterd` to `apply.py`; never publish 8891 to the internet.
+`postfix/docker/Dockerfile` builds the same image locally.
 
 The model is licensed separately from the code (`LICENSE-MODEL.md`:
 CC-BY-NC-4.0, free for non-commercial use with attribution, a paid licence for
@@ -104,6 +130,10 @@ reloads settings once if anything changed:
 export STALWART_URL=http://127.0.0.1:8080 STALWART_USER=admin STALWART_PASSWORD=...   # as for stalwart-cli
 python3 stalwart/scripts/apply.py --milter-host 127.0.0.1 --milter-port 8891           # --dry-run to see the plan
 ```
+
+The installer put the same script at `/opt/klar/share/stalwart/scripts/apply.py`
+(and `sieve_activate.py` beside it, for step 3); it reads the config and Sieve
+next to it, so either path applies the same objects.
 
 `STALWART_CLI=/path/to/stalwart-cli` if it is not on `PATH`. A milter has no
 name in Stalwart, so its endpoint is its identity: when the milter moves (a

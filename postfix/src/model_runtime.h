@@ -3,8 +3,7 @@
 #include <mutex>
 #include <string>
 
-// Forward declare - we include the C header in .cpp only
-typedef struct spam_engine_handle spam_engine_handle_t;
+#include "../../engine/spam_engine_c_api.h"  // spam_engine_profile_t, the handle
 
 namespace klar {
 
@@ -14,9 +13,8 @@ struct ClassifyResult {
     float spam = 0;
     float regular = 0;
     float marketing = 0;
-    float gibberish = 0;
     // Spam-side confidence after the engine decision layer folds the structural
-    // offsets (spam+gibberish + free-host/throwaway DKIM-signer push − thread-header
+    // offsets (spam + free-host/throwaway DKIM-signer push − thread-header
     // ham bias), clamped to [0,1] — the SAME value the Apple extension thresholds on
     // (TASK-179). Drives the junk/tag decision.
     float adjusted_spam = 0;
@@ -55,12 +53,18 @@ public:
     // origin recovered from the Received chain behind a trusted relay, which
     // carries a weaker offset (TASK-387). No defaults: the first is condemn-
     // capable, so a new call site must decide what it observed rather than
-    // silently inherit "false" (TASK-113/231).
+    // silently inherit "false" (TASK-113/231). `profile` is the policy in
+    // force for THIS message (EffectivePolicy::engine_profile from
+    // resolve_policy: the global one or the recipient domain's), handed in
+    // per call rather than cached at load so a config reload or a per-domain
+    // profile reaches the fold; the engine folds and marks flips at that
+    // gate, the same one policy.cpp thresholds the label at (TASK-510).
     ClassifyResult classify_rfc822(const std::string& raw_email,
                                    const std::string& sender_name,
                                    const std::string& sender_email,
                                    bool connect_ip_blocked,
-                                   bool header_ip_blocked);
+                                   bool header_ip_blocked,
+                                   spam_engine_profile_t profile);
     std::string loaded_model_version() const;
     uint64_t generation() const;
     bool is_loaded() const;

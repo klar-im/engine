@@ -1,11 +1,23 @@
 #pragma once
 
+// The Klar engine's C ABI, in two sections:
+//
+//   Product ABI      what a shipping consumer calls: the Mail extension and
+//                    Klar Plus (Swift), the milter, spamd, the demo addon.
+//                    A verdict is ONE call, spam_engine_classify_full.
+//   Measurement ABI  at the end of this file: what only model-lab and the
+//                    engine's tests call, to measure the pipeline piecewise.
+//
+// `make engine/shape` lists the callers of every function here.
+
 #include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// ════ Product ABI ═══════════════════════════════════════════════════════════
 
 typedef struct spam_engine_handle spam_engine_handle_t;
 
@@ -15,8 +27,10 @@ typedef enum spam_engine_status {
   SPAM_ENGINE_STATUS_RUNTIME_ERROR = 2,
 } spam_engine_status_t;
 
+// The three classes of the product taxonomy. A legacy 4-label artifact
+// (public-v0) also scores "gibberish"; the engine adds that probability to
+// `spam`, the side it always counted toward, so this struct never carries it.
 typedef struct spam_engine_scores {
-  float gibberish;
   float marketing;
   float regular;
   float spam;
@@ -24,35 +38,31 @@ typedef struct spam_engine_scores {
 
 // `label`/`confidence` are the engine's DELIVERY DECISION — not the semantic
 // argmax. `label` is only ever spam or regular: the decision layer folds the
-// neural classes into junk-vs-deliver (gibberish/marketing → deliver=regular
-// unless spam-like — see decision_from_scores), and `confidence` is that
-// decision's confidence (e.g. 1 - P(spam)), NOT scores[label]. `scores` holds
-// the stable four-slot semantic envelope; a loaded model may have fewer
-// physical rows, in which case unavailable semantics are zero. Take its argmax
-// for the predicted class (which CAN be marketing/gibberish, unlike label). A
-// "show me the classifier" UI should
-// display argmax(scores); a "should this be junked" caller uses label.
+// neural classes into junk-vs-deliver (marketing → deliver=regular unless
+// spam-like — see decision_from_scores), and `confidence` is that decision's
+// confidence (e.g. 1 - P(spam)), NOT scores[label]. `scores` holds the stable
+// three-slot semantic envelope; a loaded model may have fewer physical rows, in
+// which case unavailable semantics are zero. Take its argmax for the predicted
+// class (which CAN be marketing, unlike label). A "show me the classifier" UI
+// should display argmax(scores); a "should this be junked" caller uses label.
 //
 // ENSEMBLE NOTE (TASK-219): in mode="ensemble", FTRL is folded ESCALATE-ONLY —
 // `scores.spam` = max(neural, w*ftrl + (1-w)*neural), i.e. FTRL can only RAISE
 // the spam side (catch personalized spam), never lower it. So scores.spam == raw
 // neural whenever FTRL was not more suspicious than the neural head (the common
 // day-0 case); it is the blended value only when FTRL escalated (decided_by then
-// = "ftrl+neural"). gibberish/marketing/regular stay raw neural, so the four
+// = "ftrl+neural"). marketing/regular stay raw neural, so the three
 // values are NOT a normalized softmax and do not sum to 1. That spam side is what
-// feeds spam_engine_decide. In mode="neural" (or cold FTRL) `scores` is the pure
+// feeds the decision fold. In mode="neural" (or cold FTRL) `scores` is the pure
 // neural distribution in that stable envelope and `ftrl_score` is -1.
 typedef struct spam_engine_result {
-  int label;             // decision: spam or regular only (never marketing/gibberish)
+  int label;             // decision: 3=spam or 2=regular only (1=marketing and
+                         // 0=gibberish complete the label numbering, never set)
   float confidence;      // confidence in the DECISION (not scores[label])
   spam_engine_scores_t scores;  // stable semantic envelope; see note
   char decided_by[32];  // "ftrl", "neural", "ftrl+neural", etc.
   float ftrl_score;     // FTRL P(spam), -1 if FTRL not available
 } spam_engine_result_t;
-
-// Canonical name for a result label (0=gibberish, 1=marketing, 2=regular,
-// 3=spam, else "unknown"). Returns a static string literal — never free it.
-const char* spam_engine_label_name(int label);
 
 // Structural conversation-thread signals (see extract function below for the
 // full contract). Defined here because classify_rfc822 fills these from its own
@@ -79,8 +89,8 @@ typedef struct spam_engine_auth_features {
                                   // sending domain, receiver-verified dmarc=pass,
                                   // not a shared platform (TASK-337/334 rescue)
   // APPENDED (TASK-440), never inserted: this struct crosses the C ABI.
-  int  dmarc_pass;                // 0 or 1 — the topmost Authentication-Results
-                                  // says dmarc=pass, for any sender. Looser than
+  int  dmarc_pass;                // 0 or 1: the receiving MTA's Authentication-
+                                  // Results say dmarc=pass, for any sender. Looser than
                                   // dmarc_aligned: a message aligned via SPF
                                   // rather than DKIM passes here and not there.
 } spam_engine_auth_features_t;
@@ -194,16 +204,7 @@ spam_engine_status_t spam_engine_load(
     const char* model_path,
     float learning_rate,
     const char* ftrl_path);
-
-// Load with an explicit GGUF encoder path (overrides the default derived from model_path).
-spam_engine_status_t spam_engine_load_ggml(
-    spam_engine_handle_t* handle,
-    const char* model_path,
-    const char* gguf_model_path,
-    float learning_rate,
-    const char* ftrl_path);
 spam_engine_status_t spam_engine_unload(spam_engine_handle_t* handle);
-int spam_engine_is_loaded(const spam_engine_handle_t* handle);
 
 // Embedding dimension (float count) of the loaded model, or 0 if the handle is
 // NULL or not loaded. FIXED for the lifetime of the loaded model, so callers
@@ -212,10 +213,71 @@ int spam_engine_is_loaded(const spam_engine_handle_t* handle);
 // per-call sizing dance.
 int spam_engine_n_embd(const spam_engine_handle_t* handle);
 
-// Actual encoder backend after load: 1 when GPU offload is active, 0 for CPU,
-// fallback, NULL, or an unloaded handle. This is runtime evidence, not merely
-// the absence of SPAM_ENGINE_NO_GPU.
-int spam_engine_uses_gpu(const spam_engine_handle_t* handle);
+// ── Runtime info (TASK-505 L) ───────────────────────────────────────────────
+// The backend the encoder ACTUALLY runs on after load, and why it is on CPU
+// when it is. Runtime evidence, not the absence of SPAM_ENGINE_NO_GPU: the
+// engine falls back Metal->CPU silently, and until this a Mac on the fallback
+// classified 5-6x slower per email with nothing to say so.
+//
+// Same shape as spam_engine_model_info: one fixed-size struct, one call, so a
+// support mail, a log line, the benchmark and the apps read one record. The
+// size is reported by spam_engine_get_abi_sizes (`runtime_info`).
+typedef struct spam_engine_runtime_info {
+  // ggml's registry name, lower-cased, "MTL" spelled out as "metal". THE one
+  // spelling: apps store it verbatim rather than keeping words of their own.
+  char backend[16];
+  // ggml_backend_dev_description of the device in use ("Apple M1 Pro").
+  char device[64];
+  // Why it is on CPU, by name, the same way: "none" (on the GPU it asked
+  // for, so this is also the "uses GPU" answer), "requested_cpu"
+  // (SPAM_ENGINE_NO_GPU was set), "no_gpu_device" (no GPU-typed device
+  // registered), "context_init_failed" (a GPU refused a context: sandbox,
+  // VM). Spelled once, in engine_runtime.h's encoder_fallback_name.
+  char fallback[24];
+  // The tail of ggml's own log at the moment a GPU context init failed;
+  // empty for every other fallback value.
+  char fallback_detail[256];
+  // The cap in force after any SPAM_ENGINE_MAX_TOKENS override.
+  int max_tokens;
+  // Since load, every sequence the encoder saw: classify (one or two per
+  // message: plain and html are embedded separately), embed_* and training
+  // alike. `truncated` lost tokens to the cap; `failed` threw before an
+  // embedding existed and is counted in neither of the other two. The
+  // per-message figure is `encoder_truncated_sequences` on the full result.
+  uint64_t sequences_embedded;
+  uint64_t sequences_truncated;
+  uint64_t sequences_failed;
+} spam_engine_runtime_info_t;
+
+// Returns 1 and fills *out; returns 0 with out untouched for a NULL handle,
+// a NULL out, or an unloaded handle (same contract as spam_engine_model_info).
+int spam_engine_runtime_info(const spam_engine_handle_t* handle,
+                             spam_engine_runtime_info_t* out);
+
+// ── Log callback ────────────────────────────────────────────────────────────
+// Where the engine's own lines ("[spam_engine] loaded backend=metal ...",
+// the env-override notices) and ggml/llama's native output go. Process-global
+// like ggml_log_set, because the lines written before any handle exists
+// (backend registration) belong to no handle. NULL restores stderr, which is
+// also the default, so a CLI or milter that never calls this reads what it
+// always read. `text` arrives as written, newline included; ggml emits
+// partial lines. The engine's own lines are INFO or WARN; ggml's are DEBUG
+// (its loader prints about 600 lines per model load, measured on gen3-v6)
+// except its WARN and ERROR; a continuation fragment keeps its line's level.
+// The callback runs on the thread that logged, outside the engine's lock, and
+// a NULL install does not wait for a delivery in flight on another thread:
+// `user` must outlive every load or classify that can still log. A caller
+// that detaches must have joined those first.
+typedef enum spam_engine_log_level {
+  SPAM_ENGINE_LOG_DEBUG = 1,
+  SPAM_ENGINE_LOG_INFO = 2,
+  SPAM_ENGINE_LOG_WARN = 3,
+  SPAM_ENGINE_LOG_ERROR = 4,
+} spam_engine_log_level_t;
+
+typedef void (*spam_engine_log_fn)(int level, const char* text, void* user);
+
+void spam_engine_set_log_callback(spam_engine_log_fn fn, void* user);
 
 // What the loaded artifact says it is, so a caller can name the model behind a
 // verdict. Fixed-size buffers, so there is nothing to free.
@@ -240,9 +302,8 @@ typedef struct {
   int structural_markers; // 1 when the artifact opts into marker enrichment
   double spam_side_calibration_knot; // 0 = undeclared (identity). Otherwise the
                           // point on this artifact's spam side that the product's
-                          // Standard gate is mapped onto. A caller driving
-                          // spam_engine_decide itself MUST copy this into the
-                          // decision input's field of the same name.
+                          // Standard gate is mapped onto. spam_engine_classify_full
+                          // applies it; reported so a caller can see that it did.
   int attachment_context; // 1 when the artifact opts into bounded attachment
                           // context prepended to the email. APPENDED: C ABI.
 } spam_engine_model_info_t;
@@ -250,24 +311,14 @@ typedef struct {
 int spam_engine_model_info(const spam_engine_handle_t* handle,
                            spam_engine_model_info_t* out);
 
-// `mode` is REQUIRED (no silent default — TASK-219). One of:
+// THE `mode` ARGUMENT of every classify call is REQUIRED (no silent default —
+// TASK-219). One of:
 //   "ensemble" — neural head + FTRL P(spam) blended into the spam side (the
 //                recommended production mode). FTRL only contributes once warm;
 //                cold/absent FTRL falls back to pure neural.
 //   "neural"   — neural head only; FTRL never consulted (ftrl_score = -1).
 //   "ftrl"     — FTRL only; neural skipped (diagnostic / A-B).
 // NULL, empty, or an unknown value returns SPAM_ENGINE_STATUS_INVALID_ARGUMENT.
-//
-// Example:
-//   spam_engine_result_t r;
-//   spam_engine_classify(h, "hello", NULL, NULL, "ensemble", &r);
-spam_engine_status_t spam_engine_classify(
-    spam_engine_handle_t* handle,
-    const char* text,
-    const char* sender_name,
-    const char* sender_email,
-    const char* mode,
-    spam_engine_result_t* out_result);
 
 // Extract CLS embeddings for raw RFC822 bytes via the canonical pipeline:
 // preprocess + model-declared input calibration + encode. The
@@ -314,35 +365,13 @@ spam_engine_status_t spam_engine_embed_rfc822(
     size_t out_capacity,
     int* out_n_embd);
 
-// Extract a CLS embedding for a free-text input (e.g. synthetic gibberish
-// samples that don't have an RFC822 envelope). Applies the model-declared input
-// format with the supplied sender metadata so the result has the same calibrated
-// shape `embed_rfc822` produces.
-//
-// Use this for training data that isn't email-shaped. For real emails use
-// spam_engine_embed_rfc822 so the GMime preprocessing pipeline runs.
-//
-// out_embedding: caller-allocated buffer of at least out_capacity floats.
-// out_capacity: its capacity (float count); set to spam_engine_n_embd(). If
-//   out_capacity < n_embd the call writes nothing, sets *out_n_embd to the
-//   required dimension, and returns SPAM_ENGINE_STATUS_INVALID_ARGUMENT.
-// out_n_embd: set to the model's embedding dimension.
-spam_engine_status_t spam_engine_embed_text(
-    spam_engine_handle_t* handle,
-    const char* text,
-    const char* sender_name,
-    const char* sender_email,
-    float* out_embedding,
-    size_t out_capacity,
-    int* out_n_embd);
-
 // out_signals: OPTIONAL. When non-NULL, filled with the structural signals
 // (thread + sender-auth) extracted during the same GMime parse this call already
 // does (TASK-173), so the caller doesn't re-parse the message to get them.
 // Zero-initialised first; pass NULL to skip. On any failure status it is left
 // zeroed (safe "no signals" default).
 //
-// `mode` is REQUIRED (see spam_engine_classify): "ensemble" | "neural" | "ftrl".
+// `mode` is REQUIRED (see the note above): "ensemble" | "neural" | "ftrl".
 spam_engine_status_t spam_engine_classify_rfc822(
     spam_engine_handle_t* handle,
     const char* raw_email,
@@ -376,45 +405,7 @@ spam_engine_status_t spam_engine_extract_contribution(
     size_t capacity,
     size_t* out_count);
 
-// Flywheel (TASK-135): the PII-scrubbed body text that extract_contribution
-// hashes — the representative body part with quoted/forwarded recipient-routing
-// headers redacted and inline data: URIs stripped (GMime has already dropped
-// attachments and split real headers). Exposed for auditing the scrub at scale
-// (offline PII harness) — the contribution bag is computed from
-// exactly this text, so anything absent here is absent from the upload.
-//
-// The scrubbed text is written (NOT null-terminated) into out_buf of `capacity`
-// bytes; *out_len is set to the TOTAL byte length. If *out_len > capacity the
-// result was truncated — re-call with a larger buffer. out_buf may be NULL to
-// size first (capacity 0). Returns OK even when truncated; check *out_len.
-spam_engine_status_t spam_engine_scrub_rfc822(
-    spam_engine_handle_t* handle,
-    const char* raw_rfc822,
-    size_t raw_rfc822_len,
-    char* out_buf,
-    size_t capacity,
-    size_t* out_len);
-
 const char* spam_engine_get_last_error(const spam_engine_handle_t* handle);
-
-// HTML -> plain text (no engine handle needed): strips tags and DROPS the
-// content of <script>/<style> elements.
-//
-// Exposed so offline pipelines (training-set construction, LLM labelling) get
-// EXACTLY the text the engine feeds the model. A second implementation in
-// Python did not drop <style> content, so raw CSS entered training data as if
-// it were prose — one rule with two implementations drifts, so there is one.
-//
-// The text is written (NOT null-terminated) into out_buf of `capacity` bytes;
-// *out_len is set to the TOTAL byte length. If *out_len > capacity the result
-// was truncated — re-call with a larger buffer. out_buf may be NULL to size
-// first (capacity 0). Returns OK even when truncated; check *out_len.
-spam_engine_status_t spam_engine_html_to_text(
-    const char* html,
-    size_t html_len,
-    char* out_buf,
-    size_t capacity,
-    size_t* out_len);
 
 // Email body extraction (uses GMime, no engine handle needed).
 typedef struct spam_engine_email_body {
@@ -448,68 +439,6 @@ spam_engine_status_t spam_engine_make_replay_rfc822(
 // Free a string returned by spam_engine_extract_body.
 void spam_engine_free_string(char* str);
 
-// Structural conversation-thread signals (uses GMime, no engine handle needed).
-// Used by the Mail extension as a soft ham bias when an inbound message
-// looks like a reply (presence of In-Reply-To / References, longer
-// References chain). Phase 2 (Message-ID DB) reuses self_message_id and
-// first_reference for bypass-resistant lookups.
-// spam_engine_thread_features_t is defined above (near the result struct) so it
-// can also be filled by spam_engine_classify_rfc822's optional out-param.
-//
-// Buffer sizes are generous for real-world Message-IDs (RFC 5322 has no hard
-// limit but production IDs are typically <128 chars). Over-long values are
-// stored as the empty string (treated as absent).
-//
-// Extract structural thread features from RFC822 data. Returns 0 on success,
-// non-zero on parser failure. Even on parser failure, out_features is
-// zero-initialised so callers can treat "no features" as a safe default.
-int spam_engine_extract_thread_features(
-    const char* raw_email,
-    size_t raw_email_len,
-    spam_engine_thread_features_t* out_features);
-
-// Sender-authentication features parsed from the topmost Authentication-Results
-// header. dkim_signing_domain is the cryptographically-asserted DKIM signing
-// org-domain (header.d/.i) — empty if no dkim=pass. dmarc_aligned is 1 when
-// dmarc=pass AND the signing org-domain equals the From org-domain. See
-// TASK-122; the Swift SenderAuthClassifier turns a free-hosting signer into a
-// soft spam offset. spam_engine_auth_features_t is defined above (near the
-// result struct) so it can also be filled by classify_rfc822's optional out-param.
-//
-// Extract sender-authentication features from RFC822 data. Returns 0 on
-// success, non-zero on parser failure. out_features is zero-initialised even on
-// failure so callers can treat "no features" as a safe default (no offset).
-int spam_engine_extract_auth_features(
-    const char* raw_email,
-    size_t raw_email_len,
-    spam_engine_auth_features_t* out_features);
-
-// Extract the structural BODY features (GTUBE, callback shape, no-contact
-// instruction) from RFC822 data. No model handle is needed, which is the whole
-// point: the parity harnesses that decide whether a body predicate may ship have
-// to run it over tens of thousands of messages, and going through classify_full
-// costs a full inference per message (~85 ms, so ~37 minutes on the ham panels).
-// A check that slow is a check nobody runs, and the repo has the scars to prove
-// it. The sibling of spam_engine_extract_auth_features, with the same contract:
-// returns 0 on success, non-zero on parser failure, and out_features is
-// zero-initialised even on failure so "no features" is a safe default.
-int spam_engine_extract_body_features(
-    const char* raw_email,
-    size_t raw_email_len,
-    spam_engine_body_features_t* out_features);
-
-// Parse RFC822 attachments and return the exact bounded context an artifact
-// declaring attachment_context=true receives. No model handle is needed. The
-// text is written without a terminator; size-first/truncation contract matches
-// spam_engine_html_to_text. `out_features` is optional and zeroed first.
-spam_engine_status_t spam_engine_extract_attachment_context(
-    const char* raw_email,
-    size_t raw_email_len,
-    spam_engine_attachment_features_t* out_features,
-    char* out_buf,
-    size_t capacity,
-    size_t* out_len);
-
 // Newline-delimited list of the distinct eTLD+1 domains of every http(s) URL in
 // the body (TASK-201 link reputation; uses GMime, no engine handle needed). The
 // caller frees the result with spam_engine_free_string. Returns "" (empty, still
@@ -526,12 +455,13 @@ char* spam_engine_extract_url_domains(const char* raw_email, size_t raw_email_le
 // That happened (three fields added across TASK-113/388/391 with no mirror
 // update). So the engine reports its own sizes and mirrors assert against them.
 //
-// Adding a struct here means adding a field here AND bumping `field_count`, which
-// is itself checked, so a forgotten entry fails rather than passes.
+// `field_count` is every uint32_t after itself (sizes and offsets alike), so
+// the engine derives it from sizeof, a Python mirror from its own field list,
+// and the Node addon from the header it compiled against: a field added on one
+// side alone goes red. The C test pins the literal, which is its job.
 typedef struct spam_engine_abi_sizes {
-  uint32_t field_count;        // number of size fields that follow
+  uint32_t field_count;        // number of uint32_t fields that follow
   uint32_t parsed_signals;
-  uint32_t decision_input;
   uint32_t decision_result;
   uint32_t caller_state;
   uint32_t full_result;
@@ -551,106 +481,28 @@ typedef struct spam_engine_abi_sizes {
   uint32_t caller_state_profile;
   uint32_t caller_state_connect_ip_blocked;
   uint32_t caller_state_attachment_risk_enabled;
+  uint32_t runtime_info;  // appended (TASK-505 L); counted in field_count
+  uint32_t caller_state_replied_to_own_sent;  // appended 2026-09-24
+  uint32_t caller_state_header_ip_blocked;    // appended (TASK-540)
 } spam_engine_abi_sizes_t;
 
 // Fills *out with sizeof() for each ABI struct, as this build sees them.
 void spam_engine_get_abi_sizes(spam_engine_abi_sizes_t* out);
 
 // ── Structural decision layer (TASK-179) ────────────────────────────────────
-// Folds the soft structural offsets onto the model's spam-side confidence and
-// applies the filtering-profile threshold, returning the SAME verdict the Apple
-// extension's ClassificationService produces. Pure arithmetic — no engine
-// handle, no model, no parse. Lets the postfix milter / Stalwart plugin / CLI
-// reach an identical decision instead of shipping the engine's raw gate.
-//
-// The engine-derived inputs (thread headers, DKIM signer) come from
-// spam_engine_extract_*; the caller-state inputs (Message-ID DB hit,
-// send-counts) come from the consumer's local store — pass 0 when it has none
-// (the milter), which simply means those ham-ward offsets don't fire.
+// spam_engine_classify_full folds the soft structural offsets onto the model's
+// spam-side confidence and applies the filtering-profile threshold, returning
+// the SAME verdict the Apple extension's ClassificationService produces, so the
+// milter, spamd and the demo reach an identical decision instead of shipping
+// the engine's raw gate. The fold itself is internal (decision_input.h).
 
 typedef enum spam_engine_profile {
   SPAM_ENGINE_PROFILE_STANDARD = 0,
   SPAM_ENGINE_PROFILE_CAUTIOUS = 1,
   SPAM_ENGINE_PROFILE_LEARNING = 2,  // forces the cautious threshold
+  SPAM_ENGINE_PROFILE_AGGRESSIVE = 3,  // the product's third profile (0.95); appended,
+                                       // so the three values above keep their ABI
 } spam_engine_profile_t;
-
-typedef struct spam_engine_decision_input {
-  spam_engine_scores_t scores;   // stable semantic envelope (from classify)
-  const char* ml_label;          // model's spam-side DECISION: "spam" or "regular"
-                                 // (not a raw argmax; == the engine's binary label)
-  double ml_confidence;          // model confidence, used on the non-spam keep path
-  // Engine-derived (from the parsed message):
-  int has_in_reply_to;           // 0 or 1
-  int references_count;          // 0..N
-  const char* dkim_signing_org_domain;  // eTLD+1; NULL/"" if none
-  int signer_throwaway;          // 0 or 1
-  int display_impersonation;     // 0 or 1 — From display impersonates a brand (TASK-214)
-  int raw_ip_url;                // 0 or 1: a body link's host is a bare IP literal (TASK-257)
-  int kb_brand_dmarc_pass;       // 0 or 1 — receiver-verified KB-brand sender (TASK-337/334)
-  // Caller-OBSERVED transport fact (not derivable from the message); pass 0 if
-  // unavailable:
-  int connect_ip_blocked;        // 0 or 1 — the IP that CONNECTED to this MTA sits
-                                 // in a Spamhaus DROP netblock (TASK-113). Set it
-                                 // only from an address the caller observed itself
-                                 // (a milter's xxfi_connect argument), never from a
-                                 // Received header: below the accepting MTA's own
-                                 // line those are attacker-written, and this offset
-                                 // is condemn-capable. See ip_blocklist.h.
-  // Caller-state (local DBs); pass 0 if unavailable:
-  int phase2_match;              // Message-ID DB hit (0 or 1)
-  int exact_send_count;          // user's outbound count to this exact address
-  int domain_send_count;         // ...to this domain
-  int profile;                   // spam_engine_profile_t
-  // APPENDED, never inserted: this struct crosses the C ABI, so a new field goes
-  // after the current last member — slotting one in beside the signals it belongs
-  // with would make a not-yet-rebuilt consumer misread every field after it.
-  int header_ip_blocked;         // 0 or 1 — the same DROP hit, but on an origin
-                                 // recovered from the Received chain behind a
-                                 // TRUSTED relay (TASK-387). A SEPARATE field on
-                                 // purpose, carrying a weaker magnitude: a caller
-                                 // must not be able to launder header evidence
-                                 // into the condemn-capable one above.
-  int gtube_test;                // 0 or 1 — the GTUBE test string is present, so
-                                 // this message is an operator verifying the
-                                 // filter is live. Condemn-capable by definition,
-                                 // not by measurement: the string exists so that
-                                 // "did my filter see this?" has an answer that
-                                 // does not depend on the model. See
-                                 // decision_layer.h.
-  double spam_side_knot;         // 0 (or >= 1) = undeclared, the identity map and
-                                 // what public-v0 uses. Otherwise the point on
-                                 // THIS artifact's spam side that means the same
-                                 // thing the product's Standard gate means, and
-                                 // the engine maps it onto that gate. Set from
-                                 // classifier_config.json's
-                                 // spam_side_calibration_knot by
-                                 // spam_engine_classify_full; a caller invoking
-                                 // spam_engine_decide standalone must pass the
-                                 // loaded artifact's value from
-                                 // spam_engine_model_info, or it will threshold a
-                                 // successor's scores on public-v0's scale. See
-                                 // decision_layer.h calibrate_spam_side.
-  int attachment_disguised_executable;  // decoded dangerous bytes presented as harmless
-  int archive_disguised_executable;     // same, one bounded archive level down
-  int attachment_dangerous_type;        // plainly named or detected executable/script
-  int archive_dangerous_type;           // same, within an archive
-  int attachment_risk_enabled;          // experiment opt-in; default 0
-  int dmarc_pass;                // 0 or 1 - the receiver said dmarc=pass. Read by
-                                 // the callback-shape offset, which must not fire
-                                 // on mail the receiver could verify.
-  int callback_shape;            // 0 or 1 - brand-independent callback phishing
-                                 // (TASK-440): billing language, a number to
-                                 // call, no link anywhere. Appended here rather
-                                 // than beside raw_ip_url where it belongs
-                                 // semantically, because this struct crosses the
-                                 // C ABI and the rule above is not advisory.
-  int no_contact_instruction;    // 0 or 1 - the body tells the recipient NOT to
-                                 // check with their bank (TASK-460). Read by the
-                                 // no-contact offset, which like the callback
-                                 // shape must not fire on mail the receiver
-                                 // could verify. Appended for the same ABI
-                                 // reason as callback_shape above.
-} spam_engine_decision_input_t;
 
 typedef struct spam_engine_decision_result {
   char label[16];                // final label, NUL-terminated
@@ -663,7 +515,7 @@ typedef struct spam_engine_decision_result {
   // raw-IP corroborator (TASK-257) fires but deliberately does NOT set this: it
   // must never authorize a bounce on its own.
   //
-  // The authoritative set is a NAMED ALLOWLIST in spam_engine_decide --
+  // The authoritative set is a NAMED ALLOWLIST in the fold (decision_input.h) --
   // sender_auth, display_impersonation, gtube_test, connect_ip_drop -- not a
   // magnitude test. It was a magnitude test until TASK-347 added a 0.99
   // experimental offset that may junk but must never authorize a bounce, which
@@ -698,39 +550,20 @@ typedef struct spam_engine_decision_result {
   double calibrated_spam_side;
 } spam_engine_decision_result_t;
 
-// Fill the engine-derived fields of *din from a classification's scores and
-// parsed signals: copies scores, computes ml_label/ml_confidence (the model's
-// spam-side decision from the scores, matching the engine and Swift, not a raw
-// argmax -- TASK-251 C5), and maps the thread/auth signal fields. Leaves the caller-state
-// fields (phase2_match, exact/domain_send_count, profile) untouched; the caller
-// owns those. No-op if any pointer is NULL.
-//
-// The single place this fold is assembled, shared by every consumer of the engine
-// (milter, /demo addon, classify_full) so a new signal can't be silently dropped
-// on one surface (TASK-231). din->dkim_signing_org_domain points into *signals,
-// which must outlive the subsequent spam_engine_decide() call.
-void spam_engine_decision_input_from_signals(
-    spam_engine_decision_input_t* din,
-    const spam_engine_scores_t* scores,
-    const spam_engine_parsed_signals_t* signals);
-
-// Returns SPAM_ENGINE_STATUS_OK and fills *out, or
-// SPAM_ENGINE_STATUS_INVALID_ARGUMENT if in/out is NULL.
-int spam_engine_decide(const spam_engine_decision_input_t* in,
-                       spam_engine_decision_result_t* out);
-
 // ── Single self-evident pipeline entrypoint (TASK-219) ──────────────────────
 // Runs the WHOLE verdict in one call: FTRL P(spam) → neural head → ensemble
-// blend → structural decision-layer fold. Replaces the error-prone two-call
-// dance (spam_engine_classify_rfc822 + spam_engine_decide) that let a caller
-// silently drop the structural layer (the /demo did exactly that pre-TASK-218).
-// Reports each stage so the pipeline is inspectable rather than hidden.
+// blend → structural decision-layer fold. The only verdict path: the two-call
+// dance it replaced (classify_rfc822 + a hand-assembled decide) let a caller
+// silently drop the structural layer (the /demo did exactly that pre-TASK-218)
+// and later fold a calibrated model on the raw scale, so the decide entry
+// points left this header (TASK-540). Reports each stage so the pipeline is
+// inspectable rather than hidden.
 //
 // Caller-state offsets (Message-ID DB hit, send-counts, profile) come from the
-// consumer's local store; pass NULL for `caller_state` (the milter / demo have
-// none) and those ham-ward offsets simply don't fire. Engine-derived offsets
-// (thread headers, DKIM signer) are extracted from the same parse and folded
-// automatically. `mode` is REQUIRED (see spam_engine_classify).
+// consumer's local store; pass NULL for `caller_state` when there is none and
+// those offsets simply don't fire. Engine-derived offsets (thread headers, DKIM
+// signer) are extracted from the same parse and folded automatically. `mode` is
+// REQUIRED (see the `mode` note above).
 typedef struct spam_engine_caller_state {
   int phase2_match;        // Message-ID DB hit (0/1)
   int exact_send_count;    // user's outbound count to this exact address
@@ -739,9 +572,24 @@ typedef struct spam_engine_caller_state {
   int connect_ip_blocked;  // the IP that CONNECTED to this MTA is in a Spamhaus
                            // DROP netblock (0/1, TASK-113). A server-side
                            // consumer only: set it from an address you OBSERVED,
-                           // never from a Received header. See the field of the
-                           // same name in spam_engine_decision_input_t.
+                           // never from a Received header: below the accepting
+                           // MTA's own line those are attacker-written, and this
+                           // offset is condemn-capable. See ip_blocklist.h.
   int attachment_risk_enabled; // default-off deterministic attachment experiment
+  int replied_to_own_sent; // the Phase-2 hit was on the user's OWN OUTBOUND
+                           // Message-ID, not merely a parent we classified as
+                           // ham. A strict subset of phase2_match, and the only
+                           // one allowed to veto the display-impersonation
+                           // condemn: phase2_match is also set by a parent WE
+                           // classified as ham, which an attacker manufactures
+                           // by sending one benign message and replying to it.
+                           // APPENDED, like every field here: the struct crosses
+                           // the C ABI and an insert shifts every offset after it.
+  int header_ip_blocked;   // the same DROP hit on an origin recovered from the
+                           // Received chain behind a TRUSTED relay (0/1,
+                           // TASK-387). Its own field with a weaker offset, so
+                           // header evidence can never be laundered into
+                           // connect_ip_blocked's condemn. APPENDED (TASK-540).
 } spam_engine_caller_state_t;
 
 typedef struct spam_engine_full_result {
@@ -757,6 +605,11 @@ typedef struct spam_engine_full_result {
   spam_engine_decision_result_t decision;
   // Engine-derived signals that fed stage 3 (for display / audit).
   spam_engine_parsed_signals_t signals;
+  // How many of this message's encoder sequences the token cap clipped (0, 1
+  // or 2: plain and html embed separately; 0 when the head did not run).
+  // Appended (C ABI: never insert); a consumer built against the older struct
+  // reads everything above it unchanged. TASK-505 L.
+  uint32_t encoder_truncated_sequences;
 } spam_engine_full_result_t;
 
 // Returns SPAM_ENGINE_STATUS_OK and fills *out (zeroed first), or an error
@@ -771,6 +624,148 @@ spam_engine_status_t spam_engine_classify_full(
     const char* mode,
     const spam_engine_caller_state_t* caller_state,
     spam_engine_full_result_t* out);
+
+// ════ Measurement ABI ═══════════════════════════════════════════════════════
+// Called only by model-lab and the engine's tests: the pipeline taken apart so
+// each stage can be measured on its own, at parse speed where no model is
+// needed. No shipping consumer calls these; a verdict is classify_full.
+
+// Classify free text: the model's scores and its own spam/regular call, with
+// no parse and no structural fold. `mode` as in the note above.
+spam_engine_status_t spam_engine_classify(
+    spam_engine_handle_t* handle,
+    const char* text,
+    const char* sender_name,
+    const char* sender_email,
+    const char* mode,
+    spam_engine_result_t* out_result);
+
+// Load with an explicit GGUF encoder path (overrides the default derived from model_path).
+spam_engine_status_t spam_engine_load_ggml(
+    spam_engine_handle_t* handle,
+    const char* model_path,
+    const char* gguf_model_path,
+    float learning_rate,
+    const char* ftrl_path);
+int spam_engine_is_loaded(const spam_engine_handle_t* handle);
+
+// Extract a CLS embedding for a free-text input (e.g. synthetic samples that
+// don't have an RFC822 envelope). Applies the model-declared input format with
+// the supplied sender metadata so the result has the same calibrated shape
+// `embed_rfc822` produces.
+//
+// Use this for training data that isn't email-shaped. For real emails use
+// spam_engine_embed_rfc822 so the GMime preprocessing pipeline runs.
+//
+// out_embedding: caller-allocated buffer of at least out_capacity floats.
+// out_capacity: its capacity (float count); set to spam_engine_n_embd(). If
+//   out_capacity < n_embd the call writes nothing, sets *out_n_embd to the
+//   required dimension, and returns SPAM_ENGINE_STATUS_INVALID_ARGUMENT.
+// out_n_embd: set to the model's embedding dimension.
+spam_engine_status_t spam_engine_embed_text(
+    spam_engine_handle_t* handle,
+    const char* text,
+    const char* sender_name,
+    const char* sender_email,
+    float* out_embedding,
+    size_t out_capacity,
+    int* out_n_embd);
+
+// Flywheel (TASK-135): the PII-scrubbed body text that extract_contribution
+// hashes — the representative body part with quoted/forwarded recipient-routing
+// headers redacted and inline data: URIs stripped (GMime has already dropped
+// attachments and split real headers). Exposed for auditing the scrub at scale
+// (offline PII harness) — the contribution bag is computed from
+// exactly this text, so anything absent here is absent from the upload.
+//
+// The scrubbed text is written (NOT null-terminated) into out_buf of `capacity`
+// bytes; *out_len is set to the TOTAL byte length. If *out_len > capacity the
+// result was truncated — re-call with a larger buffer. out_buf may be NULL to
+// size first (capacity 0). Returns OK even when truncated; check *out_len.
+spam_engine_status_t spam_engine_scrub_rfc822(
+    spam_engine_handle_t* handle,
+    const char* raw_rfc822,
+    size_t raw_rfc822_len,
+    char* out_buf,
+    size_t capacity,
+    size_t* out_len);
+
+// HTML -> plain text (no engine handle needed): strips tags and DROPS the
+// content of <script>/<style> elements.
+//
+// Exposed so offline pipelines (training-set construction, LLM labelling) get
+// EXACTLY the text the engine feeds the model. A second implementation in
+// Python did not drop <style> content, so raw CSS entered training data as if
+// it were prose — one rule with two implementations drifts, so there is one.
+//
+// The text is written (NOT null-terminated) into out_buf of `capacity` bytes;
+// *out_len is set to the TOTAL byte length. If *out_len > capacity the result
+// was truncated — re-call with a larger buffer. out_buf may be NULL to size
+// first (capacity 0). Returns OK even when truncated; check *out_len.
+spam_engine_status_t spam_engine_html_to_text(
+    const char* html,
+    size_t html_len,
+    char* out_buf,
+    size_t capacity,
+    size_t* out_len);
+
+// Structural conversation-thread signals (uses GMime, no engine handle needed):
+// In-Reply-To / References presence and chain length, plus the Message-IDs a
+// Phase 2 (Message-ID DB) lookup reuses. classify_full reports the same struct
+// from its own parse in `signals.thread`.
+//
+// Buffer sizes are generous for real-world Message-IDs (RFC 5322 has no hard
+// limit but production IDs are typically <128 chars). Over-long values are
+// stored as the empty string (treated as absent).
+//
+// Returns 0 on success, non-zero on parser failure. Even on parser failure,
+// out_features is zero-initialised so callers can treat "no features" as a
+// safe default.
+int spam_engine_extract_thread_features(
+    const char* raw_email,
+    size_t raw_email_len,
+    spam_engine_thread_features_t* out_features);
+
+// Sender-authentication features parsed from the receiving MTA's
+// Authentication-Results (its run of headers, as edge_authentication_results in
+// email_preprocessor.cpp reads them). dkim_signing_domain is the cryptographically-asserted DKIM signing
+// org-domain (header.d/.i) — empty if no dkim=pass. dmarc_aligned is 1 when
+// dmarc=pass AND the signing org-domain equals the From org-domain (TASK-122).
+// classify_full reports the same struct from its own parse in `signals.auth`.
+//
+// Returns 0 on success, non-zero on parser failure. out_features is
+// zero-initialised even on failure so callers can treat "no features" as a
+// safe default (no offset).
+int spam_engine_extract_auth_features(
+    const char* raw_email,
+    size_t raw_email_len,
+    spam_engine_auth_features_t* out_features);
+
+// Extract the structural BODY features (GTUBE, callback shape, no-contact
+// instruction) from RFC822 data. No model handle is needed, which is the whole
+// point: the parity harnesses that decide whether a body predicate may ship have
+// to run it over tens of thousands of messages, and going through classify_full
+// costs a full inference per message (~85 ms, so ~37 minutes on the ham panels).
+// A check that slow is a check nobody runs, and the repo has the scars to prove
+// it. The sibling of spam_engine_extract_auth_features, with the same contract:
+// returns 0 on success, non-zero on parser failure, and out_features is
+// zero-initialised even on failure so "no features" is a safe default.
+int spam_engine_extract_body_features(
+    const char* raw_email,
+    size_t raw_email_len,
+    spam_engine_body_features_t* out_features);
+
+// Parse RFC822 attachments and return the exact bounded context an artifact
+// declaring attachment_context=true receives. No model handle is needed. The
+// text is written without a terminator; size-first/truncation contract matches
+// spam_engine_html_to_text. `out_features` is optional and zeroed first.
+spam_engine_status_t spam_engine_extract_attachment_context(
+    const char* raw_email,
+    size_t raw_email_len,
+    spam_engine_attachment_features_t* out_features,
+    char* out_buf,
+    size_t capacity,
+    size_t* out_len);
 
 #ifdef __cplusplus
 }

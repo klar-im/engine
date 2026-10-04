@@ -1,6 +1,7 @@
 #include "spam_engine_c_api.h"
 
 #include "callback_shape.h"
+#include "decision_input.h"  // the fold is internal; these tests drive it per offset
 #include "no_contact_shape.h"
 #include "spam_engine_handle_internal.h"
 #include "brand_names.h"  // direct cover for the IDN/punycode fold (TASK-237 AC#3)
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <map>
 #include <new>
+#include <nlohmann/json.hpp>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -72,8 +74,7 @@ void test_load_classify_unload_flow() {
       &result);
   test_support::check(status == SPAM_ENGINE_STATUS_OK, "classify should succeed after load");
 
-  const float sum = result.scores.gibberish + result.scores.marketing
-      + result.scores.regular + result.scores.spam;
+  const float sum = result.scores.marketing + result.scores.regular + result.scores.spam;
   test_support::check(std::abs(sum - 1.0F) < 1e-3F, "classify probabilities should sum to ~1");
   test_support::check(result.label >= 0 && result.label <= 3, "classify label should be in [0, 3]");
 
@@ -117,7 +118,7 @@ spam_engine_handle_t* create_loaded_engine(const std::string& label,
 // through the same pipeline the demo addon runs: ensemble classify_rfc822 +
 // structural decision fold at the standard profile (classify_full is that in
 // one call). Filenames carry the expected decision label (<label>.<slug>.eml,
-// decision vocabulary: spam | gibberish | marketing | ham). A regression here
+// decision vocabulary: spam | marketing | ham). A regression here
 // is a public wrong verdict on klar.im/demo: the Ham EN sample ("Marie
 // Dupont") shipped misclassified as spam for two weeks because nothing checked
 // these.
@@ -176,6 +177,252 @@ void test_model_info_names_the_loaded_artifact() {
   spam_engine_destroy(fresh);
 }
 
+// The runtime record is internally consistent whatever host runs the test, so
+// nothing here names "metal": a CUDA box, a Linux runner and a Mac under
+// SPAM_ENGINE_NO_GPU all pass, and a lying field fails on all of them.
+void check_runtime_info_consistent(const spam_engine_runtime_info_t& info,
+                                   const std::string& label) {
+  const std::string backend(info.backend);
+  const std::string fallback(info.fallback);
+  test_support::check(!backend.empty(), label + ": backend is named");
+  test_support::check(info.device[0] != '\0', label + ": device is described");
+  test_support::check((backend == "cpu") == (fallback != "none"),
+      label + ": backend is 'cpu' iff a fallback is named (got '" + backend + "', '"
+      + fallback + "')");
+  test_support::check(backend != "MTL",
+      label + ": the registry name is spelled out, never ggml's 'MTL'");
+  // One direction only: a GPU that refuses a context without logging a line
+  // leaves the detail empty, and that is the host's doing, not the engine's.
+  test_support::check(info.fallback_detail[0] == '\0' || fallback == "context_init_failed",
+      label + ": fallback_detail only accompanies a failed context init");
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
+  if (std::getenv("SPAM_ENGINE_NO_GPU") != nullptr) {
+    test_support::check(fallback == "requested_cpu",
+        label + ": SPAM_ENGINE_NO_GPU reads as requested_cpu");
+  }
+  test_support::check(info.max_tokens > 0, label + ": the cap in force is reported");
+}
+
+// The encoder cap clips input at max_tokens and nothing recorded how often
+// until TASK-505 L; this is the counter that makes "what share of mail is
+// truncated" a measurable number instead of a guess. classify() embeds one
+// sequence per call, so the counts below are exact.
+void test_runtime_info_counts_truncation() {
+  spam_engine_handle_t* handle = create_loaded_engine("runtime info");
+
+  spam_engine_runtime_info_t info{};
+  test_support::check(spam_engine_runtime_info(handle, &info) == 1,
+      "runtime_info should succeed on a loaded handle");
+  check_runtime_info_consistent(info, "after load");
+  test_support::check(info.sequences_embedded == 0 && info.sequences_truncated == 0
+                          && info.sequences_failed == 0,
+      "counters start at zero after load");
+
+  spam_engine_result_t result{};
+  int status = spam_engine_classify(handle, "short note", "hi", "a@example.com",
+                                    "ensemble", &result);
+  test_support::check(status == SPAM_ENGINE_STATUS_OK, "short classify should succeed");
+  spam_engine_runtime_info(handle, &info);
+  test_support::check(info.sequences_embedded == 1, "one sequence embedded after one classify");
+  test_support::check(info.sequences_truncated == 0, "a short input is not truncated");
+
+  // Well past any cap the model can load with (n_ctx_train is 512 for every
+  // shipped encoder): 2,000 words.
+  std::string long_text;
+  for (int i = 0; i < 2000; ++i) { long_text += "word" + std::to_string(i) + " "; }
+  status = spam_engine_classify(handle, long_text.c_str(), "long", "a@example.com",
+                                "ensemble", &result);
+  test_support::check(status == SPAM_ENGINE_STATUS_OK, "long classify should succeed");
+  spam_engine_runtime_info(handle, &info);
+  test_support::check(info.sequences_embedded == 2, "two sequences embedded after two classifies");
+  test_support::check(info.sequences_truncated == 1, "the long input is counted as truncated");
+  test_support::check(info.sequences_failed == 0, "nothing failed");
+
+  // The same fact per message, on the full result: an rfc822 message embeds
+  // plain and html separately, so a long multipart message reports 2 and a
+  // short one 0, without any caller reading the counter.
+  const std::string long_html = "<p>" + long_text + "</p>";
+  const std::string multipart =
+      "From: a@example.com\r\nTo: b@example.com\r\nSubject: long\r\n"
+      "MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"b\"\r\n\r\n"
+      "--b\r\nContent-Type: text/plain\r\n\r\n" + long_text + "\r\n"
+      "--b\r\nContent-Type: text/html\r\n\r\n" + long_html + "\r\n--b--\r\n";
+  spam_engine_full_result_t full{};
+  status = spam_engine_classify_full(handle, multipart.c_str(), multipart.size(),
+                                     "a", "a@example.com", "ensemble", nullptr, &full);
+  test_support::check(status == SPAM_ENGINE_STATUS_OK, "classify_full should succeed");
+  test_support::check(full.encoder_truncated_sequences == 2,
+      "a long multipart message reports both sequences truncated, got "
+      + std::to_string(full.encoder_truncated_sequences));
+  const std::string short_mail =
+      "From: a@example.com\r\nSubject: hi\r\n\r\nshort note\r\n";
+  status = spam_engine_classify_full(handle, short_mail.c_str(), short_mail.size(),
+                                     "a", "a@example.com", "ensemble", nullptr, &full);
+  test_support::check(status == SPAM_ENGINE_STATUS_OK, "short classify_full should succeed");
+  test_support::check(full.encoder_truncated_sequences == 0,
+      "a short message reports no truncated sequence");
+
+  // Unloaded and NULL handles report 0 and leave `out` alone, never a stale
+  // or zeroed record that reads as "cpu, no fallback" (model_info's contract).
+  spam_engine_unload(handle);
+  spam_engine_runtime_info_t untouched{};
+  std::memset(&untouched, 0xFF, sizeof(untouched));
+  test_support::check(spam_engine_runtime_info(handle, &untouched) == 0,
+      "runtime_info on an unloaded handle should fail");
+  test_support::check(untouched.max_tokens == -1 && untouched.backend[0] == '\xFF',
+      "a failed runtime_info leaves out untouched");
+  test_support::check(spam_engine_runtime_info(nullptr, &untouched) == 0,
+      "runtime_info on a NULL handle should fail");
+  test_support::check(spam_engine_runtime_info(handle, nullptr) == 0,
+      "runtime_info with a NULL out should fail");
+  spam_engine_destroy(handle);
+}
+
+// The engine's own lines reach an installed callback, and so do ggml's: the
+// MailKit appex has no stderr, so this is the only way "which backend" is
+// ever read from the process that matters. NULL restores stderr and nothing
+// more arrives.
+struct LogCapture {
+  std::vector<std::pair<int, std::string>> lines;
+  // The sink is process-global and this is a stack object: whatever path
+  // leaves this scope (a check() throwing inside the load included) must
+  // detach it, or the next test's load writes into freed memory.
+  LogCapture() = default;
+  LogCapture(const LogCapture&) = delete;
+  LogCapture& operator=(const LogCapture&) = delete;
+  LogCapture(LogCapture&&) = delete;
+  LogCapture& operator=(LogCapture&&) = delete;
+  ~LogCapture() { spam_engine_set_log_callback(nullptr, nullptr); }
+};
+
+void capture_log(int level, const char* text, void* user) {
+  static_cast<LogCapture*>(user)->lines.emplace_back(level, text);
+}
+
+void test_log_callback_receives_engine_and_native_lines() {
+  LogCapture capture;
+  spam_engine_set_log_callback(capture_log, &capture);
+  spam_engine_handle_t* handle = create_loaded_engine("log callback");
+  spam_engine_set_log_callback(nullptr, nullptr);
+
+  bool saw_load_line = false;
+  bool saw_native_line = false;
+  for (const auto& [level, text] : capture.lines) {
+    if (level == SPAM_ENGINE_LOG_INFO && text.find("[spam_engine] loaded backend=") == 0
+        && text.find(" fallback=") != std::string::npos) {
+      saw_load_line = true;
+    }
+    if (level == SPAM_ENGINE_LOG_DEBUG && text.find("[spam_engine]") == std::string::npos) {
+      saw_native_line = true;
+    }
+  }
+  test_support::check(saw_load_line, "the engine's load line reaches the callback as INFO");
+  test_support::check(saw_native_line, "ggml/llama's own lines reach the callback as DEBUG");
+
+  // A load that fails after the encoder is up (here: no classifier head in
+  // the model directory) must leave no "loaded" line behind: that line is
+  // what a support thread reads to learn whether the load succeeded on
+  // Metal, and the health record beside it says the load failed.
+  {
+    LogCapture failed;
+    spam_engine_set_log_callback(capture_log, &failed);
+    const auto paths = test_support::model_paths();
+    const auto empty_dir = test_support::unique_temp_path("klar-no-head-");
+    std::filesystem::create_directories(empty_dir);
+    const std::string gguf = (paths.model_path / "gguf"
+        / spam_engine::default_gguf_encoder_file(paths.model_path.string())).string();
+    spam_engine_handle_t* no_head = spam_engine_create();
+    const int status = spam_engine_load_ggml(no_head, empty_dir.string().c_str(),
+                                             gguf.c_str(), 0.0F, nullptr);
+    spam_engine_set_log_callback(nullptr, nullptr);
+    spam_engine_destroy(no_head);
+    std::filesystem::remove_all(empty_dir);
+    test_support::check(status != SPAM_ENGINE_STATUS_OK,
+        "a model directory without a head does not load");
+    bool saw_debug = false;
+    for (const auto& [level, text] : failed.lines) {
+      saw_debug = saw_debug || level == SPAM_ENGINE_LOG_DEBUG;
+      test_support::check(text.find("[spam_engine] loaded backend=") == std::string::npos,
+          "a failed load writes no 'loaded backend=' line");
+    }
+    test_support::check(saw_debug, "the encoder did load before the head failed (ggml logged)");
+  }
+
+  const auto count_before = capture.lines.size();
+  spam_engine_unload(handle);
+  spam_engine_destroy(handle);
+  spam_engine_handle_t* second = create_loaded_engine("log callback, callback removed");
+  spam_engine_destroy(second);
+  test_support::check(capture.lines.size() == count_before,
+      "after NULL, a load writes nothing to the old callback");
+}
+
+// fallback_detail is the tail of ggml's own lines, cut on line boundaries:
+// a support mail that opens mid-path names nothing. When one line is longer
+// than the whole window, its head is what names the failure.
+void test_log_tail_cuts_on_line_boundaries() {
+  using spam_engine::log_tail_lines;
+  test_support::check(log_tail_lines("short\n", 100) == "short\n",
+      "a buffer within the window is returned whole");
+  test_support::check(log_tail_lines("first line\nsecond\nthird\n", 15) == "second\nthird\n",
+      "a cut inside a line drops that line's fragment");
+  test_support::check(log_tail_lines("first line\nsecond\nthird\n", 6) == "third\n",
+      "a cut exactly on a line boundary keeps the line after it");
+  test_support::check(log_tail_lines("first\nsecond\nthird", 14) == "second\nthird",
+      "an unterminated last line is kept, as ggml writes partial lines");
+  const std::string one_long = "ok\nggml_metal_init: error: /very/long/path/to/default.metallib\n";
+  test_support::check(log_tail_lines(one_long, 20) == "ggml_metal_init: err",
+      "a window that fits only a fragment of one line returns that line's HEAD");
+  test_support::check(log_tail_lines("ggml_metal_init: error: no newline anywhere", 10)
+      == "ggml_metal",
+      "and so does a single unterminated line longer than the window");
+}
+
+// SPAM_ENGINE_NO_GPU is the one fallback a test can cause on purpose. Runs
+// LAST: the CPU path unloads Metal for the whole process (see
+// load_with_gpu_layers), so every test after it would measure CPU.
+void test_runtime_info_requested_cpu() {
+  // What this process has before the CPU load: "none" when Metal is still
+  // here, or the reason it is already gone (an earlier test's fallback, or a
+  // host that never had it). The load after the CPU load must report that
+  // reason when Metal was already gone, and requested_cpu when this test is
+  // what removed it. The variable is cleared first: a suite run under
+  // SPAM_ENGINE_NO_GPU=1 would otherwise read requested_cpu here on a host
+  // that never had Metal, and expect it from a later load that can only say
+  // no_gpu_device (nothing unloaded, so nothing was recorded).
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
+  unsetenv("SPAM_ENGINE_NO_GPU");
+  spam_engine_runtime_info_t info{};
+  spam_engine_handle_t* before = create_loaded_engine("before the requested cpu");
+  test_support::check(spam_engine_runtime_info(before, &info) == 1, "runtime_info succeeds");
+  const std::string before_fallback(info.fallback);
+  spam_engine_destroy(before);
+  const std::string expected_later = before_fallback == "none" ? "requested_cpu" : before_fallback;
+
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
+  setenv("SPAM_ENGINE_NO_GPU", "1", 1);
+  spam_engine_handle_t* handle = create_loaded_engine("requested cpu");
+  test_support::check(spam_engine_runtime_info(handle, &info) == 1, "runtime_info succeeds");
+  check_runtime_info_consistent(info, "requested cpu");
+  test_support::check(std::string(info.fallback) == "requested_cpu",
+      "SPAM_ENGINE_NO_GPU is recorded as the reason");
+  test_support::check(std::string(info.backend) == "cpu", "and the backend is cpu");
+  spam_engine_destroy(handle);
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
+  unsetenv("SPAM_ENGINE_NO_GPU");
+
+  // That load unloaded Metal for the whole process. The next load asks for
+  // the GPU, finds no device, and must report the reason Metal is gone, not
+  // no_gpu_device: the extension's nightly reload after a failed context
+  // init is this shape, and it must not overwrite the recorded reason.
+  spam_engine_handle_t* later = create_loaded_engine("after the unload");
+  test_support::check(spam_engine_runtime_info(later, &info) == 1, "runtime_info succeeds");
+  test_support::check(std::string(info.fallback) == expected_later,
+      "a later load reports why Metal is gone: expected '" + expected_later + "', got '"
+      + info.fallback + "'");
+  spam_engine_destroy(later);
+}
+
 void test_demo_samples_decision() {
   const auto paths = test_support::model_paths();
   spam_engine_handle_t* handle = create_loaded_engine("demo samples decision");
@@ -226,27 +473,23 @@ void test_demo_samples_decision() {
   const std::set<std::string>& accepted_backend_drifts =
       is_gen3 ? gen3_accepted_backend_drifts : empty_exceptions;
 
-  // gen3-v6 (the released model since TASK-367 AC#1) decides 25 of the 28 on
-  // both backends, measured 2026-09-14 on the CPU and Metal paths alike: two
-  // non-English marketing samples read as ham (spam side 0.85 / 0.74, the
-  // weak-language legitimate-mail direction TRAINING_EXPERIMENT_LOG.md #51
-  // found), and the English parcel scam lands at spam side 0.98, one grid
-  // step under the 0.99 gate. Pinned to the exact outcome so a third label is
-  // a regression and a pass fails the test until the entry is removed; the
-  // fix is a retrain (gen3-v7 carrying the adjudicated native ham), not an
-  // operating point read off the demo.
-  static const std::map<std::string, std::string> gen3v6_measured_misses = {
-      {"marketing.fr.eml", "ham"},
-      {"marketing.weekend.de.eml", "ham"},
-      {"spam.parcel.en.eml", "ham"}};
-  // Keyed on the exact artifact, not the recipe: a reproduction, a different
-  // quantization or a recalibrated export of the same fit shares the source
-  // prefix and has its own verdicts to measure.
-  const bool is_gen3v6 =
-      std::string(model.uuid) == "dab55c42-6eb5-464b-9e2a-271fd1867a19";
-  const std::map<std::string, std::string> no_misses;
-  const std::map<std::string, std::string>& measured_misses =
-      is_gen3v6 ? gen3v6_measured_misses : no_misses;
+  // The samples the released model reads differently by design live beside
+  // the samples, in measured-misses.json, keyed on the exact artifact (a
+  // reproduction, a different quantization or a recalibrated export of the
+  // same fit shares the source prefix and has its own verdicts to measure).
+  // One file, because the messages MPA's test reads the same list; the why
+  // of each entry is in the file. Pinned to the exact outcome so a third
+  // label is a regression and a pass fails the test until the entry is
+  // removed: the fix is a retrain, not an operating point read off the demo.
+  std::map<std::string, std::string> measured_misses;
+  {
+    std::ifstream in(dir / "measured-misses.json");
+    test_support::check(in.good(), "measured-misses.json readable beside the demo samples");
+    const nlohmann::json all = nlohmann::json::parse(in);
+    if (const auto it = all.find(std::string(model.uuid)); it != all.end()) {
+      measured_misses = it->get<std::map<std::string, std::string>>();
+    }
+  }
 
   for (const auto& f : files) {
     const std::string name = f.filename().string();
@@ -260,7 +503,7 @@ void test_demo_samples_decision() {
       const std::string got(full.decision.label);
       std::string message = "demo sample '";
       message += name;
-      message += "' is a recorded gen3-v6 miss and must still decide '";
+      message += "' is a recorded miss of this model and must still decide '";
       message += miss->second;
       message += "' (want '";
       message += expected;
@@ -268,7 +511,7 @@ void test_demo_samples_decision() {
       message += got;
       message += "'); a pass means the entry is stale, anything else is a new regression";
       test_support::check(got == miss->second, message);
-      std::cout << "  [MEASURED-MISS gen3-v6] demo '" << name << "' decided '" << got
+      std::cout << "  [MEASURED-MISS " << model.uuid << "] demo '" << name << "' decided '" << got
                 << "' (want '" << expected << "')\n";
       continue;
     }
@@ -402,7 +645,7 @@ void test_rfc822_picks_spammy_html_when_plain_and_html_drift_via_c_api() {
     return r.scores;
   };
   auto const confident_spam = [](const spam_engine_scores_t& s) {
-    return test_support::confident_class(s.spam, s.regular, s.marketing, s.gibberish);
+    return test_support::confident_class(s.spam, s.regular, s.marketing);
   };
 
   const spam_engine_scores_t drift_scores = scores_of(drift_rfc822, "multipart drift");
@@ -662,7 +905,7 @@ void test_train_rfc822_and_incremental_flow() {
   // tail. Queue [good, no-content(throws in train_rfc822), good]: the batch fails,
   // the already-trained head is not re-run, the poison sample is dropped, and the
   // trailing good sample is re-queued (previously the whole drained batch was lost).
-  const std::string no_content = "To: x@y.com\r\n\r\n";  // no From/Subject/body -> no extractable text
+  const std::string no_content = "To: x@example.com\r\n\r\n";  // no From/Subject/body -> no extractable text
   spam_engine_add_training_sample(handle, ham_rfc822.c_str(), ham_rfc822.size(), nullptr, nullptr, 2);
   spam_engine_add_training_sample(handle, no_content.c_str(), no_content.size(), nullptr, nullptr, 3);
   spam_engine_add_training_sample(handle, spam_rfc822.c_str(), spam_rfc822.size(), nullptr, nullptr, 3);
@@ -1436,7 +1679,7 @@ void test_parcel_carrier_impersonation() {
       // structural rule that briefly did (isolated_offsite_cta, TASK-439) cost
       // 15 legitimate messages per 4 catches and was removed. TASK-442.
       {"compromised relay, no brand claimed",
-       "From: \"Info\" <info@arredamentimoreni.it>\r\n"
+       "From: \"Info\" <info@furniture-shop.example>\r\n"
        "Subject: Probleme de livraison\r\n\r\nVotre colis attend.\r\n", 0},
       // Keying a brand cuts both ways, and this is the half that protects users:
       // the entry that condemns the spoofs above exempts the carrier's real mail.
@@ -1452,6 +1695,303 @@ void test_parcel_carrier_impersonation() {
     spam_engine_extract_auth_features(c.raw.data(), c.raw.size(), &f);
     test_support::check(f.display_impersonation == c.expect,
                         std::string("parcel case: ") + c.label);
+  }
+}
+
+// A user's Klar report of 2026-09-15: five wrongly flagged messages, all five
+// display_impersonation at 1.00 with the neural side under 0.28, on two
+// mechanisms. (1) Apple's Hide My Email relay rewrites the From to
+// "<brand display>" <service_at_email_brand_com_<alias>_<hash>@privaterelay.appleid.com>,
+// so the display and local part both claim the brand and appleid.com owns none:
+// the cold-start condemn on every brand mail such a user gets. The relay records
+// the sender it verified in its own Authentication-Results, and that is the
+// identity the claims are measured against (apple_relay_origin). (2) The
+// 1934 dictionary has Paris and Berlin but not London, England or Germany, and
+// "art" but not "arts", so "The All England Lawn Tennis Club", ng-london.org.uk
+// (the National Gallery) and arts-mail.co.uk (Cadogan Hall's ESP) were Tier-1
+// brand claims and combosquats; places and regular plurals are Tier-2 now
+// (gen_brand_names.py), like Paris and Apple always were. The spoof shapes the
+// same paths exist for stay condemned, measured here rather than assumed.
+void test_hide_my_email_relay_and_place_names() {
+  // Apple's headers, in the order the relay writes them: the receiving MTA's
+  // result on top (DMARC pass for appleid.com), then Apple's own verification
+  // of the original sender, one line per method.
+  const std::string relay_bounce =
+      test_support::consumer_address("privaterelay.bounce.k7m2", "privaterelay.appleid.com");
+  const std::string relay_ar =
+      "Authentication-Results: mx.example.net; dkim=pass header.i=@privaterelay.appleid.com;"
+      " spf=pass smtp.mailfrom=" + relay_bounce + ";"
+      " dmarc=pass (p=REJECT) header.from=appleid.com\r\n";
+  auto const icloud_dkim = [](const std::string& result) {
+    return "Authentication-Results: dkim-verifier.icloud.com; dkim=" + result + "\r\n";
+  };
+  auto const icloud_spf = [](const std::string& result, const std::string& mailfrom) {
+    return "Authentication-Results: spf.icloud.com; spf=" + result + " smtp.mailfrom=" + mailfrom + "\r\n";
+  };
+  auto const icloud_dmarc = [](const std::string& header_from) {
+    return "Authentication-Results: dmarc.icloud.com; dmarc=pass header.from=" + header_from + "\r\n";
+  };
+  // The From as Apple rewrites it: the brand's display, the original address
+  // encoded in the local part; Sign in with Apple's host, or Hide My Email's.
+  auto const relayed_from = [](const std::string& display, const std::string& encoded,
+                               const std::string& host = "privaterelay.appleid.com") {
+    return "From: " + display + " <" + encoded + "_k7m2q9x4wz_1f2e3d4c@" + host + ">\r\n";
+  };
+  const std::string hme_to =
+      "To: Hide My Email <" + test_support::consumer_address("quiet.river_4k", "icloud.com") + ">\r\n";
+  const std::string moonpig_from = relayed_from("Moonpig Reminder", "service_at_email_moonpig_com");
+  const std::string wimbledon_from = relayed_from("Wimbledon Tickets", "noreply_at_wimbledon_tickets");
+  const std::string paypal_from = relayed_from("PayPal", "service_at_paypa1-secure_com");
+  const std::string moonpig_body = "Subject: Grandad's birthday\r\n\r\n20% off cards.\r\n";
+  const std::string wimbledon_body = "Subject: Ballot confirmation\r\n\r\nThank you.\r\n";
+  const std::string phish_body = "Subject: Your account\r\n\r\nVerify now.\r\n";
+  struct Case { const char* label; std::string raw; int expect; };
+  const std::vector<Case> cases = {
+      {"relayed brand mail, DKIM-verified origin owns the claim",
+       moonpig_from + relay_ar +
+       icloud_dkim("pass header.d=email.moonpig.com header.i=service@email.moonpig.com") +
+       moonpig_body, 0},
+      {"relayed brand mail, SPF-only origin owns the claim",
+       wimbledon_from + relay_ar + icloud_spf("pass", "noreply@wimbledon.tickets") + wimbledon_body, 0},
+      // A brand behind an ESP carries the ESP's signature line first (Postmark's
+      // ab.mtasv.net, the shape postfix/tests/fixtures has) and its own below;
+      // the origin is the line aligned with the From Apple encoded, not the first.
+      {"relayed brand mail through an ESP: the aligned line, not the first",
+       moonpig_from + relay_ar + icloud_dkim("pass header.d=ab.mtasv.net") +
+       icloud_dkim("pass header.d=email.moonpig.com") + moonpig_body, 0},
+      // A bounce address as mailfrom: the domain is what follows its '@', not the
+      // token the local part's '+' or '=' would stop at.
+      {"relayed brand mail, SPF-only origin with a VERP mailfrom",
+       wimbledon_from + relay_ar +
+       icloud_spf("pass (spf.icloud.com: domain of bounces+1234-abcd-user=example.org@bounce.wimbledon.tickets"
+                  " designates 203.0.113.25 as permitted sender)",
+                  "bounces+1234-abcd-user=example.org@bounce.wimbledon.tickets") +
+       wimbledon_body, 0},
+      // The origin is measured, not trusted: a stolen alias mailed from a
+      // cousin domain claims a KB brand it does not authenticate as.
+      {"relayed phish: Apple verified paypa1-secure.com, the display says PayPal",
+       paypal_from + relay_ar + icloud_dkim("pass header.d=paypa1-secure.com") + phish_body, 1},
+      // A line planted inside the message names a brand the From Apple encoded
+      // is not aligned with, so it is ignored wherever it sits: below Apple's
+      // real pass, or below an Apple line that did not pass at all.
+      {"relayed phish with a planted icloud result below Apple's",
+       paypal_from + relay_ar + icloud_dkim("pass header.d=paypa1-secure.com") +
+       icloud_dkim("pass header.d=paypal.com") + phish_body, 1},
+      {"relayed phish: Apple's line is dkim=none, a planted pass names paypal.com",
+       paypal_from + relay_ar + icloud_dkim("none") + icloud_spf("fail", "x@paypa1-secure.com") +
+       icloud_dkim("pass header.d=paypal.com") + icloud_spf("pass", "x@paypal.com") + phish_body, 1},
+      // The planted line IS aligned here: the attacker wrote paypal.com as the
+      // From, Apple encoded it and reported dkim=none / spf=fail on it, and the
+      // planted pass below names the same domain. Apple's verdict on a method
+      // closes it: nothing below a non-pass icloud line is Apple's.
+      {"relayed phish: From spoofed as paypal.com, Apple says none/fail, planted aligned passes below",
+       relayed_from("PayPal", "service_at_paypal_com") + relay_ar + icloud_dkim("none") +
+       icloud_spf("fail", "service@paypal.com") + icloud_dkim("pass header.d=paypal.com") +
+       icloud_spf("pass", "service@paypal.com") + phish_body, 1},
+      // A stolen alias mailed from a free ESP account: the From the attacker
+      // wrote decodes to a domain no icloud line aligns with, so the identity
+      // stays appleid.com and the ESP's established signature exempts nothing.
+      {"relayed phish through a free SendGrid account claiming PayPal",
+       relayed_from("PayPal", "service_at_anything_example") + relay_ar +
+       icloud_dkim("pass header.d=sendgrid.net") + phish_body, 1},
+      // iCloud's inbound MX writes one Authentication-Results per method; the
+      // brand's own mail to a mac.com mailbox was read as "bimi=none" and
+      // condemned (5 of the 20 user-reported false positives).
+      {"a KB brand's own mail into an iCloud mailbox, one result header per method",
+       "Return-path: <noreply@email.apple.com>\r\n"
+       "Received: from p00-icloudmta-bulkin by p155-mailgateway-smtp (mailgateway) id x\r\n"
+       "Authentication-Results: bimi.icloud.com; bimi=pass header.d=email.apple.com\r\n"
+       "Authentication-Results: dmarc.icloud.com; dmarc=pass header.from=email.apple.com\r\n" +
+       icloud_dkim("pass header.d=email.apple.com header.i=@email.apple.com") +
+       icloud_spf("pass", "noreply@email.apple.com") +
+       "From: Apple <noreply@email.apple.com>\r\n"
+       "Subject: Your receipt\r\n\r\nThank you.\r\n", 0},
+      // ... and the same inbound shape on a relayed brand mail: the edge's own
+      // icloud lines verify Apple's relay signature, the relay's lines below
+      // verify the origin, and only the aligned one is the origin.
+      {"relayed brand mail into an iCloud mailbox",
+       moonpig_from +
+       "Authentication-Results: bimi.icloud.com; bimi=none\r\n"
+       "Authentication-Results: dmarc.icloud.com; dmarc=pass header.from=appleid.com\r\n" +
+       icloud_dkim("pass header.d=privaterelay.appleid.com") +
+       icloud_spf("pass", relay_bounce) +
+       "DKIM-Signature: v=1; d=privaterelay.appleid.com; s=prv2019; b=x\r\n" +
+       icloud_dkim("pass header.d=email.moonpig.com") + moonpig_body, 0},
+      // A privaterelay From that did not come through Apple (no DMARC pass for
+      // appleid.com at the receiving edge) keeps appleid.com as its identity and
+      // the brand claim condemns as before, whatever the message says below.
+      {"forged privaterelay From, DMARC fail at the edge",
+       moonpig_from +
+       "Authentication-Results: mx.example.net; dmarc=fail header.from=appleid.com\r\n" +
+       icloud_dkim("pass header.d=email.moonpig.com") + moonpig_body, 1},
+      // "Forged" needs the edge to have looked and said no (TASK-510). A
+      // message with no Authentication-Results at all (an archive, a trap
+      // corpus) is unknown: the plain cold-start claim then has nothing to
+      // condemn on, like any other plain claim without corroboration.
+      {"privaterelay From with no Authentication-Results at all: unknown, not forged",
+       moonpig_from + moonpig_body, 0},
+      // An edge that evaluated SPF only (a 2013 Hotmail shape) said nothing
+      // about DMARC: "forged" is the edge's own dmarc=fail, not the absence
+      // of a pass. Red while relay_forged read "not passed" as "failed".
+      {"privaterelay From at an edge that reports no dmarc method: unknown, not forged",
+       moonpig_from +
+       "Authentication-Results: mx.example.net; spf=pass smtp.mailfrom=privaterelay.appleid.com\r\n" +
+       icloud_dkim("pass header.d=email.moonpig.com") + moonpig_body, 0},
+      // The edge passed the relay but the local part is not Apple's encoding
+      // (no _at_ token), so the origin cannot be read: the identity stays
+      // appleid.com, and a message Apple verified is not a forgery.
+      {"relayed mail the edge passed, origin undecodable: not forged",
+       "From: Moonpig Reminder <" + test_support::consumer_address("k7m2q9x4wz", "privaterelay.appleid.com") +
+       ">\r\n" + relay_ar +
+       icloud_dkim("pass header.d=email.moonpig.com") + moonpig_body, 0},
+      // Through the relay for real, but Apple's only line is an ESP's, aligned
+      // with nothing the From encodes: a stolen alias mailed from a free ESP
+      // account claiming a cold-start brand. Pinned at 0, and known: the
+      // relay's pass is not corroboration, and the ESP line alone does not say
+      // the origin lied (an edge that strips foreign results looks the same on
+      // legit relayed brand mail). A KB brand in the same shape fires above.
+      {"relayed cold-start claim through a free ESP, no aligned icloud line",
+       relayed_from("Moonpig Reminder", "service_at_anything_example") + relay_ar +
+       icloud_dkim("pass header.d=sendgrid.net") + moonpig_body, 0},
+      // Outlook/Hotmail stamp the aligned signer with no dmarc= token at all;
+      // that proves the message came through Apple as well as dmarc=pass does.
+      {"relayed brand mail into an Outlook mailbox (aligned signer, no dmarc= token)",
+       moonpig_from +
+       "Authentication-Results: spf=pass (sender IP is 198.51.100.6)"
+       " smtp.mailfrom=privaterelay.appleid.com; dkim=pass (signature was verified)"
+       " header.d=privaterelay.appleid.com\r\n" +
+       icloud_dkim("pass header.d=email.moonpig.com") + moonpig_body, 0},
+      // The encoded local part is read case-insensitively, like every other
+      // identity string here.
+      {"relayed brand mail, the encoded local part in mixed case",
+       relayed_from("Moonpig Reminder", "Service_AT_Email_Moonpig_Com") + relay_ar +
+       icloud_dkim("pass header.d=email.moonpig.com") + moonpig_body, 0},
+      // iCloud+ Hide My Email into an iCloud mailbox (a report of 2026-09-21,
+      // headers as delivered): the same encoding on icloud.com, verified by
+      // the edge's own run. The reported DHL notice itself no longer fires
+      // since the cold-start condemn needs corroboration (TASK-510); a KB
+      // brand does, on the icloud.com identity, until the relay is read.
+      {"Hide My Email on icloud.com, a KB brand the iCloud edge verified",
+       relayed_from("PayPal", "service_at_paypal_com", "icloud.com") + hme_to +
+       icloud_dmarc("paypal.com") + icloud_dkim("pass header.d=paypal.com header.i=@paypal.com") +
+       icloud_spf("pass", "service@paypal.com") +
+       "Subject: Your receipt\r\n\r\nThank you.\r\n", 0},
+      {"Hide My Email on icloud.com, the reported DHL notice",
+       relayed_from("Joybuy", "NoReply.ODD_at_dhl_com", "icloud.com") + hme_to +
+       "Authentication-Results: bimi.icloud.com; bimi=pass header.d=dhl.com\r\n"
+       "Authentication-Results: arc.icloud.com; arc=none\r\n" +
+       icloud_dmarc("dhl.com") + icloud_dkim("pass header.d=dhl.com header.i=@dhl.com") +
+       icloud_spf("pass", "prvs=1724db5c4a=NoReply.ODD@dhl.com") +
+       "Subject: DHL On Demand Delivery\r\n\r\nIhre Sendung kommt heute.\r\n", 0},
+      // icloud.com is a mailbox anyone can register: an account named after
+      // the brand. Mailed to a Gmail user with Apple's lines planted under
+      // Google's: the edge is not iCloud, so its run holds no relay line.
+      {"an iCloud account named like the relay, to a Gmail mailbox, planted icloud lines",
+       relayed_from("PayPal", "service_at_paypal_com", "icloud.com") +
+       "Authentication-Results: mx.google.com; dkim=pass header.i=@icloud.com;"
+       " spf=pass smtp.mailfrom=" + test_support::consumer_address("x", "icloud.com") +
+       "; dmarc=pass header.from=icloud.com\r\n" +
+       icloud_dmarc("paypal.com") + icloud_dkim("pass header.d=paypal.com") + phish_body, 1},
+      // ... and mailed to an iCloud user: Apple's own run signs it as
+      // icloud.com, and the planted pass below that run is not read.
+      {"an iCloud account named like the relay, direct to an iCloud mailbox, planted pass below",
+       relayed_from("PayPal", "service_at_paypal_com", "icloud.com") + icloud_dmarc("icloud.com") +
+       icloud_dkim("pass header.d=icloud.com") +
+       icloud_spf("pass", test_support::consumer_address("x", "icloud.com")) +
+       "Received: from attacker by p00-icloudmta-smtpin id y\r\n" +
+       "Authentication-Results: mx.attacker.example; spf=none\r\n" +
+       icloud_dkim("pass header.d=paypal.com") + phish_body, 1},
+      // (2) Places and plurals: the three non-relay messages of the same report.
+      {"a club named after a country, on its own domain",
+       "From: The All England Lawn Tennis Club <noreply@wimbledon.tickets>\r\n"
+       "Subject: Ballot confirmation\r\n\r\nThank you.\r\n", 0},
+      {"a gallery whose domain carries its city (was a combosquat on 'london')",
+       "From: \"The National Gallery\" <updates@ng-london.org.uk>\r\n"
+       "Subject: What secrets lie beneath the Arnolfini Portrait?\r\n\r\nA closer look.\r\n", 0},
+      {"a venue's ESP domain carrying a plural (was a combosquat on 'arts')",
+       "From: Cadogan Hall <CadoganHall@arts-mail.co.uk>\r\n"
+       "Subject: A rare London concert\r\n\r\nDear Sam.\r\n", 0},
+      // The combosquat and cold-start paths still fire on a coined brand.
+      {"combosquat on a coined brand still fires",
+       "From: x@paypal-secure.com\r\nSubject: x\r\n\r\nx\r\n", 1},
+      {"a plural-shaped brand the KB keys still fires on the identity mismatch",
+       "From: Starbucks <rewards@example.com>\r\nSubject: x\r\n\r\nx\r\n", 1},
+  };
+
+  for (const auto& c : cases) {
+    spam_engine_auth_features_t f{};
+    spam_engine_extract_auth_features(c.raw.data(), c.raw.size(), &f);
+    test_support::check(f.display_impersonation == c.expect,
+                        std::string("hide-my-email / place case: ") + c.label);
+  }
+}
+
+// What edge_authentication_results reads, pinned on the shapes that matter:
+// iCloud's one header per method, OpenDKIM then OpenDMARC ahead of the milter,
+// Gmail's one header with everything, and the planted duplicates under each.
+void test_edge_results_first_header_per_method() {
+  const std::string from = "From: \"Sam's Club\" <deals@samsclub.com>\r\nSubject: x\r\n\r\nx\r\n";
+  struct Case {
+    const char* label;
+    std::string raw;
+    int dmarc_pass;
+    std::string signer;
+  };
+  const std::vector<Case> cases = {
+      {"iCloud edge: real fail/none, planted pass below for the same methods",
+       "Authentication-Results: bimi.icloud.com; bimi=none\r\n"
+       "Authentication-Results: dmarc.icloud.com; dmarc=fail header.from=samsclub.com\r\n"
+       "Authentication-Results: dkim-verifier.icloud.com; dkim=none\r\n"
+       "Authentication-Results: spf.icloud.com; spf=fail smtp.mailfrom=x@samsclub.com\r\n"
+       "Authentication-Results: dmarc.icloud.com; dmarc=pass header.from=samsclub.com\r\n"
+       "Authentication-Results: dkim-verifier.icloud.com; dkim=pass header.d=samsclub.com\r\n" + from,
+       0, ""},
+      {"iCloud edge: two real signatures in two headers, the first is the signer",
+       "Authentication-Results: bimi.icloud.com; bimi=none\r\n"
+       "Authentication-Results: dmarc.icloud.com; dmarc=pass header.from=samsclub.com\r\n"
+       "Authentication-Results: dkim-verifier.icloud.com; dkim=pass header.d=samsclub.com\r\n"
+       "Authentication-Results: dkim-verifier.icloud.com; dkim=pass header.d=s12.y.mc.salesforce.com\r\n"
+       "Authentication-Results: spf.icloud.com; spf=pass smtp.mailfrom=x@samsclub.com\r\n" + from,
+       1, "samsclub.com"},
+      {"Gmail edge: one header, a planted mx.google.com pass below it",
+       "Authentication-Results: mx.google.com; dkim=none; spf=fail smtp.mailfrom=x@samsclub.com;"
+       " dmarc=fail (p=REJECT) header.from=samsclub.com\r\n"
+       "Authentication-Results: mx.google.com; dkim=pass header.d=samsclub.com;"
+       " dmarc=pass header.from=samsclub.com\r\n" + from,
+       0, ""},
+      // Klar Pro's reference edge (postfix/docker): OpenDMARC's header on top of
+      // OpenDKIM's, one method each under one authserv-id; the signer is in the
+      // second header, and a planted third one repeating a method is not read.
+      {"OpenDKIM then OpenDMARC, one header each, a planted dkim=pass below",
+       "Authentication-Results: mail.example.com; dmarc=fail header.from=samsclub.com\r\n"
+       "Authentication-Results: mail.example.com; dkim=pass header.d=mail56.atl71.mcdlv.net\r\n"
+       "Authentication-Results: mail.example.com; dkim=pass header.d=samsclub.com\r\n" + from,
+       0, "mcdlv.net"},
+      // Method tokens inside a comment are the previous hop's, restated
+      // (Gmail's arc=pass comment); an iCloud arc line carrying them must not
+      // count as the edge's dkim/spf/dmarc report and pre-empt the real lines.
+      {"iCloud edge: arc=pass comment restates the previous hop's methods",
+       "Authentication-Results: bimi.icloud.com; bimi=none\r\n"
+       "Authentication-Results: arc.icloud.com; arc=pass (i=1 spf=pass spfdomain=samsclub.com"
+       " dkim=pass dkdomain=samsclub.com dmarc=pass fromdomain=samsclub.com)\r\n"
+       "Authentication-Results: dmarc.icloud.com; dmarc=pass header.from=samsclub.com\r\n"
+       "Authentication-Results: dkim-verifier.icloud.com; dkim=pass header.d=samsclub.com\r\n"
+       "Authentication-Results: spf.icloud.com; spf=pass smtp.mailfrom=x@samsclub.com\r\n" + from,
+       1, "samsclub.com"},
+      {"Gmail edge: dmarc=pass inside the arc comment, dmarc=fail as the verdict",
+       "Authentication-Results: mx.google.com; arc=pass (i=1 spf=pass spfdomain=samsclub.com"
+       " dkim=pass dkdomain=samsclub.com dmarc=pass fromdomain=samsclub.com); dkim=none;"
+       " spf=fail smtp.mailfrom=x@samsclub.com; dmarc=fail (p=REJECT) header.from=samsclub.com\r\n" + from,
+       0, ""},
+  };
+  for (const auto& c : cases) {
+    spam_engine_auth_features_t f{};
+    spam_engine_extract_auth_features(c.raw.data(), c.raw.size(), &f);
+    test_support::check(f.dmarc_pass == c.dmarc_pass && f.dkim_signing_domain == c.signer,
+                        std::string("edge run case: ") + c.label + " (dmarc_pass=" +
+                            std::to_string(f.dmarc_pass) + ", signer=" + f.dkim_signing_domain + ")");
+    test_support::check(f.kb_brand_dmarc_pass == c.dmarc_pass,
+                        std::string("edge run case, kb_brand_dmarc_pass: ") + c.label);
   }
 }
 
@@ -2031,7 +2571,7 @@ void test_brand_fp_regressions() {
   // Unclaimed link typosquat with a throwaway signer: the corroborated fallback fires.
   const std::string corro_link =
       "From: Billing <noreply@notif-center.example>\r\n"
-      "Authentication-Results: mx; dkim=pass header.d=hfp4j.e5q.jalo.edu.pl; dmarc=fail\r\n"
+      "Authentication-Results: mx; dkim=pass header.d=hfp4j.e5q.synthetic.edu.pl; dmarc=fail\r\n"
       "Content-Type: text/plain\r\n\r\n"
       "restore at https://paypall.com/verify\r\n";
   spam_engine_auth_features_t g12{};
@@ -2133,13 +2673,21 @@ void test_display_brand_homoglyph_and_owns() {
 }
 
 // TASK-268: the ambiguous Tier-1 brands (Boulanger, Norton) are heavily-phished
-// brands that are also common surnames. They condemn standalone like Tier-1, but
-// only WITH the impersonation shape, so a personal-name display passes instead
-// of repeating the Marie Dupont FP (TASK-266) for these names. (Leclerc, the
-// other Leclerc-class dual, is not a Tranco stem at all: e.leclerc reduces to
-// stem "e". Its coverage needs the brand KB, TASK-267.)
+// brands that are also common surnames. They are Tier-1 claims, but only WITH
+// the impersonation shape, so a personal-name display passes instead of
+// repeating the Marie Dupont FP (TASK-266) for these names. (Leclerc, the other
+// Leclerc-class dual, is not a Tranco stem at all: e.leclerc reduces to stem
+// "e". Its coverage needs the brand KB, TASK-267.) Since TASK-510 a plain Tier-1
+// claim the KB cannot adjudicate needs corroboration, so both are keyed in the
+// KB and the shape claim condemns through claimed-vs-authenticated; the
+// precondition below is what keeps "Boulanger Livraison" a standalone condemn.
 void test_ambiguous_surname_brands() {
   using spam_engine::brand_names::display_impersonates_brand;
+  for (const char* brand : {"boulanger", "norton"}) {
+    test_support::check(spam_engine::brand_names::is_ambiguous_brand(brand) &&
+                            spam_engine::brand_kb::brand_has_auth_set(brand),
+        std::string("precondition: ambiguous brand '") + brand + "' is keyed in the KB");
+  }
 
   // Personal-name shape: the first name is a distinctive leftover, breaks the
   // shape, and the claim is dropped entirely (not even Tier-2).
@@ -2150,8 +2698,8 @@ void test_ambiguous_surname_brands() {
   test_support::check(!person2.tier1 && !person2.tier2,
       "'Sophie Norton' is a person, not a Norton claim (shape broken)");
 
-  // Brand + role words (or the bare brand) keeps the shape and condemns
-  // STANDALONE from a non-owned domain: Tier-1 strength, no corroboration.
+  // Brand + role words (or the bare brand) keeps the shape and is a Tier-1
+  // claim from a non-owned domain; the KB then condemns it with no corroboration.
   const auto role = display_impersonates_brand("Boulanger Livraison", "colis-suivi.example");
   test_support::check(role.tier1 && role.brand == "boulanger",
       "'Boulanger Livraison' from a foreign domain IS a standalone Boulanger claim");
@@ -2188,18 +2736,112 @@ void test_ambiguous_surname_brands() {
   const auto own = display_impersonates_brand("Boulanger Livraison", "boulanger.com");
   test_support::check(!own.tier1 && !own.tier2,
       "'Boulanger Livraison' from boulanger.com is the brand itself");
+
+  // End to end, no corroborating signer anywhere: the shape claim condemns
+  // through the KB, the person does not, the brand's own domain does not.
+  const auto verdict = [](const std::string& from) {
+    const std::string eml = "From: " + from + "\r\nSubject: Votre commande\r\n\r\nBonjour.\r\n";
+    spam_engine_auth_features_t f{};
+    spam_engine_extract_auth_features(eml.data(), eml.size(), &f);
+    return f.display_impersonation;
+  };
+  test_support::check(verdict("Boulanger Livraison <suivi@colis-suivi.example>") == 1,
+      "'Boulanger Livraison' from a foreign domain is impersonation, no corroboration needed");
+  test_support::check(verdict("Edmond Boulanger <edmond@example.net>") == 0,
+      "'Edmond Boulanger' is a person");
+  test_support::check(verdict("Boulanger <noreply@boulanger.fr>") == 0,
+      "Boulanger on its own .fr is Boulanger");
+
+  // ── The EN surname-brands (2026-09-24) ────────────────────────────────────
+  // The surname-hotel class. hilton is NOT keyed in the KB (so the cold-start
+  // path governs it); marriott, kroger and lowes ARE keyed by TASK-510, which
+  // is what made them dangerous: a keyed Tier-1 brand takes the
+  // claimed-vs-authenticated path and condemns standalone with no shape gate.
+  const struct { const char* brand; bool keyed; } surname_brands[] = {
+      {"hilton", false},  // not keyed: the cold-start path governs it
+      {"kroger", true}, {"lowes", true}, {"marriott", true},  // keyed by TASK-510
+  };
+  for (const auto& s : surname_brands) {
+    test_support::check(spam_engine::brand_names::is_ambiguous_brand(s.brand),
+        std::string("precondition: '") + s.brand + "' is an ambiguous surname-brand");
+    test_support::check(spam_engine::brand_kb::brand_has_auth_set(s.brand) == s.keyed,
+        std::string("precondition: '") + s.brand + "' KB-keyed == expected");
+  }
+
+  // Namesakes pass. The first name is a distinctive leftover, the shape breaks,
+  // and the claim is dropped entirely — not even Tier-2, so nothing downstream
+  // can condemn a person on their surname.
+  const struct { const char* display; const char* domain; } people[] = {
+      {"Nadia Hilton", "nhilton.example"},  // a person on a domain named after her
+      {"Ines Marriott", "imarriott.example"},  // one edit from the keyed marriott
+      {"Sarah Kroger", "gmail.com"},
+      {"David Lowes", "dlowes.net"},
+  };
+  for (const auto& p : people) {
+    const auto person = display_impersonates_brand(p.display, p.domain);
+    test_support::check(!person.tier1 && !person.tier2,
+        std::string("'") + p.display + "' is a person, not a brand claim");
+    test_support::check(
+        verdict(std::string(p.display) + " <someone@" + p.domain + ">") == 0,
+        std::string("'") + p.display + "' end to end raises no impersonation");
+  }
+
+  // The lure shapes still fire. Each brand's own loyalty programme is a product
+  // line of THAT brand, so it does not break the shape the way a given name does.
+  test_support::check(verdict("Marriott Bonvoy <rewards@serveexpert.example>") == 1,
+      "'Marriott Bonvoy' from a foreign domain is impersonation (keyed, claimed-vs-authenticated)");
+  test_support::check(verdict("Kroger Plus <points@sqlpracticetest.example>") == 1,
+      "'Kroger Plus' from a foreign domain is impersonation");
+  const auto honors = display_impersonates_brand("Hilton Honors", "promo.example");
+  test_support::check(honors.tier1 && honors.brand == "hilton",
+      "'Hilton Honors' keeps the shape and is a Tier-1 claim");
+
+  // And the brands' own authenticated mail is still exempt.
+  test_support::check(verdict("Marriott Bonvoy <rewards@marriott.com>") == 0,
+      "Marriott on its own domain is Marriott");
+
+  // The namesake's OWN COMPOUND DOMAIN. The shape gate and the claim gate above
+  // are display-shaped; the combosquat path is domain-shaped and not
+  // claim-gated, so it fired on these independently, at 0.99 with bounce
+  // authority. is_ambiguous_brand now suppresses the combosquat token match
+  // too: "no person owns b0ulanger.com" is true of the homoglyph branch beside
+  // it and false of a plain compound.
+  test_support::check(verdict("David Lowes <david@lowes-consulting.example>") == 0,
+      "a namesake's own compound domain is not a combosquat");
+  test_support::check(verdict("Sarah Kroger <sarah@kroger-family.example>") == 0,
+      "nor is a family domain built from the family's name");
+  // The scam compound is NOT lost: brand + a strong keyword is a different
+  // predicate (is_phishy_combosquat), and it still condemns.
+  test_support::check(verdict("Service Client <no-reply@boulanger-securite.example>") == 1,
+      "brand + a strong keyword is still a combosquat condemn");
+
+  // An ambiguous brand claimed ONLY in Reply-To still counts. `claimed` is fed
+  // from the Reply-To fields as well as the From, and the erase that keeps a
+  // surname out of the domain-shaped paths reads the shape gate on all four --
+  // an earlier version read only the two From fields and so dropped the BEC
+  // reply-hijack shape the Reply-To fields are read for in the first place.
+  // nortonn is one edit from the keyed norton, so it is a CLAIMED typosquat --
+  // which only works while "norton" is still in the claim set.
+  const std::string hijack =
+      "From: \"Some Person\" <person@unrelated.example>\r\n"
+      "Reply-To: \"Norton Billing\" <billing@nortonn.example>\r\n"
+      "Subject: Your renewal\r\n\r\nHello.\r\n";
+  spam_engine_auth_features_t hj{};
+  spam_engine_extract_auth_features(hijack.data(), hijack.size(), &hj);
+  test_support::check(hj.display_impersonation == 1,
+      "a Norton claim in Reply-To beside a look-alike domain still fires");
 }
 
 void test_display_impersonation() {
   // Extraction (TASK-214): the From display claims a distinctive brand the From
   // org-domain isn't, the Scaleway phish shape.
   const std::string phish =
-      "From: Scaleway <noca@depilacionlasercanarias.com>\r\n"
+      "From: Scaleway <info@depilacionlaser.example>\r\n"
       "Subject: Account locked\r\n\r\nbody";
   spam_engine_auth_features_t f{};
   spam_engine_extract_auth_features(phish.data(), phish.size(), &f);
   test_support::check(f.display_impersonation == 1,
-      "display 'Scaleway' from depilacionlasercanarias.com IS impersonation");
+      "display 'Scaleway' from depilacionlaser.example IS impersonation");
 
   // The brand from its OWN domain is exempt (stem matches), no false flag.
   const std::string legit = "From: Scaleway <noreply@scaleway.com>\r\n\r\nbody";
@@ -2209,14 +2851,14 @@ void test_display_impersonation() {
       "brand display from the brand's OWN domain is NOT impersonation");
 
   // No display name → nothing to impersonate.
-  const std::string nodisp = "From: <noreply@depilacionlasercanarias.com>\r\n\r\nbody";
+  const std::string nodisp = "From: <noreply@depilacionlaser.example>\r\n\r\nbody";
   spam_engine_auth_features_t f3{};
   spam_engine_extract_auth_features(nodisp.data(), nodisp.size(), &f3);
   test_support::check(f3.display_impersonation == 0, "no display name → no impersonation");
 
   // Homoglyph evasion (TASK-230): a capital 'I' standing in for 'l' must not hide
   // a known brand. "ScaIeway" folds to "scaleway" and fires from a foreign domain.
-  const std::string homo = "From: ScaIeway <x@depilacionlasercanarias.com>\r\n\r\nbody";
+  const std::string homo = "From: ScaIeway <x@depilacionlaser.example>\r\n\r\nbody";
   spam_engine_auth_features_t f4{};
   spam_engine_extract_auth_features(homo.data(), homo.size(), &f4);
   test_support::check(f4.display_impersonation == 1,
@@ -2322,7 +2964,7 @@ void test_display_impersonation() {
   // free webmail. The reply-hijack corroborates the tld-swap -> fires.
   const std::string tld_hijack =
       "From: Account Team <billing@paypal.top>\r\n"
-      "Reply-To: service@gmail.com\r\n"
+      "Reply-To: " + test_support::consumer_address("service", "gmail.com") + "\r\n"
       "Authentication-Results: mx; dkim=pass header.d=paypal.top; dmarc=pass\r\n\r\nbody";
   spam_engine_auth_features_t f14{};
   spam_engine_extract_auth_features(tld_hijack.data(), tld_hijack.size(), &f14);
@@ -2334,7 +2976,7 @@ void test_display_impersonation() {
   // a display Tier-2 (the FP that reverted the first AC#1 attempt).
   const std::string surname_rt =
       "From: Bob Smith <bob@smallbiz-consulting.fr>\r\n"
-      "Reply-To: smith@gmail.com\r\n\r\nFollowing up on our chat.";
+      "Reply-To: " + test_support::consumer_address("smith", "gmail.com") + "\r\n\r\nFollowing up on our chat.";
   spam_engine_auth_features_t f15{};
   spam_engine_extract_auth_features(surname_rt.data(), surname_rt.size(), &f15);
   test_support::check(f15.display_impersonation == 0,
@@ -2357,7 +2999,7 @@ void test_display_impersonation() {
   // reputable_aligned, so before TASK-266 'John Williams' condemned even with
   // dmarc=pass ("williams" was Tier-1 via williams.com).
   const std::string surname_en =
-      "From: John Williams <jwilliams@gmail.com>\r\n"
+      "From: John Williams <" + test_support::consumer_address("jwilliams", "gmail.com") + ">\r\n"
       "Authentication-Results: mx; dkim=pass header.d=gmail.com; dmarc=pass\r\n\r\nbody";
   spam_engine_auth_features_t f15c{};
   spam_engine_extract_auth_features(surname_en.data(), surname_en.size(), &f15c);
@@ -2652,7 +3294,7 @@ void test_display_impersonation() {
   // shared-platform domain does NOT vouch for the brand even when in its auth set -> this FIRES
   // (TASK-246). Contrast g2c: Apple from its own NON-shared domain is the brand and is exempt.
   const std::string t2shared =
-      "From: Apple <noreply@icloud.com>\r\n"
+      "From: Apple <" + test_support::consumer_address("noreply", "icloud.com") + ">\r\n"
       "Authentication-Results: mx; dkim=pass header.d=icloud.com; dmarc=pass\r\n\r\nbody";
   spam_engine_auth_features_t g2b{};
   spam_engine_extract_auth_features(t2shared.data(), t2shared.size(), &g2b);
@@ -2687,10 +3329,10 @@ void test_display_impersonation() {
       "'Amazon Marketplace' from amazon.fr: owning brand token exempts the sub-brand");
 
   // ...but a non-brand token matching the throwaway domain must NOT self-exempt a
-  // real impersonation: 'PayPal depilacion' from depilacionlasercanarias.com still fires
+  // real impersonation: 'PayPal depilacion' from depilacionlaser.example still fires
   // ('depilacion' owns the domain but is not a brand; 'paypal' is the spoofed brand).
   const std::string ownself =
-      "From: PayPal depilacion <x@depilacionlasercanarias.com>\r\n\r\nbody";
+      "From: PayPal depilacion <x@depilacionlaser.example>\r\n\r\nbody";
   spam_engine_auth_features_t g5{};
   spam_engine_extract_auth_features(ownself.data(), ownself.size(), &g5);
   test_support::check(g5.display_impersonation == 1,
@@ -2710,7 +3352,7 @@ void test_display_impersonation() {
   // ...but a Tier-2 brand + a GEOGRAPHIC/generic word ("Orange County Moms") is a
   // namesake, not the brand, it breaks the shape even when free-host signed.
   const std::string mwplace =
-      "From: Orange County Moms <ocmoms@gmail.com>\r\n"
+      "From: Orange County Moms <" + test_support::consumer_address("moms.group", "gmail.com") + ">\r\n"
       "Authentication-Results: mx; dkim=pass header.d=gmail.com; dmarc=pass\r\n\r\nbody";
   spam_engine_auth_features_t g7{};
   spam_engine_extract_auth_features(mwplace.data(), mwplace.size(), &g7);
@@ -2752,7 +3394,7 @@ void test_display_impersonation() {
   // display from a gmail.com account is the classic spoof and must still fire even
   // though gmail.com is 'established' and DMARC-aligned to itself.
   const std::string repWebmail =
-      "From: PayPal <phisher@gmail.com>\r\n"
+      "From: PayPal <" + test_support::consumer_address("phisher", "gmail.com") + ">\r\n"
       "Authentication-Results: mx; dkim=pass header.d=gmail.com; dmarc=pass\r\n\r\nbody";
   spam_engine_auth_features_t g11{};
   spam_engine_extract_auth_features(repWebmail.data(), repWebmail.size(), &g11);
@@ -2810,7 +3452,7 @@ void test_display_impersonation() {
   // corroboration. Here a throwaway signer corroborates -> cousin.
   const std::string kbTld =
       "From: PayPal Billing <billing@paypal.top>\r\n"
-      "Authentication-Results: mx; dkim=pass header.d=hfp4j.e5q.jalo.edu.pl; dmarc=fail\r\n\r\nbody";
+      "Authentication-Results: mx; dkim=pass header.d=hfp4j.e5q.synthetic.edu.pl; dmarc=fail\r\n\r\nbody";
   spam_engine_auth_features_t k2{};
   spam_engine_extract_auth_features(kbTld.data(), kbTld.size(), &k2);
   test_support::check(k2.display_impersonation == 1,
@@ -2841,7 +3483,7 @@ void test_display_impersonation() {
   // demotes to the corroboration-gated tier. A throwaway signer corroborates -> fires.
   const std::string kbTypoCorro =
       "From: Billing <noreply@paypall.com>\r\n"
-      "Authentication-Results: mx; dkim=pass header.d=hfp4j.e5q.jalo.edu.pl; dmarc=fail\r\n\r\nbody";
+      "Authentication-Results: mx; dkim=pass header.d=hfp4j.e5q.synthetic.edu.pl; dmarc=fail\r\n\r\nbody";
   spam_engine_auth_features_t k3b{};
   spam_engine_extract_auth_features(kbTypoCorro.data(), kbTypoCorro.size(), &k3b);
   test_support::check(k3b.display_impersonation == 1,
@@ -2921,7 +3563,7 @@ void test_display_impersonation() {
 
   // Single-label multi-word brand (La Poste -> laposte) from a throwaway fires;
   // from its own domain it is exempt.
-  const std::string mwLP = "From: La Poste <edu@hfp4j.e5q.jalo.edu.pl>\r\n\r\nbody";
+  const std::string mwLP = "From: La Poste <edu@hfp4j.e5q.synthetic.edu.pl>\r\n\r\nbody";
   spam_engine_auth_features_t m3{};
   spam_engine_extract_auth_features(mwLP.data(), mwLP.size(), &m3);
   test_support::check(m3.display_impersonation == 1,
@@ -2965,8 +3607,8 @@ void test_display_impersonation() {
   // delivery impersonation target (huge in DE). Tier-2 (needs shape + corroboration),
   // so a throwaway-signed "DHL" fires but the brand from its own aligned domain does
   // not, and a 3-char token outside the tiny allowlist never matches.
-  const std::string dhlTw = "From: DHL Express <edu@hfp4j.e5q.jalo.edu.pl>\r\n"
-      "Authentication-Results: mx; dkim=pass header.d=hfp4j.e5q.jalo.edu.pl; dmarc=pass\r\n\r\nbody";
+  const std::string dhlTw = "From: DHL Express <edu@hfp4j.e5q.synthetic.edu.pl>\r\n"
+      "Authentication-Results: mx; dkim=pass header.d=hfp4j.e5q.synthetic.edu.pl; dmarc=pass\r\n\r\nbody";
   spam_engine_auth_features_t n1{};
   spam_engine_extract_auth_features(dhlTw.data(), dhlTw.size(), &n1);
   test_support::check(n1.display_impersonation == 1,
@@ -2982,7 +3624,7 @@ void test_display_impersonation() {
   // Decision: a low-neural clone flagged as impersonation is condemned to spam
   // (mirrors the real Scaleway phish: neural reads it 'regular').
   spam_engine_decision_input_t in{};
-  in.scores = {0.0F, 0.0F, 0.94F, 0.06F};
+  in.scores = {0.0F, 0.94F, 0.06F};
   in.ml_label = "regular";
   in.ml_confidence = 0.94;
   in.display_impersonation = 1;
@@ -2998,35 +3640,192 @@ void test_display_impersonation() {
       "no impersonation flag → the same low-neural message stays kept");
 }
 
+// A verified reply to our own mail vetoes the display-impersonation condemn
+// (2026-09-24). A user-reported false positive: a two-line reply to mail the
+// user sent, DKIM/SPF/DMARC pass, junked at an adjusted 0.78 because the
+// sender's surname is a hotel chain. The ham-ward offsets could not rescue
+// it, and never could have: dl::fold SUMS each direction, so thread_history
+// (-0.30) plus thread_headers (-0.25) does not cancel display_impersonation
+// (+0.99). Hence a veto, and hence both halves are required -- a Message-ID we
+// issued AND the receiver's own dmarc=pass.
+void test_reply_to_our_own_mail_vetoes_impersonation() {
+  // The neural head says regular, so nothing here condemns on the model alone;
+  // the score is high enough that the ham-ward offsets CANNOT out-sum +0.99,
+  // which is the whole point. At a near-zero spam side thread_history's -0.30
+  // already clears the 0.99 gate by itself and the veto would look untested.
+  // display_impersonation is 1 throughout: every row here is about what does and
+  // does not take the condemn away again. The neural head says regular, so
+  // nothing condemns on the model alone, and the spam side is high enough that
+  // the ham-ward offsets CANNOT out-sum +0.99, which is the whole point: at a
+  // near-zero spam side thread_history's -0.30 already clears the 0.99 gate by
+  // itself and the veto would look tested when it was not.
+  struct Ctx { int own_sent; int phase2; int dmarc_pass; int sends; };
+  auto const decide = [](Ctx c) {
+    spam_engine_decision_input_t in{};
+    in.scores = {0.0F, 0.55F, 0.45F};
+    in.ml_label = "regular";
+    in.ml_confidence = 0.55;
+    in.display_impersonation = 1;
+    in.replied_to_own_sent = c.own_sent;
+    in.phase2_match = c.phase2;
+    in.dmarc_pass = c.dmarc_pass;
+    in.exact_send_count = c.sends;
+    in.profile = SPAM_ENGINE_PROFILE_STANDARD;
+    spam_engine_decision_result_t out{};
+    spam_engine_decide(&in, &out);
+    return out;
+  };
+  auto const label = [&](Ctx c) { return std::string(decide(c).label); };
+
+  test_support::check(label({0, 0, 0, 0}) == "spam",
+      "baseline: an impersonation claim on a low-neural phish still condemns");
+  test_support::check(label({1, 1, 1, 0}) != "spam",
+      "a Message-ID WE SENT + the receiver's dmarc=pass vetoes the condemn");
+
+  // THE BYPASS THIS FIELD EXISTS TO CLOSE. phase2_match is the weaker superset:
+  // it also fires on a parent we merely CLASSIFIED as ham, which an attacker
+  // manufactures by sending one benign message and replying to their own
+  // thread. Only replied_to_own_sent may veto (Codex, #888).
+  test_support::check(label({0, 1, 1, 0}) == "spam",
+      "a Phase-2 hit on a parent we classified ham does NOT veto: attacker-reachable");
+
+  // Both halves of the real route are load-bearing, and each alone must not rescue.
+  test_support::check(label({1, 1, 0, 0}) == "spam",
+      "an own-sent match without dmarc=pass does not rescue (the From is assertable)");
+  test_support::check(label({0, 0, 1, 0}) == "spam",
+      "dmarc=pass alone does not rescue: the Scaleway phish was aligned from a real domain");
+
+  // The second route, for the case Mail gives us no outgoing Message-ID to hold:
+  // an address the user has written to twice. 0/12,807 spam reach it.
+  test_support::check(label({0, 0, 1, 2}) != "spam",
+      "writing to this address twice + dmarc=pass also vetoes the condemn");
+  test_support::check(label({0, 0, 1, 1}) == "spam",
+      "a single prior send is the weaker tier and does NOT veto");
+  test_support::check(label({0, 0, 0, 5}) == "spam",
+      "send history without dmarc=pass does not veto: the address alone is assertable");
+
+  // The veto removes the condemn AUTHORITY too, not just the label: this offset
+  // is on the authoritative-bounce allowlist, so a vetoed claim must not bounce.
+  test_support::check(decide({1, 1, 1, 0}).condemn_offset_fired == 0,
+      "a vetoed impersonation claim carries no condemn authority");
+}
+
 // TASK-232 AC#4: the claimed-vs-authenticated KB mismatch is the primary path for KNOWN
 // brands; the bare Tranco string-condemn is demoted to a cold-start crutch scoped to brands
 // the KB cannot adjudicate. Pin the split so neither half silently regresses.
 void test_display_impersonation_kb_vs_coldstart() {
   // Precondition for the two halves: a distinctive coined brand with NO KB auth set
-  // (cold-start tail) vs one the KB knows (durable core). If the KB grows to cover the
-  // chosen cold-start brand, swap it -- the architecture, not the specific brand, is the point.
-  test_support::check(spam_engine::brand_names::brand_tier("scaleway") == 1 &&
-                          !spam_engine::brand_kb::brand_has_auth_set("scaleway"),
-      "precondition: 'scaleway' is a Tier-1 coined brand with no KB auth set");
-  test_support::check(spam_engine::brand_names::brand_tier("paypal") == 1 &&
-                          spam_engine::brand_kb::brand_has_auth_set("paypal"),
-      "precondition: 'paypal' is a Tier-1 brand the KB knows");
+  // (cold-start tail: hilton and proxmox, the two the user reports of 2026-09 were
+  // about) vs one the KB knows (durable core). If the KB grows to cover the chosen
+  // cold-start brand, swap it -- the architecture, not the specific brand, is the point.
+  const struct { const char* brand; bool keyed; } tier1_brands[] = {
+      {"hilton", false}, {"proxmox", false},  // the two the user reports of 2026-09 were about
+      {"paypal", true}, {"scaleway", true},   // scaleway keyed under TASK-510
+  };
+  for (const auto& b : tier1_brands) {
+    test_support::check(spam_engine::brand_names::brand_tier(b.brand) == 1 &&
+                            spam_engine::brand_kb::brand_has_auth_set(b.brand) == b.keyed,
+        std::string("precondition: '") + b.brand + "' is a Tier-1 coined brand " +
+            (b.keyed ? "the KB knows" : "with no KB auth set"));
+  }
 
-  // Cold-start crutch vs KB durable core: a non-KB coined brand condemns on the name alone (day-0
-  // fallback); a KB brand from an unauthenticated domain fires via claimed-vs-authenticated mismatch;
-  // the same KB brand from a domain in its auth set is exonerated (the KB supersedes the bare string
-  // match). The full auth-verdict x membership matrix is in test_brand_auth_exoneration_truth_table.
-  struct Case { const char* from; int want; const char* why; };
+  // The cold-start string match (TASK-510): a plain-spelled non-KB brand condemns
+  // only with corroboration (a throwaway or free-host signer), never on the name
+  // alone -- a person surnamed Hilton replying from their own domain and "Proxmox VE"
+  // from a self-hoster's own server were both junked on it. A perturbed spelling condemns
+  // standalone: no person or product spells itself "H1lton". A KB brand from an
+  // unauthenticated domain fires via the claimed-vs-authenticated mismatch, with no
+  // corroboration needed (the Scaleway phish from a compromised, aligned clinic);
+  // the same KB brand from a domain in its auth set is exonerated. The full
+  // auth-verdict x membership matrix is in test_brand_auth_exoneration_truth_table.
+  const std::string free_host_ar =
+      "Authentication-Results: mx.example.net;\r\n"
+      "       dkim=pass header.i=@firebaseapp.com header.s=key;\r\n"
+      "       spf=pass; dmarc=fail (p=NONE) header.from=hilton-honors.firebaseapp.com\r\n";
+  struct Case { std::string headers; int want; const char* why; };
   const Case cases[] = {
-      {"Scaleway <noca@depilacionlasercanarias.com>", 1, "non-KB coined brand fires standalone (cold-start crutch)"},
-      {"PayPal Support <secure@account-verify-portal.com>", 1, "KB brand from an unauthenticated domain fires (mismatch)"},
-      {"PayPal <service@paypal.com>", 0, "KB brand from a domain in its authenticated set is NOT impersonation"},
+      {"From: Nadia Hilton <nadia@nhilton.example>\r\n", 0,
+       "plain non-KB brand beside a given name, no corroboration: not impersonation"},
+      {"From: \"Proxmox VE\" <pve@homelab.example>\r\n", 0,
+       "plain non-KB product name from a self-hosted install, no corroboration: not impersonation"},
+      // A neutral From domain in the two below: a brand-plus-keyword domain
+      // ("hilton-rewards") is a combosquat and condemns on its own structural
+      // path, which is not what these cases measure.
+      {"From: Hilton Honors <rewards@promo-mailer.example>\r\n", 0,
+       "plain non-KB brand claim with no corroborating signer: not impersonation on the string alone"},
+      {free_host_ar + "From: Hilton Honors <rewards@hilton-honors.firebaseapp.com>\r\n", 1,
+       "plain non-KB brand claim from a free-host signer: corroborated, fires"},
+      {"From: Hi1ton Honors <rewards@promo-mailer.example>\r\n", 1,
+       "perturbed non-KB brand spelling (a 1 for the l) fires standalone (no corroboration needed)"},
+      // Every other spelling no person carries counts as perturbed too: a
+      // cross-script homoglyph, an invisible code point inside the token, and
+      // letter-spacing. Each folds to the plain stem, so the fold alone cannot
+      // tell them from "Hilton"; the tokenizer's `folded` bit does (a spaced
+      // join sets it).
+      {"From: \"H\xd1\x96lton Honors\" <rewards@promo-mailer.example>\r\n", 1,
+       "Cyrillic i in a non-KB brand fires standalone"},
+      {"From: \"Hil\xe2\x80\x8bton Honors\" <rewards@promo-mailer.example>\r\n", 1,
+       "a zero-width space inside a non-KB brand fires standalone"},
+      {"From: \"H i l t o n Honors\" <rewards@promo-mailer.example>\r\n", 1,
+       "a letter-spaced non-KB brand fires standalone"},
+      {"From: \"Hilton\xe2\x80\x8b Honors\" <rewards@promo-mailer.example>\r\n", 0,
+       "a zero-width space AFTER the token (a marketer's spacer) is not a perturbed spelling"},
+      // The local part is read even when the display carries a plain Tier-1
+      // claim: the perturbed spelling that condemns may sit there alone.
+      {"From: Nadia Hilton <hi1ton@promo-mailer.example>\r\n", 1,
+       "a plain display beside a perturbed local-part claim fires on the local part"},
+      // The second Tier-1 token decides too: perturbation is OR'd across tokens,
+      // not read off the first hit.
+      {"From: \"Hilton Pr0xmox\" <x@promo-mailer.example>\r\n", 1,
+       "a perturbed second Tier-1 token fires (OR across tokens)"},
+      {"From: Scaleway <info@depilacionlaser.example>\r\n", 1,
+       "KB brand from a domain outside its auth set fires (mismatch), aligned or not"},
+      {"From: PayPal Support <secure@account-verify-portal.com>\r\n", 1,
+       "KB brand from an unauthenticated domain fires (mismatch)"},
+      {"From: PayPal <service@paypal.com>\r\n", 0,
+       "KB brand from a domain in its authenticated set is NOT impersonation"},
   };
   for (const Case& c : cases) {
-    const std::string eml = std::string("From: ") + c.from + "\r\n\r\nbody";
+    const std::string eml = c.headers + "\r\nbody";
     spam_engine_auth_features_t f{};
     spam_engine_extract_auth_features(eml.data(), eml.size(), &f);
     test_support::check(f.display_impersonation == c.want, c.why);
+  }
+  // The perturbation bit itself, on the match: a Latin diacritic is a genuine
+  // spelling (Nocibé is how Nocibé writes it) and must not set it, while each
+  // cross-script or invisible fold must, whatever the KB later decides.
+  using spam_engine::brand_names::display_impersonates_brand;
+  test_support::check(!display_impersonates_brand("Nocib\xc3\xa9 Support", "promo.example").tier1_perturbed,
+      "a Latin diacritic fold is not a perturbed spelling");
+  test_support::check(display_impersonates_brand("H\xd1\x96lton Support", "promo.example").tier1_perturbed,
+      "a Cyrillic homoglyph fold is a perturbed spelling");
+  test_support::check(display_impersonates_brand("Hil\xc2\xadton Support", "promo.example").tier1_perturbed,
+      "a soft hyphen inside the token is a perturbed spelling");
+  test_support::check(!display_impersonates_brand("Hilton Support", "promo.example").tier1_perturbed,
+      "the plain spelling is not");
+  // The claim is the first Tier-1 token and the perturbation is OR'd across
+  // all of them: "Scaleway Pr0xmox" claims scaleway, perturbed. Moving the claim
+  // onto the perturbed token would change which brand the KB adjudicates.
+  const auto two = display_impersonates_brand("Scaleway Pr0xmox", "promo.example");
+  test_support::check(two.brand == "scaleway" && two.tier1_perturbed,
+      "brand is the first Tier-1 claim; a later perturbed token still marks the match perturbed");
+  // An AMBIGUOUS brand does not take the claim off a plain Tier-1 one, because
+  // it is resolved after the loop and only when nothing else claimed: "Hilton
+  // Pr0xmox" is adjudicated as proxmox, the brand no person is named after.
+  // This is the 2026-09-24 surname change, and it is the desired order: a
+  // surname should never be the brand the KB measures a sender against when an
+  // unambiguous claim sits beside it.
+  const auto amb = display_impersonates_brand("Hilton Pr0xmox", "promo.example");
+  test_support::check(amb.brand == "proxmox" && amb.tier1_perturbed,
+      "an ambiguous surname-brand yields the claim to an unambiguous one beside it");
+  {
+    const std::string eml =
+        "Authentication-Results: mx; spf=pass smtp.mailfrom=louisvuitton.com; dmarc=pass\r\n"
+        "From: \"PayPal Vuitt0n\" <x@louisvuitton.com>\r\n\r\nbody";
+    spam_engine_auth_features_t f{};
+    spam_engine_extract_auth_features(eml.data(), eml.size(), &f);
+    test_support::check(f.display_impersonation == 1,
+        "a KB brand claim beside a perturbed KB brand the sender IS authenticated as still mismatches on the first claim");
   }
 }
 
@@ -3067,7 +3866,7 @@ void test_tier2_from_combosquat() {
 // verdict) and the multi-word join path (AmEx / aexp.com). A SHARED in-set domain (icloud.com) is a
 // separate dimension: it fires regardless of verdict (TASK-246), pinned by the one row below + g2b.
 void test_brand_auth_exoneration_truth_table() {
-  struct Case { const char* display; const char* from; const char* ar; int want; const char* why; };
+  struct Case { const char* display; std::string from; const char* ar; int want; const char* why; };
   const Case cases[] = {
       // Single-token, NON-shared in-set: transferwise.com is in wise's auth set (non-prefix, so only
       // membership saves it; not a shared platform, so the DMARC verdict alone decides).
@@ -3075,8 +3874,16 @@ void test_brand_auth_exoneration_truth_table() {
       {"Wise", "x@transferwise.com", "mx; dkim=pass header.d=transferwise.com; dmarc=pass", 0, "in-set + DKIM-aligned pass -> exonerate"},
       {"Wise", "x@transferwise.com", "mx; spf=pass smtp.mailfrom=transferwise.com; dmarc=pass", 0, "in-set + SPF-only pass -> exonerate"},
       {"Wise", "x@transferwise.com", "mx; spf=fail; dmarc=fail",                          1, "in-set + dmarc=FAIL (forged) -> fire"},
+      // Fail is the edge's word, not the absence of a pass (2026-09-19, TASK-337): an
+      // aligned signer with no dmarc= token (Outlook) is a pass; an edge that reports no
+      // dmarc method at all (2013 Hotmail: spf, a dkim permerror, x-hmca) is unknown; a
+      // dmarc= result that is not pass stays a fail.
+      {"Wise", "x@transferwise.com", "mx; dkim=pass header.d=transferwise.com",           0, "in-set + aligned signer, no dmarc= token -> exonerate"},
+      {"Wise", "x@transferwise.com", "mx; spf=pass smtp.mailfrom=transferwise.com; dkim=permerror header.d=transferwise.com", 0, "in-set + edge reports no dmarc method -> unknown, exonerate"},
+      {"Wise", "x@transferwise.com", "mx; spf=pass smtp.mailfrom=transferwise.com; dmarc=none header.from=transferwise.com", 1, "in-set + dmarc=none (the edge found no policy for a brand that publishes one) -> fire"},
+      {"Wise", "x@transferwise.com", "mx; spf=pass smtp.mailfrom=transferwise.com; dmarc=temperror header.from=transferwise.com", 1, "in-set + dmarc=temperror -> fire (the edge's word)"},
       // A SHARED-webmail in-set domain does NOT vouch even on a pass (TASK-246).
-      {"Apple", "x@icloud.com", "mx; dkim=pass header.d=icloud.com; dmarc=pass",         1, "in-set but SHARED platform -> fire despite pass"},
+      {"Apple", test_support::consumer_address("x", "icloud.com"), "mx; dkim=pass header.d=icloud.com; dmarc=pass", 1, "in-set but SHARED platform -> fire despite pass"},
       // Not in the brand's auth set, no brand token / phishy keyword: the claim alone decides.
       {"Apple", "x@notice-account-portal.com", nullptr,                                  1, "not-in-set + NO AR -> fire (claim)"},
       {"Apple", "x@notice-account-portal.com", "mx; spf=pass smtp.mailfrom=notice-account-portal.com; dmarc=pass", 1, "not-in-set + aligned to its OWN domain -> still fire"},
@@ -3147,20 +3954,20 @@ void test_extract_auth_features_throwaway_signer() {
   // 'Action requise pour maintenir votre service Cloud.eml'.
   const std::string email =
       "Authentication-Results: mx.google.com;\r\n"
-      "       dkim=pass header.i=@jjlw.how.populag.org.es header.s=smtp;\r\n"
-      "       spf=pass; dmarc=pass header.from=jjlw.how.populag.org.es\r\n"
-      "From: CIoud.Support <edu@jjlw.how.populag.org.es>\r\n"
+      "       dkim=pass header.i=@jjlw.how.synthetic.org.es header.s=smtp;\r\n"
+      "       spf=pass; dmarc=pass header.from=jjlw.how.synthetic.org.es\r\n"
+      "From: CIoud.Support <edu@jjlw.how.synthetic.org.es>\r\n"
       "\r\nbody";
   spam_engine_auth_features_t features{};
   test_support::check(
       spam_engine_extract_auth_features(email.data(), email.size(), &features) == 0,
       "extract should succeed");
-  test_support::check(std::string(features.dkim_signing_fqdn) == "jjlw.how.populag.org.es",
+  test_support::check(std::string(features.dkim_signing_fqdn) == "jjlw.how.synthetic.org.es",
                       "full signer FQDN should be surfaced");
-  test_support::check(std::string(features.dkim_signing_domain) == "populag.org.es",
-                      "org_domain is ccSLD-aware: populag.org.es, not org.es");
+  test_support::check(std::string(features.dkim_signing_domain) == "synthetic.org.es",
+                      "org_domain is ccSLD-aware: synthetic.org.es, not org.es");
   test_support::check(features.signer_throwaway == 1,
-                      "jjlw.how below populag.org.es is throwaway-shaped");
+                      "jjlw.how below synthetic.org.es is throwaway-shaped");
   test_support::check(features.dmarc_aligned == 1,
                       "spammer-aligned throwaway domain still reads as aligned");
 
@@ -3179,11 +3986,11 @@ void test_extract_auth_features_throwaway_signer() {
 
   // ...but a SINGLE letter + digits (m1 / m4 / t9o) is not a shard word, it is
   // throwaway randomness: it must read as generated so the whole FQDN qualifies.
-  // (Real throwaway phish signers: t9o.m1.fnt.rybnik.pl, ek4a.m4.ich.walbrzych.pl.)
+  // (The shape real throwaway phish signers take under a Polish regional suffix.)
   const std::string shortgen =
       "Authentication-Results: mx.example.net;\r\n"
-      "       dkim=pass header.d=t9o.m1.fnt.rybnik.pl\r\n"
-      "From: Apple <edu@t9o.m1.fnt.rybnik.pl>\r\n"
+      "       dkim=pass header.d=t9o.m1.qzx.rybnik.pl\r\n"
+      "From: Apple <edu@t9o.m1.qzx.rybnik.pl>\r\n"
       "\r\nbody";
   test_support::check(
       spam_engine_extract_auth_features(shortgen.data(), shortgen.size(), &features) == 0,
@@ -3218,17 +4025,17 @@ void test_extract_auth_features_throwaway_signer() {
 
   // Google Workspace signs digit-named customers as
   // <name>-<tld>.<yyyymmdd>.gappssmtp.com — the date-stamp label is exempt,
-  // so a brand like 42.fr or beer52.com must NOT read as throwaway
+  // so a digit-named brand must NOT read as throwaway
   // (7 real ham FPs in 75,635 before this exemption — TASK-178 OOD scan).
   const std::string workspace =
       "Authentication-Results: mx.example.net;\r\n"
-      "       dkim=pass header.i=user@42-fr.20210112.gappssmtp.com\r\n"
-      "From: 42 <contact@42.fr>\r\n"
+      "       dkim=pass header.i=user@4242-test.20210112.gappssmtp.com\r\n"
+      "From: 4242 <contact@4242.test>\r\n"
       "\r\nbody";
   test_support::check(
       spam_engine_extract_auth_features(workspace.data(), workspace.size(), &features) == 0,
       "extract should succeed");
-  test_support::check(std::string(features.dkim_signing_fqdn) == "42-fr.20210112.gappssmtp.com",
+  test_support::check(std::string(features.dkim_signing_fqdn) == "4242-test.20210112.gappssmtp.com",
                       "full-AUID header.i=local@domain keeps the domain side");
   test_support::check(features.signer_throwaway == 0,
                       "digit-named Workspace customer with date-stamp label is not throwaway");
@@ -3592,7 +4399,7 @@ void test_embed_capacity_guard_c_abi() {
 // TASK-201 AC#3 (engine half): the URL-domain extractor exposed over the C ABI.
 void test_extract_url_domains_c_api() {
   const std::string raw =
-      "From: x@y.com\r\nSubject: t\r\nContent-Type: text/html\r\n\r\n"
+      "From: x@example.com\r\nSubject: t\r\nContent-Type: text/html\r\n\r\n"
       "<a href=\"https://login.evil.web.app/reset\">x</a> "
       "see http://www.Example.co.uk/p and https://u:p@phish.firebaseapp.com/\r\n";
   char* out = spam_engine_extract_url_domains(raw.data(), raw.size());
@@ -3610,7 +4417,7 @@ void test_extract_url_domains_c_api() {
         "C ABI must return the deduped eTLD+1 domains, newline-delimited");
 
   // No URLs → "" (allocated), not NULL.
-  const std::string clean = "From: a@b.com\r\nSubject: hi\r\n\r\nno links\r\n";
+  const std::string clean = "From: a@example.com\r\nSubject: hi\r\n\r\nno links\r\n";
   char* empty = spam_engine_extract_url_domains(clean.data(), clean.size());
   test_support::check(empty != nullptr && empty[0] == '\0',
         "no-URL body returns an allocated empty string, not NULL");
@@ -3625,7 +4432,7 @@ void test_decide_c_api() {
   // Free-host condemn: a marketing leak (spam-side ~0.09) signed by web.app is
   // carried over the 0.90 standard threshold by the sender-auth push.
   spam_engine_decision_input_t in{};
-  in.scores = {0.04F, 0.91F, 0.0F, 0.05F};
+  in.scores = {0.91F, 0.0F, 0.09F};
   in.ml_label = "marketing";
   in.ml_confidence = 0.91;
   in.dkim_signing_org_domain = "web.app";
@@ -3640,7 +4447,7 @@ void test_decide_c_api() {
 
   // Ham rescue: model says spam, but the user has emailed this sender >= 2x.
   spam_engine_decision_input_t r{};
-  r.scores = {0.0F, 0.0F, 0.05F, 0.95F};
+  r.scores = {0.0F, 0.05F, 0.95F};
   r.ml_label = "spam";
   r.ml_confidence = 0.95;
   r.exact_send_count = 2;
@@ -3656,7 +4463,7 @@ void test_decide_c_api() {
   // leak at every profile (was 0.04 + 0.90 = 0.94 < 0.95, kept). No new FP: free-host
   // signing is 0/500 ham, so this only condemns mail that is never legitimate.
   spam_engine_decision_input_t c{};
-  c.scores = {0.0F, 0.96F, 0.0F, 0.04F};
+  c.scores = {0.96F, 0.0F, 0.04F};
   c.ml_label = "marketing";
   c.ml_confidence = 0.96;
   c.dkim_signing_org_domain = "web.app";
@@ -3671,7 +4478,7 @@ void test_decide_c_api() {
   // gate (0.99 - 0.15 = 0.84). v4 (TASK-283): score + ceiling scaled to the 0.99
   // gate (ceiling 0.97 -> 0.999), so the rescue still fires below "near-certain".
   spam_engine_decision_input_t b{};
-  b.scores = {0.0F, 0.0F, 0.01F, 0.99F};
+  b.scores = {0.0F, 0.01F, 0.99F};
   b.ml_label = "spam";
   b.ml_confidence = 0.99;
   b.dkim_signing_org_domain = "github.com";  // Tranco rank 31
@@ -3690,7 +4497,7 @@ void test_decide_c_api() {
   // Ceiling: a near-certain spam (spam-side 0.9995 >= 0.999) signed by a brand is
   // NOT exonerated — guards against a popular-but-abused domain.
   spam_engine_decision_input_t bc{};
-  bc.scores = {0.0F, 0.0F, 0.0005F, 0.9995F};
+  bc.scores = {0.0F, 0.0005F, 0.9995F};
   bc.ml_label = "spam";
   bc.ml_confidence = 0.9995;
   bc.dkim_signing_org_domain = "github.com";
@@ -3706,7 +4513,7 @@ void test_decide_c_api() {
   // destructive bounce on its own). v4 (TASK-283): borderline scaled to the 0.99
   // gate (0.70 + 0.30 = 1.0 >= 0.99; was 0.65 + 0.30 = 0.95 >= 0.90).
   spam_engine_decision_input_t ip{};
-  ip.scores = {0.0F, 0.30F, 0.0F, 0.70F};
+  ip.scores = {0.30F, 0.0F, 0.70F};
   ip.ml_label = "marketing";
   ip.ml_confidence = 0.70;
   ip.raw_ip_url = 1;
@@ -3720,7 +4527,7 @@ void test_decide_c_api() {
 
   // Raw-IP alone cannot condemn a clean message: spam-side 0.30 + 0.30 = 0.60 < 0.90.
   spam_engine_decision_input_t ipc{};
-  ipc.scores = {0.0F, 0.70F, 0.0F, 0.30F};
+  ipc.scores = {0.70F, 0.0F, 0.30F};
   ipc.ml_label = "marketing";
   ipc.ml_confidence = 0.70;
   ipc.raw_ip_url = 1;
@@ -3734,7 +4541,7 @@ void test_decide_c_api() {
   // the bounce-authorizing flag, because the caller OBSERVED the peer rather than
   // reading a claim out of the message.
   spam_engine_decision_input_t drop{};
-  drop.scores = {0.0F, 0.08F, 0.90F, 0.02F};
+  drop.scores = {0.08F, 0.90F, 0.02F};
   drop.ml_label = "regular";
   drop.ml_confidence = 0.98;
   drop.connect_ip_blocked = 1;
@@ -3759,7 +4566,7 @@ void test_decide_c_api() {
   // TASK-391: GTUBE condemns regardless of content score — the point of the test
   // string is that the answer does not depend on the model.
   spam_engine_decision_input_t gt{};
-  gt.scores = {0.0F, 0.02F, 0.97F, 0.01F};
+  gt.scores = {0.02F, 0.97F, 0.01F};
   gt.ml_label = "regular";
   gt.ml_confidence = 0.99;
   gt.gtube_test = 1;
@@ -3773,7 +4580,7 @@ void test_decide_c_api() {
 
   // TASK-387: the header-derived sibling is weaker and cannot condemn alone.
   spam_engine_decision_input_t hdr{};
-  hdr.scores = {0.0F, 0.08F, 0.90F, 0.02F};
+  hdr.scores = {0.08F, 0.90F, 0.02F};
   hdr.ml_label = "regular";
   hdr.ml_confidence = 0.98;
   hdr.header_ip_blocked = 1;
@@ -3806,7 +4613,7 @@ void test_decide_c_api() {
   // A ham-ward offset that fires without changing the verdict is listed, but
   // unmarked: "fired" and "flipped the decision" are different facts.
   spam_engine_decision_input_t threaded{};
-  threaded.scores = {0.0F, 0.08F, 0.90F, 0.02F};
+  threaded.scores = {0.08F, 0.90F, 0.02F};
   threaded.ml_label = "regular";
   threaded.ml_confidence = 0.98;
   threaded.has_in_reply_to = 1;
@@ -3971,7 +4778,18 @@ void test_callback_shape_is_corroborating_not_condemning() {
 void test_abi_sizes_are_self_reported() {
   spam_engine_abi_sizes_t sizes{};
   spam_engine_get_abi_sizes(&sizes);
-  test_support::check(sizes.field_count == 8, "field_count matches the struct");
+  // The literal is the point: the header declares sixteen uint32_t after
+  // field_count today, and a field appended without this line moving is what
+  // the check exists to catch. The Python mirrors derive theirs from their
+  // own field lists, so the three sides cross-check rather than restate.
+  // (Went 15 -> 16 on 2026-09-24 with caller_state_replied_to_own_sent, and
+  // this assertion is what noticed. Stayed 16 in TASK-540: decision_input left
+  // the ABI and caller_state_header_ip_blocked joined it.)
+  test_support::check(sizes.field_count == 16, "field_count is every uint32_t after itself");
+  test_support::check(sizeof(spam_engine_abi_sizes_t) == 17 * sizeof(uint32_t),
+                      "the struct is field_count plus sixteen fields");
+  test_support::check(sizes.runtime_info == sizeof(spam_engine_runtime_info_t),
+        "runtime_info size is reported correctly");
   test_support::check(
       sizes.caller_state_connect_ip_blocked ==
           offsetof(spam_engine_caller_state_t, connect_ip_blocked),
@@ -3980,10 +4798,12 @@ void test_abi_sizes_are_self_reported() {
       sizes.caller_state_attachment_risk_enabled ==
           offsetof(spam_engine_caller_state_t, attachment_risk_enabled),
       "appended attachment experiment flag offset is reported");
+  test_support::check(
+      sizes.caller_state_header_ip_blocked ==
+          offsetof(spam_engine_caller_state_t, header_ip_blocked),
+      "appended header-IP flag offset is reported");
   test_support::check(sizes.parsed_signals == sizeof(spam_engine_parsed_signals_t),
         "parsed_signals size is reported correctly");
-  test_support::check(sizes.decision_input == sizeof(spam_engine_decision_input_t),
-        "decision_input size is reported correctly");
   test_support::check(sizes.decision_result == sizeof(spam_engine_decision_result_t),
         "decision_result size is reported correctly");
   test_support::check(sizes.caller_state == sizeof(spam_engine_caller_state_t),
@@ -3997,7 +4817,7 @@ void test_abi_sizes_are_self_reported() {
 }
 
 void test_decision_input_from_signals() {
-  spam_engine_scores_t const scores = {0.01F, 0.04F, 0.10F, 0.85F};  // spam-dominant
+  spam_engine_scores_t const scores = {0.04F, 0.10F, 0.85F};  // spam-dominant
   spam_engine_parsed_signals_t signals{};
   signals.thread.has_in_reply_to = 1;
   signals.thread.references_count = 3;
@@ -4015,9 +4835,9 @@ void test_decision_input_from_signals() {
   din.phase2_match = 1;
   spam_engine_decision_input_from_signals(&din, &scores, &signals);
 
-  // Every engine-derived field mapped (all 4 scores, not just the argmax winner).
-  test_support::check(din.scores.gibberish == 0.01F && din.scores.marketing == 0.04F &&
-        din.scores.regular == 0.10F && din.scores.spam == 0.85F, "all 4 scores copied");
+  // Every engine-derived field mapped (all 3 scores, not just the argmax winner).
+  test_support::check(din.scores.marketing == 0.04F &&
+        din.scores.regular == 0.10F && din.scores.spam == 0.85F, "all 3 scores copied");
   test_support::check(std::string(din.ml_label) == "spam", "neural-decision label is spam");
   test_support::check(din.ml_confidence == static_cast<double>(scores.spam),
         "spam-side decision confidence is the spam score");
@@ -4073,7 +4893,7 @@ void test_decision_input_from_signals() {
 // authoritative offset sets the flag, and every corroborator -- including the
 // 0.99-magnitude experimental one -- does not.
 // The matcher, pinned against the SAME strings the Python census ran on
-// (model-lab/scripts/measure_secured_account_shape.py), because the 0-of-21,291
+// (model-lab/scripts/measure_secured_account_shape.py), because the 0-of-17,348
 // false-positive rate that licenses a 0.99 magnitude was measured with those
 // patterns and this scanner is a different implementation of them.
 void test_no_contact_matcher_parity() {
@@ -4315,7 +5135,7 @@ void test_no_contact_junks_but_never_bounces() {
 void test_authoritative_condemn_allowlist() {
   const auto decide = [](void (*arm)(spam_engine_decision_input_t&)) {
     spam_engine_decision_input_t in{};
-    in.scores = {0.0F, 0.0F, 0.98F, 0.02F};  // clean model verdict on its own
+    in.scores = {0.0F, 0.98F, 0.02F};  // clean model verdict on its own
     in.ml_label = "regular";
     in.ml_confidence = 0.98;
     in.profile = SPAM_ENGINE_PROFILE_STANDARD;
@@ -4409,7 +5229,7 @@ void test_attachment_context_and_default_off_rule() {
   test_support::check(context.find("name=\"invoice.pdf\"") != std::string::npos,
       "C ABI exposes the runtime's model-facing filename context");
 
-  spam_engine_scores_t const clean = {0.0F, 0.0F, 1.0F, 0.0F};
+  spam_engine_scores_t const clean = {0.0F, 1.0F, 0.0F};
   spam_engine_parsed_signals_t signals{};
   signals.attachment = features;
   spam_engine_decision_input_t din{};
@@ -4461,45 +5281,75 @@ void test_attachment_context_and_default_off_rule() {
   }
 }
 
+// The milter reaches its verdict through classify_full (TASK-540), so every
+// transport fact it observed has to cross caller_state. header_ip_blocked did
+// not exist there until then: dropping it would silently lose the TASK-387
+// offset on every DROP-listed origin behind a trusted relay.
+void test_classify_full_reads_transport_facts_from_caller_state() {
+  bool have_ftrl = false;
+  spam_engine_handle_t* handle =
+      create_loaded_engine("classify_full transport facts", &have_ftrl);
+  if (handle == nullptr) { return; }
+  const std::string mail =
+      "From: Alice <alice@example.org>\r\nSubject: lunch\r\n\r\n"
+      "Are we still on for lunch tomorrow?\r\n";
+  const auto fired = [&](const spam_engine_caller_state_t& caller) {
+    spam_engine_full_result_t full{};
+    const auto status = spam_engine_classify_full(handle, mail.data(), mail.size(),
+                                                  "", "", "ensemble", &caller, &full);
+    test_support::check(status == SPAM_ENGINE_STATUS_OK, "classify_full succeeds");
+    return std::string(full.decision.fired_offsets);
+  };
+  spam_engine_caller_state_t header{};
+  header.header_ip_blocked = 1;
+  test_support::check(fired(header).find("header_ip_drop") != std::string::npos,
+      "caller_state.header_ip_blocked reaches the fold");
+  spam_engine_caller_state_t both = header;
+  both.connect_ip_blocked = 1;
+  const std::string both_fired = fired(both);
+  test_support::check(both_fired.find("connect_ip_drop") != std::string::npos &&
+                          both_fired.find("header_ip_drop") == std::string::npos,
+      "an observed connecting IP supersedes the header evidence");
+  test_support::check(fired(spam_engine_caller_state_t{}).find("ip_drop") == std::string::npos,
+      "no transport fact, no transport offset");
+  spam_engine_destroy(handle);
+}
+
 // TASK-251 C5: the builder sets ml_label from the model's binary spam-side
 // DECISION (== SpamEngine::decision_from_scores, == Swift mlResult.label), NOT a
-// raw 4-class argmax, so the C-ABI decide path can't diverge from the engine and
-// Swift on gibberish-argmax mail.
+// raw argmax, so the fold can't diverge from the engine and Swift.
 void test_decision_ml_label_matches_engine_decision() {
   spam_engine_parsed_signals_t signals{};
 
-  // Gibberish is the argmax, but the engine scores this a DELIVER (gibberish
-  // 0.55 <= 0.7 and spam 0.25 <= 0.5): ml_label must be the deliver label, not
-  // "gibberish". The old argmax builder returned "gibberish" here. Raw spam side
-  // (0.80) stays UNDER the 0.90 gate so the display-impersonation offset is what
-  // condemns (a genuine header-only condemn), letting train_ml differ by label.
-  spam_engine_scores_t const gib = {0.55F, 0.05F, 0.50F, 0.25F};
+  // Marketing is the argmax, and the engine scores this a DELIVER (spam 0.30 <=
+  // 0.5): ml_label must be the deliver label "regular", not the argmax.
+  spam_engine_scores_t const mkt = {0.60F, 0.10F, 0.30F};
   spam_engine_decision_input_t din{};
-  spam_engine_decision_input_from_signals(&din, &gib, &signals);
+  spam_engine_decision_input_from_signals(&din, &mkt, &signals);
   test_support::check(std::string(din.ml_label) == "regular",
-        "gibberish-argmax below the spam-side gate is a deliver, not gibberish (C5)");
-  test_support::check(din.ml_confidence == (1.0F - gib.spam),
+        "marketing-argmax below the spam-side gate is a deliver (C5)");
+  test_support::check(din.ml_confidence == (1.0F - mkt.spam),
         "deliver confidence is 1 - spam (matches decision_from_scores)");
 
-  // High gibberish (> 0.7) IS a spam-side decision even though spam is not the argmax.
-  spam_engine_scores_t const hg = {0.80F, 0.05F, 0.10F, 0.40F};
-  spam_engine_decision_input_from_signals(&din, &hg, &signals);
+  // spam > 0.5 IS a spam-side decision even when spam is not the argmax would
+  // be impossible in three classes summing to 1; a majority spam side is spam.
+  spam_engine_scores_t const sp = {0.20F, 0.25F, 0.55F};
+  spam_engine_decision_input_from_signals(&din, &sp, &signals);
   test_support::check(std::string(din.ml_label) == "spam",
-        "gibberish > 0.7 is a spam-side decision (C5)");
+        "spam side > 0.5 is a spam-side decision (C5)");
 
-  // The divergence bit the fold: on the deliver-scored gibberish mail, a
-  // spam-ward offset (display impersonation) condemns via the OFFSET, so it is a
-  // header-only condemn (train_ml=0). The OLD argmax label "gibberish" would have
-  // made the fold think the MODEL said spam (train_ml=1), disagreeing with Swift.
+  // On the deliver-scored mail, a spam-ward offset (display impersonation)
+  // condemns via the OFFSET, so it is a header-only condemn (train_ml=0); a
+  // label claiming the MODEL said spam would make it train_ml=1.
   signals.auth.display_impersonation = 1;
-  spam_engine_decision_input_from_signals(&din, &gib, &signals);  // ml_label = "regular"
+  spam_engine_decision_input_from_signals(&din, &mkt, &signals);  // ml_label = "regular"
   spam_engine_decision_result_t fixed{};
   spam_engine_decide(&din, &fixed);
-  din.ml_label = "gibberish";                                     // simulate the old argmax bug
-  spam_engine_decision_result_t old_bug{};
-  spam_engine_decide(&din, &old_bug);
-  test_support::check(fixed.train_ml == 0 && old_bug.train_ml == 1,
-        "argmax->decision fix flips the fold's train_ml on gibberish-argmax + spam-ward mail (C5)");
+  din.ml_label = "spam";
+  spam_engine_decision_result_t model_said_spam{};
+  spam_engine_decide(&din, &model_said_spam);
+  test_support::check(fixed.train_ml == 0 && model_said_spam.train_ml == 1,
+        "the decision label, not the argmax, sets train_ml on a spam-ward condemn (C5)");
 }
 
 }  // namespace
@@ -4520,6 +5370,15 @@ int main() {
   failures += test_support::run_test(
       "model_info names the loaded artifact",
       test_model_info_names_the_loaded_artifact);
+  failures += test_support::run_test(
+      "runtime_info counts truncation (TASK-505 L)",
+      test_runtime_info_counts_truncation);
+  failures += test_support::run_test(
+      "log callback receives engine and native lines (TASK-505 L)",
+      test_log_callback_receives_engine_and_native_lines);
+  failures += test_support::run_test(
+      "log tail cuts on line boundaries (TASK-505 L)",
+      test_log_tail_cuts_on_line_boundaries);
   failures += test_support::run_test(
       "demo samples hold their decision class (TASK-266)",
       test_demo_samples_decision);
@@ -4578,6 +5437,9 @@ int main() {
       "attachment context + default-off deterministic rule (TASK-347)",
       test_attachment_context_and_default_off_rule);
   failures += test_support::run_test(
+      "classify_full reads transport facts from caller_state (TASK-540)",
+      test_classify_full_reads_transport_facts_from_caller_state);
+  failures += test_support::run_test(
       "decide ml_label is the engine decision, not argmax (TASK-251 C5)",
       test_decision_ml_label_matches_engine_decision);
   failures += test_support::run_test(
@@ -4623,6 +5485,12 @@ int main() {
       "parcel carrier impersonation (TASK-440/442)",
       test_parcel_carrier_impersonation);
   failures += test_support::run_test(
+      "Hide My Email relay identity; places and plurals are Tier-2 (2026-09-16)",
+      test_hide_my_email_relay_and_place_names);
+  failures += test_support::run_test(
+      "edge Authentication-Results run: first header per method",
+      test_edge_results_first_header_per_method);
+  failures += test_support::run_test(
       "combosquat keywords are not English-only (fr/de bank-advisor lure)",
       test_non_english_combosquat_keywords);
   failures += test_support::run_test(
@@ -4656,6 +5524,9 @@ int main() {
       "impersonation: KB mismatch vs cold-start string crutch (TASK-232 AC#4)",
       test_display_impersonation_kb_vs_coldstart);
   failures += test_support::run_test(
+      "impersonation: a verified reply to our own mail vetoes the condemn",
+      test_reply_to_our_own_mail_vetoes_impersonation);
+  failures += test_support::run_test(
       "impersonation: Tier-2 From combosquat, typosquat excluded (TASK-232 AC#7)",
       test_tier2_from_combosquat);
   failures += test_support::run_test(
@@ -4688,6 +5559,11 @@ int main() {
   failures += test_support::run_test(
       "embed capacity guard C ABI (TASK-208)",
       test_embed_capacity_guard_c_abi);
+  // Last on purpose: it unloads Metal process-wide. Nothing after it may
+  // measure or assert anything about the GPU.
+  failures += test_support::run_test(
+      "runtime_info records a requested CPU (TASK-505 L)",
+      test_runtime_info_requested_cpu);
 
   // Each test above creates AND destroys its own engine handle, and must keep
   // doing so. Nothing here will tell you if a future test stops: the leak is

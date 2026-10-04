@@ -1,5 +1,33 @@
 # Klar Engine
 
+## Klar for Stalwart
+
+Klar replaces Stalwart's built-in spam filter with a multilingual transformer
+classifier that runs on your own server: Stalwart hands each inbound message to
+the `klar-milterd` milter, and a per-mailbox Sieve rule files on its verdict.
+
+Install on Linux (x86_64 or arm64, systemd), from prebuilt release binaries:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/klar-im/engine/main/install.sh | sudo KLAR_ACCEPT_MODEL_LICENSE=1 sh
+```
+
+`KLAR_ACCEPT_MODEL_LICENSE=1` records that you accept the model's licence
+(CC-BY-NC-4.0, `LICENSE-MODEL.md`); the installer downloads the model,
+verified file by file, and starts the `klar-milterd` service. Then point
+Stalwart at it with `stalwart-cli` admin credentials:
+
+```bash
+export STALWART_URL=http://127.0.0.1:8080 STALWART_USER=admin STALWART_PASSWORD=...
+python3 /opt/klar/share/stalwart/scripts/apply.py --milter-host 127.0.0.1 --milter-port 8891
+```
+
+The full guide (shadow mode, per-mailbox filing, the container, sizing) is
+[`stalwart/README.md`](stalwart/README.md). On Postfix, run the installer with
+`KLAR_MTA=postfix` and follow [`postfix/README.md`](postfix/README.md).
+
+## The engine
+
 A self-hostable spam-detection engine built on a multilingual transformer
 (XLM-RoBERTa) classifier. It scores mail on-device: no data leaves your server.
 
@@ -19,6 +47,9 @@ This repo is the open-core of [Klar](https://klar.im), licensed AGPLv3 (see
 - `postfix/` is the reference milter: a Postfix-facing daemon (config, policy,
   event store, health endpoint, CLI) plus a Docker end-to-end stack (Postfix
   and Dovecot) that shows how to embed the engine.
+- `stalwart/` is the Stalwart wiring: config fragments, `apply.py` over
+  `stalwart-cli`, the filing Sieve, a compose end-to-end stack.
+- `install.sh` is the one-line installer for the release binaries.
 
 ## Run it behind your mail server
 
@@ -31,9 +62,15 @@ This repo is the open-core of [Klar](https://klar.im), licensed AGPLv3 (see
 - **Postfix**: [`postfix/README.md`](postfix/README.md). The same daemon with
   OpenDKIM and OpenDMARC ahead of it, a systemd unit, and a Docker end-to-end
   stack.
-- **The image**: `postfix/docker/Dockerfile` builds `klar-milterd` from this
-  tree with no weights; the container fetches the model into its volume on
-  first start, only with `KLAR_ACCEPT_MODEL_LICENSE=1`.
+- **The binaries**: every release attaches `klar-milterd-<version>-linux-x86_64.tar.gz`
+  and `-linux-arm64.tar.gz` (with `.sha256`), built by this repo's CI on
+  glibc 2.35 (x86_64) and 2.39 (arm64) with every other library bundled and
+  no weights. `install.sh`
+  installs them; read it before piping it to a shell.
+- **The image**: `ghcr.io/klar-im/klar-milterd` (linux/amd64 and linux/arm64),
+  built from `postfix/docker/Dockerfile` with no weights; the container
+  fetches the model into its volume on first start, only with
+  `KLAR_ACCEPT_MODEL_LICENSE=1`.
 
 ## The model is separate from the code
 
@@ -49,7 +86,7 @@ attribution; commercial use needs a paid licence, see `LICENSE-MODEL.md`).
 make setup                                   # C/C++ deps (llama.cpp, gmime, xxhash, json)
 KLAR_ACCEPT_MODEL_LICENSE=1 make model       # fetch the production model, verified against the pinned manifest
 make build
-./engine/build/spam_classifier ./engine/model   # classify a built-in sample
+./engine/build/spam_classifier ./engine/model engine/tests/data/demo-samples/spam.en.eml   # prints: spam
 ```
 
 `make model` downloads the seven files the manifest pins into `engine/model/`

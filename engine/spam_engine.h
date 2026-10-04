@@ -7,26 +7,22 @@
 #include <vector>
 
 #include "email_preprocessor.h"  // ExtractedThreadFeatures / ExtractedAuthFeatures
+#include "engine_runtime.h"       // EncoderRuntimeInfo / EncoderEmbedding
 
 class TrainableClassifierHead;
 
 namespace spam_engine {
 
-struct TranscriptMessage {
-  std::string from_type;
-  std::string text;
-  std::string origin;
-};
-
-// Sender / context metadata that gets serialized into the head's input
-// `Customer Info:` block. Today carries name + email + a single derived
-// signal (replyto_differs); see engine/PARITY_PLAN.md for the next batch
-// of signals (in_address_book, prior_corrections, envelope_mismatch, ...).
+// Sender metadata. The legacy (public-v0) input envelope serializes it into a
+// `Customer Info:` block, the wording that model was trained on; raw-input
+// models never see it. Carries name + email + a single derived signal
+// (replyto_differs); see engine/PARITY_PLAN.md for the next batch of signals
+// (in_address_book, prior_corrections, envelope_mismatch, ...).
 //
 // New fields are wire-format-additive: they're emitted only when the
 // signal is present, so old training distributions stay valid until the
 // next retrain teaches the head the new tokens.
-struct CustomerInfo {
+struct SenderInfo {
   std::string name;
   std::string email;
   // True if the message has a Reply-To header that differs from the From
@@ -60,8 +56,8 @@ class CalibratedInputText {
   explicit CalibratedInputText(std::string t) : text_(std::move(t)) {}
 
   friend CalibratedInputText build_input_text(
-      const std::vector<TranscriptMessage>& transcript,
-      const CustomerInfo& customer,
+      const std::string& text,
+      const SenderInfo& sender,
       ModelInputFormat format);
 
   std::string text_;
@@ -70,13 +66,13 @@ class CalibratedInputText {
 // Explicit representation builder. Production callers use
 // SpamEngine::calibrate_input(), which selects from classifier_config.json.
 CalibratedInputText build_input_text(
-    const std::vector<TranscriptMessage>& transcript,
-    const CustomerInfo& customer,
+    const std::string& text,
+    const SenderInfo& sender,
     ModelInputFormat format);
 
-// Parse a "Foo Bar <foo@bar.com>" or bare "foo@bar.com" string into
+// Parse a "Foo Bar <foo@example.com>" or bare "foo@example.com" string into
 // (display_name, email_address). Used by every code path that needs to
-// reconcile a caller-supplied CustomerInfo with the From header GMime
+// reconcile a caller-supplied SenderInfo with the From header GMime
 // parsed out of the raw RFC822 bytes. Public so the C ABI doesn't have to
 // re-inline the same logic.
 std::pair<std::string, std::string> parse_from_header(const std::string& from);
@@ -87,7 +83,7 @@ std::pair<std::string, std::string> parse_from_header(const std::string& from);
 std::string default_gguf_encoder_file(const std::string& model_path);
 
 // Apply preprocessor-derived signals (currently `replyto_differs` and the
-// From-header sender fallback) to a caller-supplied CustomerInfo, in
+// From-header sender fallback) to a caller-supplied SenderInfo, in
 // place. Caller-provided name+email always wins over the From header;
 // preprocessor-derived signals always override caller-supplied values for
 // fields the caller couldn't have known (replyto_differs).
@@ -96,12 +92,14 @@ std::string default_gguf_encoder_file(const std::string& model_path);
 // with what GMime found" — used by classify_rfc822, train_rfc822, and
 // the C ABI's spam_engine_embed_rfc822.
 struct PreprocessedEmail;  // forward declared in email_preprocessor.h
-void apply_preprocessed_to_customer(
-    CustomerInfo& customer,
+void apply_preprocessed_to_sender(
+    SenderInfo& sender,
     const PreprocessedEmail& preprocessed);
 
+// The three classes of the product taxonomy. A legacy 4-label artifact
+// (public-v0) has a gibberish row too; classify_embedding adds its probability
+// to `spam`, the side it always counted toward, so nothing downstream sees it.
 struct ClassScores {
-  float gibberish = 0.0F;
   float marketing = 0.0F;
   float regular = 0.0F;
   float spam = 0.0F;
@@ -111,13 +109,13 @@ struct ClassificationResult {
   // The five answer fields, disambiguated (TASK-219):
   //  class_name   — the engine's own spam/regular call from `scores`.
   //  confidence   — confidence in THAT call (e.g. 1 - P(spam)), not scores[class].
-  //  scores       — the stable four-slot semantic envelope
-  //                 {gibberish, marketing, regular, spam}. A model may have
+  //  scores       — the stable three-slot semantic envelope
+  //                 {marketing, regular, spam}. A model may have
   //                 fewer physical rows; unavailable semantics are zero. In
   //                 "ensemble" mode `scores.spam` is
   //                 the ESCALATE-ONLY spam side max(neural, w*ftrl+(1-w)*neural)
   //                 — i.e. what the structural decision layer should fold — while
-  //                 gibberish/marketing/regular stay raw neural. It equals raw
+  //                 marketing/regular stay raw neural. It equals raw
   //                 neural unless FTRL escalated. `neural_spam` keeps the
   //                 pre-blend neural spam so each stage stays inspectable.
   //  decided_by   — "neural" | "ftrl" | "ftrl+neural" (which scorers ran).
@@ -137,6 +135,13 @@ struct ClassificationResult {
   ExtractedUrlFeatures    url_features;
   ExtractedBodyFeatures   body_features;
   ExtractedAttachmentFeatures attachment_features;
+  // How many of this message's encoder sequences the token cap clipped: 0, 1
+  // or 2 on the rfc822 path (plain and html are embedded separately), 0 or 1
+  // on the text path, 0 when the neural head did not run. Stamped from the
+  // embeddings this call produced (EncoderEmbedding::truncated), so it holds
+  // whoever else is embedding on the same encoder; `runtime_info()` is the
+  // cumulative view (TASK-505 L).
+  std::uint32_t encoder_truncated_sequences = 0;
 };
 
 /// Which scorers produce the verdict. REQUIRED — there is no silent default
@@ -219,7 +224,7 @@ struct EngineConfig {
   // Weight of FTRL P(spam) in the ESCALATE-ONLY "ensemble" fold of the spam side:
   //   scores.spam' = max(neural.spam, w*ftrl + (1-w)*neural.spam)
   // The blend is applied only when it RAISES the spam side, so FTRL can add
-  // suspicion but never exonerate. FTRL trains only on the founder's small,
+  // suspicion but never exonerate. FTRL trains only on a small,
   // spam-poor personal mbox, so a cold ftrl≈0 is absence-of-evidence, not a ham
   // vote — a SYMMETRIC blend at this weight dragged confident-neural spam below
   // the condemn threshold (0/5 recall on the blatant slice, measure_escalate_only.py
@@ -266,8 +271,12 @@ class SpamEngine {
   // model, so C-ABI callers size embed() output buffers from this once.
   [[nodiscard]] int n_embd() const noexcept;
 
-  // Actual encoder backend after load, including automatic Metal->CPU fallback.
-  [[nodiscard]] bool uses_gpu() const noexcept;
+  // The backend the encoder actually runs on after load (Metal, or CPU with
+  // the reason: requested, no GPU device, or a context init that failed and
+  // the ggml lines that say why), the cap in force, and the sequence counters
+  // since load. Zero-valued when not loaded. See engine_runtime.h. A copy
+  // (three strings), so not noexcept: the C API's catch is the boundary.
+  [[nodiscard]] EncoderRuntimeInfo runtime_info() const;
 
   // What the loaded artifact says it is.
   //
@@ -306,8 +315,8 @@ class SpamEngine {
   // text. Keeping this model-bound prevents a comparison or rollout from
   // silently feeding one model the other model's representation.
   [[nodiscard]] CalibratedInputText calibrate_input(
-      const std::vector<TranscriptMessage>& transcript,
-      const CustomerInfo& customer) const;
+      const std::string& text,
+      const SenderInfo& sender) const;
 
   // Model-bound RFC822 representation. normalized_text is always the legacy,
   // marker-free base; marker_prefix is prepended only when the loaded artifact
@@ -316,16 +325,16 @@ class SpamEngine {
       const std::string& normalized_text,
       const std::string& marker_prefix,
       const std::string& attachment_context,
-      const CustomerInfo& customer) const;
+      const SenderInfo& sender) const;
 
   // Compatibility convenience for generic callers/tests with no attachment
   // parse. Model-bound RFC822 paths use the four-argument form above.
   [[nodiscard]] CalibratedInputText calibrate_preprocessed_input(
       const std::string& normalized_text,
       const std::string& marker_prefix,
-      const CustomerInfo& customer) const {
+      const SenderInfo& sender) const {
     return calibrate_preprocessed_input(
-        normalized_text, marker_prefix, "", customer);
+        normalized_text, marker_prefix, "", sender);
   }
 
   // `options.mode` is REQUIRED (ensemble|neural|ftrl) — no silent default.
@@ -342,11 +351,6 @@ class SpamEngine {
       const ClassifyOptions& options,
       bool extract_attachment_signals = false);
 
-  ClassificationResult classify_transcript(
-      const std::vector<TranscriptMessage>& transcript,
-      const CustomerInfo& customer,
-      const ClassifyOptions& options);
-
   // Encoder API. The string types here are CalibratedInputText, NOT
   // std::string — the compiler enforces that anything fed to the head
   // went through an explicit `build_input_text` choice first. See
@@ -360,14 +364,14 @@ class SpamEngine {
 
   float train_text(const std::string& text, int correct_label);
   float train_rfc822(const std::string& raw_rfc822,
-                     const CustomerInfo& customer,
+                     const SenderInfo& sender,
                      int correct_label);
   // Train only the additive, escalate-only FTRL learner. The neural head is
   // neither embedded nor updated. This is the role-specific Klar Plus arm:
   // personalized spam evidence may raise the spam side, but a spam-poor early
   // mailbox cannot teach the base neural classifier that spam is ham.
   void train_ftrl_rfc822(const std::string& raw_rfc822,
-                         const CustomerInfo& customer,
+                         const SenderInfo& sender,
                          int correct_label);
   float train_embedding(const std::vector<float>& embedding, int correct_label);
 
@@ -418,7 +422,7 @@ class SpamEngine {
   static int label_from_string(const std::string& label);
   static std::string label_to_string(int label);
   // Canonical int->name mapping as a static string literal (single source of
-  // truth for label_to_string and the C API's spam_engine_label_name).
+  // truth for label_to_string).
   static const char* label_name(int label);
 
  private:
@@ -435,6 +439,11 @@ class SpamEngine {
       const CalibratedInputText& neural_input,
       const CalibratedInputText& ftrl_input,
       const ClassifyOptions& options);
+  // embed_batch with the per-sequence truncation flag kept, so a classify
+  // entry point stamps `ClassificationResult::encoder_truncated_sequences`
+  // from what it embedded.
+  std::vector<EncoderEmbedding> embed_inputs(
+      const std::vector<CalibratedInputText>& inputs);
   void ensure_loaded() const;
   float train_inputs(
       const CalibratedInputText& neural_input,
@@ -447,7 +456,7 @@ class SpamEngine {
   [[nodiscard]] std::vector<std::pair<CalibratedInputText, CalibratedInputText>>
   prepare_rfc822_training_inputs(
       const std::string& raw_rfc822,
-      const CustomerInfo& customer) const;
+      const SenderInfo& sender) const;
 
   EngineConfig config_;
   std::unique_ptr<Impl> impl_;

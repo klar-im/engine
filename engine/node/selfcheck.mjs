@@ -3,10 +3,10 @@
 // is the check that says so, run right after every build of the addon (make
 // website/engine-addon, and deploy-demo-engine.sh on the server).
 //
-// Why it exists: the addon runs spam_engine_decide itself, and a standalone
-// decide caller has to copy the artifact's calibration knot into the decision
-// input (spam_engine_classify_full does it for its own callers). Until
-// 2026-09-14 it did not, and nothing noticed for as long as the released model
+// Why it exists: until TASK-540 the addon ran the decide step itself, and a
+// standalone decide caller had to copy the artifact's calibration knot into the
+// decision input (spam_engine_classify_full, which the addon now calls, does it
+// for its callers). Until 2026-09-14 it did not, and nothing noticed for as long as the released model
 // declared no knot: public-v0's raw spam side already sits above 0.99. gen3-v6
 // declares 0.8931 and its raw spam side tops out near 0.90, so the day it was
 // deployed every neural spam verdict on klar.im read as ham at 0.897 while the

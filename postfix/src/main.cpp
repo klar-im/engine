@@ -140,7 +140,8 @@ int main(int argc, char* argv[]) {
 
         auto result = runtime.classify_rfc822(smoke_email, "", "smoke@test.local",
                                               /*connect_ip_blocked=*/false,
-                                              /*header_ip_blocked=*/false);
+                                              /*header_ip_blocked=*/false,
+                                              klar::profile_to_engine(cfg->profile));
         if (!result.ok) {
             log_msg(cfg->log_json, "error",
                     "smoke inference failed: " + result.error);
@@ -148,21 +149,20 @@ int main(int argc, char* argv[]) {
         } else {
             // Per-score [0,1] sanity + a sum LOWER bound. NOT sum≈1: in ensemble
             // mode scores.spam is the escalate-only spam side (max of neural and
-            // the FTRL blend), so the four values are intentionally not a
+            // the FTRL blend), so the three values are intentionally not a
             // normalized softmax and can sum above 1 when a warm FTRL escalates
             // (TASK-38). But the non-spam classes stay a raw-neural softmax, so a
             // valid result always sums to >= ~1; the `sum < 0.5` floor catches a
-            // dead/zeroed model ({0,0,0,0}) that the per-score bounds would pass.
-            const float sum = result.spam + result.regular + result.marketing + result.gibberish;
+            // dead/zeroed model ({0,0,0}) that the per-score bounds would pass.
+            const float sum = result.spam + result.regular + result.marketing;
             auto bad = [](float x) { return !std::isfinite(x) || x < -0.01f || x > 1.01f; };
             if (bad(result.spam) || bad(result.regular) ||
-                bad(result.marketing) || bad(result.gibberish) || sum < 0.5f) {
+                bad(result.marketing) || sum < 0.5f) {
                 char buf[256];
                 snprintf(buf, sizeof(buf),
                          "smoke inference scores not sane: spam=%.4f regular=%.4f "
-                         "marketing=%.4f gibberish=%.4f sum=%.4f",
-                         result.spam, result.regular, result.marketing,
-                         result.gibberish, sum);
+                         "marketing=%.4f sum=%.4f",
+                         result.spam, result.regular, result.marketing, sum);
                 log_msg(cfg->log_json, "error", buf);
                 if (!cfg->fail_open) return 1;
             } else {

@@ -20,6 +20,8 @@
 //   at encode time, so we throw early instead.
 
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -32,6 +34,8 @@
 
 #include <ggml-backend.h>
 #include <llama.h>
+
+#include "engine_runtime.h"
 
 namespace spam_engine {
 
@@ -54,12 +58,31 @@ inline std::string& native_log_buffer() {
   return buffer;
 }
 
-inline void native_log_callback(ggml_log_level /*level*/, const char* text, void* /*user*/) {
+inline void native_log_callback(ggml_log_level level, const char* text, void* /*user*/) {
   if (text == nullptr) { return;
 }
-  // Keep dev/CLI behaviour unchanged: ggml normally prints to stderr.
-  std::fputs(text, stderr);
+  // Through the engine's own sink (engine_runtime.h): stderr when none is
+  // installed, so dev/CLI behaviour is unchanged. llama's loader chatter is
+  // INFO on its side and DEBUG on ours; a consumer that wants it asks for it.
+  // A CONT fragment continues the previous line and keeps its level, so the
+  // tail of a ggml error does not land in the debug channel.
+  // One critical section for the level, the delivery and the capture: two
+  // handles loading on two threads would otherwise hand one thread's CONT
+  // fragment the other's level, and capture lines in an order the sink never
+  // saw. The sink holds no ggml lock and calls nothing that logs through
+  // here, so delivering under this mutex cannot re-enter it.
+  static LogLevel last_level = LogLevel::kDebug;  // guarded by native_log_mutex()
   std::scoped_lock const lock(native_log_mutex());
+  LogLevel ours = LogLevel::kDebug;
+  if (level == GGML_LOG_LEVEL_CONT) {
+    ours = last_level;
+  } else {
+    ours = level == GGML_LOG_LEVEL_ERROR ? LogLevel::kError
+        : level == GGML_LOG_LEVEL_WARN ? LogLevel::kWarn
+        : LogLevel::kDebug;
+    last_level = ours;
+  }
+  log_line(ours, text);
   std::string& buffer = native_log_buffer();
   buffer.append(text);
   constexpr size_t kMaxNativeLog = 4096;  // keep only the recent tail
@@ -73,6 +96,47 @@ inline std::string drain_native_log() {
   std::string out = native_log_buffer();
   native_log_buffer().clear();
   return out;
+}
+
+// The last `max_bytes` of the capture, whole lines (log_tail_lines in
+// engine_runtime.h), without draining it: the reason a GPU context init
+// failed is in here at the moment it fails, and the CPU load that follows
+// would otherwise bury it.
+inline std::string native_log_tail(size_t max_bytes) {
+  std::scoped_lock const lock(native_log_mutex());
+  return log_tail_lines(native_log_buffer(), max_bytes);
+}
+
+// Why Metal is gone from this process, if it is. ggml_backend_unload(MTL) is
+// process-wide (see load_with_gpu_layers), so every encoder loaded after the
+// first CPU load finds no GPU device and, without this, would report
+// no_gpu_device on a Mac that has one: the extension's nightly reload after
+// a failed context init would overwrite the recorded reason and its detail
+// with the wrong one. First unload wins; later loads read it.
+struct MetalUnloadRecord {
+  std::mutex mutex;
+  bool unloaded = false;
+  EncoderFallback reason = EncoderFallback::kNone;
+  std::string detail;
+};
+
+inline MetalUnloadRecord& metal_unload_record() {
+  static MetalUnloadRecord record;
+  return record;
+}
+
+inline void unload_metal(EncoderFallback reason, std::string detail) {
+  auto* metal_reg = ggml_backend_reg_by_name("MTL");
+  // Nothing to unload (already gone, or a host that never had Metal): the
+  // record stays as it is, so a Linux CPU load does not claim to have
+  // removed a GPU.
+  if (metal_reg == nullptr) { return; }
+  ggml_backend_unload(metal_reg);
+  auto& record = metal_unload_record();
+  std::scoped_lock const lock(record.mutex);
+  record.unloaded = true;
+  record.reason = reason;
+  record.detail = std::move(detail);
 }
 
 // True once process exit has torn down, or is about to tear down, ggml's own
@@ -233,17 +297,17 @@ class GgmlEncoder {
     // measure CI-CPU vs prod-Metal divergence on the same model (TASK-204).
     // the only setenv() in this class runs inside the call_once above, so by
     // this point env mutation is done.
-    const int default_gpu_layers =
-        // NOLINTNEXTLINE(concurrency-mt-unsafe)
-        std::getenv("SPAM_ENGINE_NO_GPU") != nullptr ? 0 : 99;
-    load_with_gpu_layers(gguf_path, default_gpu_layers);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    const bool cpu_requested = std::getenv("SPAM_ENGINE_NO_GPU") != nullptr;
+    load_with_gpu_layers(gguf_path, cpu_requested ? 0 : 99,
+                         cpu_requested ? EncoderFallback::kRequestedCpu : EncoderFallback::kNone);
     // After the load, never before: ggml's device statics are constructed
     // lazily during it, and this must be registered later than all of them.
     install_exit_teardown_guard();
   }
 
-  std::vector<std::vector<float>> embed_batch(const std::vector<std::string>& texts) {
-    std::vector<std::vector<float>> results;
+  std::vector<EncoderEmbedding> embed_batch(const std::vector<std::string>& texts) {
+    std::vector<EncoderEmbedding> results;
     results.reserve(texts.size());
     for (const auto& text : texts) {
       results.push_back(embed_one(text));
@@ -255,9 +319,11 @@ class GgmlEncoder {
   // model's lifetime, so callers size output buffers from this exactly once.
   [[nodiscard]] int n_embd() const noexcept { return n_embd_; }
 
-  // True only when this loaded instance requested offload, a GPU backend was
-  // registered, and context creation succeeded without the CPU fallback.
-  [[nodiscard]] bool uses_gpu() const noexcept { return uses_gpu_; }
+  // The backend this instance runs on and why, the cap in force, and what the
+  // cap did since load(). Filled by load_with_gpu_layers; the counters by
+  // embed_one. A fresh instance per load (SpamEngine::load builds one), so
+  // the counters start at zero without a reset.
+  [[nodiscard]] const EncoderRuntimeInfo& runtime_info() const noexcept { return runtime_; }
 
  private:
   // Pre-truncation tokenize buffer. Large enough to absorb any realistic email
@@ -269,12 +335,12 @@ class GgmlEncoder {
   llama_context*     ctx_   = nullptr;
   const llama_vocab* vocab_ = nullptr;
   int                n_embd_ = 0;
-  bool               uses_gpu_ = false;
+  EncoderRuntimeInfo runtime_;
   // Persistent buffer to avoid per-call allocation churn during batch
   // embedding (training processes hundreds/thousands of samples).
   std::vector<llama_token> token_buf_;
 
-  std::vector<float> embed_one(const std::string& text) {
+  EncoderEmbedding embed_one(const std::string& text) {
     // Tokenize to a large buffer first, then truncate to max_tokens_.
     // We pass add_special=true, but the GGUF metadata `add_bos_token` was
     // set to False during conversion (a `convert_hf_to_gguf.py` quirk for
@@ -321,10 +387,12 @@ class GgmlEncoder {
       token_buf_.assign(scratch.begin(), scratch.begin() + keep);
       n = cnt;
     }
+    bool truncated = false;
     if (n > max_tokens_) {
       // Truncate and restore EOS at the last position (mirrors CT2 path).
       n = max_tokens_;
       token_buf_[n - 1] = llama_vocab_eos(vocab_);
+      truncated = true;
     }
     token_buf_.resize(n);
 
@@ -336,24 +404,30 @@ class GgmlEncoder {
       if (static_cast<int>(token_buf_.size()) > max_tokens_) {
         token_buf_.resize(max_tokens_);
         token_buf_[max_tokens_ - 1] = llama_vocab_eos(vocab_);
+        truncated = true;
       }
     }
-
     // Clear context memory so each call is independent.
     llama_memory_clear(llama_get_memory(ctx_), /*data=*/false);
 
     // Encode as a single sequence (seq_id = 0 via batch_get_one).
     auto const batch = llama_batch_get_one(token_buf_.data(), static_cast<int32_t>(token_buf_.size()));
     if (llama_encode(ctx_, batch) != 0) {
+      ++runtime_.sequences_failed;
       throw std::runtime_error("GgmlEncoder: llama_encode failed");
     }
 
     // CLS pooling: llama.cpp returns the pooled embedding for seq 0.
     const float* emb = llama_get_embeddings_seq(ctx_, 0);
     if (!emb) {
+      // The 2026-09-13 brew-upgrade breakage: every encode ended here. Counted
+      // as failed, never as embedded, so a backend that embeds nothing says so.
+      ++runtime_.sequences_failed;
       throw std::runtime_error("GgmlEncoder: embedding extraction returned null (pooling misconfigured?)");
     }
-    return {emb, emb + n_embd_};
+    ++runtime_.sequences_embedded;
+    if (truncated) { ++runtime_.sequences_truncated; }
+    return {{emb, emb + n_embd_}, truncated};
   }
 
   // Try to load with the given GPU layer count. If context creation fails
@@ -365,16 +439,20 @@ class GgmlEncoder {
   // blocked (sandbox/VM), all subsequent instances should skip it too
   // rather than repeating the failed init. The backend registry is
   // process-global and initialized once via call_once above.
-  void load_with_gpu_layers(const std::string& gguf_path, int n_gpu_layers) {
+  //
+  // `why_cpu` is the reason CPU was chosen when n_gpu_layers is 0 (requested
+  // by env, or a context init that just failed): an input, so the record is
+  // written in one place below rather than reconstructed after the fact.
+  void load_with_gpu_layers(const std::string& gguf_path, int n_gpu_layers,
+                            EncoderFallback why_cpu) {
     // ggml 0.17 may still choose an initialized Metal backend for context work
     // when model layers and KQV are CPU-only. That breaks the documented
     // SPAM_ENGINE_NO_GPU contract in sandboxes/VMs where Metal is present but
     // cannot create a command queue. Explicit CPU mode is process-wide, so unload
     // MTL before model/context creation just as the GPU-failure fallback does.
     if (n_gpu_layers == 0) {
-      auto *metal_reg = ggml_backend_reg_by_name("MTL");
-      if (metal_reg) { ggml_backend_unload(metal_reg);
-}
+      unload_metal(why_cpu, why_cpu == EncoderFallback::kContextInitFailed
+                                ? runtime_.fallback_detail : std::string());
     }
 
     auto mparams = llama_model_default_params();
@@ -420,12 +498,13 @@ class GgmlEncoder {
     if (!ctx_ && n_gpu_layers > 0) {
       // GPU init failed (e.g. Metal blocked in sandbox) — retry CPU-only.
       // Unload MTL so context init doesn't try to init it again on retry.
-      auto *metal_reg = ggml_backend_reg_by_name("MTL");
-      if (metal_reg) { ggml_backend_unload(metal_reg);
-}
+      // Capture why first: the CPU load below writes more native log and a
+      // support mail wants the lines from THIS failure, not that success.
+      // The CPU load unloads Metal (with this reason and detail, process-wide).
+      runtime_.fallback_detail = native_log_tail(EncoderRuntimeInfo::kFallbackDetailBytes);
       llama_model_free(model_);
       model_ = nullptr;
-      load_with_gpu_layers(gguf_path, 0);
+      load_with_gpu_layers(gguf_path, 0, EncoderFallback::kContextInitFailed);
       return;
     }
     if (!ctx_) {
@@ -434,9 +513,49 @@ class GgmlEncoder {
       throw std::runtime_error("GgmlEncoder: failed to create context");
     }
 
-    uses_gpu_ = n_gpu_layers > 0 &&
-        (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr ||
-         ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr);
+    auto* gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_dev == nullptr) { gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU); }
+    const bool uses_gpu = n_gpu_layers > 0 && gpu_dev != nullptr;
+    // The one place the reason is written: on the GPU there is none; CPU by
+    // request or after a failed context init is what the caller passed; CPU
+    // with the GPU asked for means no GPU-typed device registered (no Metal
+    // plugin staged, or Linux CI).
+    runtime_.fallback = uses_gpu ? EncoderFallback::kNone
+        : n_gpu_layers == 0 ? why_cpu
+        : EncoderFallback::kNoGpuDevice;
+    if (runtime_.fallback == EncoderFallback::kNoGpuDevice) {
+      // No GPU device because an earlier load in this process unloaded Metal:
+      // that load's reason and detail are the true ones (see MetalUnloadRecord).
+      auto& record = metal_unload_record();
+      std::scoped_lock const lock(record.mutex);
+      if (record.unloaded) {
+        runtime_.fallback = record.reason;
+        runtime_.fallback_detail = record.detail;
+      }
+    }
+    // The name comes from ggml's own registry, lower-cased ("CUDA" -> "cuda",
+    // "Vulkan" -> "vulkan"), with ggml's "MTL" spelled out as "metal" because
+    // this string ends up in support mails. Chosen here and nowhere else, so
+    // every consumer that prints or stores a backend says what the engine
+    // said rather than keeping its own two-word vocabulary.
+    runtime_.backend = "cpu";
+    auto* dev_in_use = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (uses_gpu) {
+      dev_in_use = gpu_dev;
+      runtime_.backend = ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpu_dev));
+      if (runtime_.backend == "MTL") {
+        runtime_.backend = "metal";
+      } else {
+        std::transform(runtime_.backend.begin(), runtime_.backend.end(), runtime_.backend.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      }
+    }
+    // "Apple M1 Pro" beside "metal": the line a support thread wants.
+    if (dev_in_use != nullptr) {
+      const char* description = ggml_backend_dev_description(dev_in_use);
+      runtime_.device = description != nullptr ? description : "";
+    }
+    runtime_.max_tokens = max_tokens_;
 
     n_embd_ = llama_model_n_embd(model_);
     vocab_ = llama_model_get_vocab(model_);

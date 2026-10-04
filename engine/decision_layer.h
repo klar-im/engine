@@ -71,9 +71,10 @@ inline constexpr double kOriginIpDrop = 0.99;  // spam-ward: the peer that CONNE
 // spam-ward: brand-independent callback phishing (TASK-440). Billing language, a
 // callback phone number, no link anywhere, and a sender the receiver could not
 // verify. Corroborating, like kUrlRawIp and for the same reason: measured 0 of
-// 3,621 real invoices, 0 of 8,000 ordinary messages, and 203 of 7,083
-// invoice-shaped trap messages. 0 of 3,621 bounds the false-positive rate at
-// roughly 0.08% rather than at zero, so a message must already be near 0.69 from
+// 2,008 distinct real invoices, 0 of 8,000 ordinary messages, and 228 of 8,488
+// invoice-shaped trap messages (2026-10-01; the 2026-08-19 run's 3,621 summed
+// its sources). 0 of 2,008 bounds the false-positive rate at
+// roughly 0.15% rather than at zero, so a message must already be near 0.69 from
 // the model before this carries it over the gate. The auth condition lives at
 // the offset site in spam_engine_c_api.cpp, with the measurement that forced it.
 inline constexpr double kCallbackShape = 0.30;
@@ -85,18 +86,24 @@ inline constexpr double kCallbackShape = 0.30;
 // else because the evidence is different. Rule of three on a zero count bounds
 // the true false-positive rate at 3/N:
 //
-//   kCallbackShape   0 of  3,621 real invoices     -> bound 0.083%  -> 0.30
-//   this             0 of 21,291 real ham messages -> bound 0.0141% -> 0.99
+//   kCallbackShape   0 of  2,008 real invoices     -> bound 0.149%  -> 0.30
+//   this             0 of 17,348 real ham messages -> bound 0.0173% -> 0.99
 //
-// THE DENOMINATOR IS DISTINCT MESSAGES, and getting that wrong was caught in
-// review. The first version quoted 25,982, which is the SUM of the census's ham
-// rows -- but two of those rows re-scan mailboxes the others already cover, so
-// the same messages were counted twice and a repeated observation cannot tighten
-// a bound. 21,291 is the distinct ham-labelled population of the four source
-// mailboxes (21,325 messages less 34 that carry X-Klar-Label: spam). The census
-// now computes and prints that number rather than leaving it to be summed.
+// THE DENOMINATOR IS DISTINCT MESSAGES, and getting that wrong was caught three
+// times: the callback panel's own 3,621 (2026-08-19) summed its six sources with
+// gmail in twice and hotmail three times, and read the Apple Mail export as two
+// blobs; distinct and ham-labelled it was 2,054 (2026-09-30, #935), and with
+// the billing prefilter on the decoded Subject rather than the raw header
+// block it is 2,008 (2026-10-01, the same PR).
+// The first version quoted 25,982, the SUM of the census's ham rows, two of
+// which re-scan mailboxes the others already cover: a repeated observation
+// cannot tighten a bound. The second quoted 21,291 as "distinct", but it summed
+// the four source mailboxes, and personalization/gmail_inbox.mbox is 3,630 of
+// its 3,631 messages the same mail as applemail/gmail_inbox (found 2026-09-25,
+// TASK-516). 17,348 is the ham-labelled population after de-duplicating by
+// Message-ID, and the census computes it (`distinct_ham`) rather than summing.
 //
-// A 5.9x tighter bound than the callback shape's, on a predicate that fires ZERO
+// A 4.8x tighter bound than the callback shape's, on a predicate that fires ZERO
 // times on real mail rather than merely rarely: 0 across the corpus ham panels,
 // 0 on the five ham fixtures that are prose ABOUT this scam, and 1 hit in
 // 153,806 trap messages, which makes it specific rather than inert. Measured 9/9
@@ -321,6 +328,15 @@ inline constexpr double kThresholdStandard = 0.99;  // successor (TASK-283): the
                                   // recall @ 2.3% personal-ham FP vs 90.0% @ 3.1% at
                                   // 0.90 — 0.99 wins every FP panel for -2.2pp recall.
 inline constexpr double kThresholdCautious = 0.995;  // also forced while "learning"
+inline constexpr double kThresholdAggressive = 0.95;  // the third product profile
+                                  // (FilteringProfileSetting.aggressive), on the C++
+                                  // side since 2026-09-18 so that every server-side
+                                  // consumer (klar-milterd, klar-spamd, the messages
+                                  // MPA) reads the product's three numbers from here.
+                                  // The milter had carried its own table, 0.70 / 0.50
+                                  // / 0.30, from its first commit: same calibrated
+                                  // score, a gate half the product's, and a reply to
+                                  // the user's own mail junked at 0.78 (TASK-510).
 
 // Free-hosting / disposable DKIM signing org-domains — mirror
 // AuthFeatures.freeHostSigningDomains. All two-label org-domains so they
@@ -441,7 +457,7 @@ inline double sender_history_magnitude(int exact_send_count, int domain_send_cou
 
 // Profile threshold. `learning` forces the cautious threshold (mirror
 // SharedSettings.spamThreshold's learning-clause).
-enum class Profile : std::uint8_t { Standard, Cautious, Learning };
+enum class Profile : std::uint8_t { Standard, Cautious, Learning, Aggressive };
 // ── Per-artifact spam-side calibration ──────────────────────────────────────
 //
 // A successor encoder's scores do not sit where public-v0's sit. Measured on the
@@ -494,6 +510,8 @@ inline double threshold_for_profile(Profile p) {
     case Profile::Cautious:
     case Profile::Learning:
       return kThresholdCautious;
+    case Profile::Aggressive:
+      return kThresholdAggressive;
     case Profile::Standard:
       break;
   }
@@ -517,10 +535,11 @@ struct Offset {
   [[nodiscard]] bool fired() const { return magnitude > 0.0; }
 };
 
-// 4-class softmax (mirror ClassScores; doubles so the fold matches Swift's
-// Double arithmetic bit-for-bit on the constants).
+// 3-class softmax (mirror ClassScores; doubles so the fold matches Swift's
+// Double arithmetic bit-for-bit on the constants). A legacy 4-label artifact's
+// gibberish probability is already folded into `spam` where the engine maps
+// the head's labels (SpamEngine::classify_embedding), so `spam` IS the spam side.
 struct Scores {
-  double gibberish = 0.0;
   double marketing = 0.0;
   double regular = 0.0;
   double spam = 0.0;
@@ -538,7 +557,7 @@ struct FiredOffset {
 };
 
 struct Verdict {
-  std::string label;             // "spam" | "gibberish" | "marketing" | "ham"
+  std::string label;             // "spam" | "marketing" | "ham"
   double confidence = 0.0;
   double adjusted_spam_side = 0.0;
   // The spam side after calibrate_spam_side and before any offset: what the
@@ -554,22 +573,17 @@ inline std::string refine_non_spam_label(const Scores& s) {
   return s.marketing > s.regular ? "marketing" : "ham";
 }
 
-// The model's OWN pre-offset decision from the 4-class scores: the binary label
+// The model's OWN pre-offset decision from the 3-class scores: the binary label
 // ("spam"/"regular") and confidence the fold treats as "what the model said". It
-// is NOT a raw argmax: a high gibberish is a spam-side call, and a low-spam
-// high-regular carve-out is a deliver. This is the single source of truth that
-// SpamEngine::decision_from_scores, the C-ABI decide-input builder, and Swift's
-// mlResult.label all reduce to, so ml_said_spam can't drift across the three
-// (TASK-251 C5). The old C-ABI builder used argmax, which fired ml_said_spam on
-// gibberish-argmax mail the engine and Swift scored as a deliver.
+// is NOT a raw argmax: a low-spam high-regular carve-out is a deliver. This is
+// the single source of truth that SpamEngine::decision_from_scores, the fold's
+// input builder, and Swift's mlResult.label all reduce to, so ml_said_spam can't
+// drift across the three (TASK-251 C5).
 struct NeuralDecision { const char* label; double confidence; };
 inline NeuralDecision neural_decision(const Scores& s) {
-  // Float literals: the source scores are float, so comparing against 0.7f/0.2f/
-  // 0.5f (promoted to double) reproduces the old float comparison exactly, with no
-  // boundary drift from a double 0.7 sitting one ULP above 0.7f (TASK-251 C5).
-  if (s.gibberish > 0.7F) { { return {"spam", s.gibberish};
-}
-}
+  // Float literals: the source scores are float, so comparing against 0.2f/0.5f
+  // (promoted to double) reproduces the old float comparison exactly, with no
+  // boundary drift from a double sitting one ULP off the float (TASK-251 C5).
   if (s.spam < 0.2F && s.regular > 0.5F) { { return {"regular", 1.0 - s.spam};
 }
 }
@@ -581,8 +595,8 @@ inline NeuralDecision neural_decision(const Scores& s) {
 
 // Fold the signed offsets onto the spam side and threshold. `ml_label` is the
 // model's own spam-side DECISION (neural_decision above / Swift mlResult.label):
-// "spam" (incl. a "gibberish" sub-label a caller may still pass) means the model
-// itself said spam-side; not a raw 4-class argmax (TASK-251 C5). Faithful port of
+// "spam" means the model itself said spam-side; not a raw argmax (TASK-251 C5).
+// Faithful port of
 // ClassificationService steps 6-7: same arithmetic, same clamp, same flip
 // attribution, same train_ml rule.
 inline Verdict fold(const Scores& scores,
@@ -592,7 +606,7 @@ inline Verdict fold(const Scores& scores,
                     double ml_confidence,
                     double spam_side_knot = 0.0) {
   const double raw_spam_side =
-      calibrate_spam_side(scores.spam + scores.gibberish, spam_side_knot);
+      calibrate_spam_side(scores.spam, spam_side_knot);
   const auto offset_allowed = [raw_spam_side](const Offset& o) {
     if (o.direction != Direction::Ham || raw_spam_side < kSoftHamRescueCeiling) {
       return true;
@@ -623,7 +637,7 @@ inline Verdict fold(const Scores& scores,
   const double without_ham_ward = clamp01(raw_spam_side + spam_ward_sum);
   const double without_spam_ward = clamp01(raw_spam_side + ham_ward_sum);
 
-  const bool ml_said_spam = (ml_label == "spam" || ml_label == "gibberish");
+  const bool ml_said_spam = ml_label == "spam";
 
   Verdict v;
   v.adjusted_spam_side = adjusted;

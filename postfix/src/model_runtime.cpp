@@ -85,7 +85,8 @@ ClassifyResult ModelRuntime::classify_rfc822(const std::string& raw_email,
                                               const std::string& sender_name,
                                               const std::string& sender_email,
                                               bool connect_ip_blocked,
-                                              bool header_ip_blocked) {
+                                              bool header_ip_blocked,
+                                              spam_engine_profile_t profile) {
     std::lock_guard<std::mutex> lock(mutex_);
     ClassifyResult cr;
 
@@ -95,22 +96,29 @@ ClassifyResult ModelRuntime::classify_rfc822(const std::string& raw_email,
         return cr;
     }
 
-    spam_engine_result_t result{};
-    // Capture the structural signals from the SAME parse (TASK-173) so the
-    // decision layer below can fold them — the milter no longer ships the raw
-    // verdict alone (TASK-179).
-    spam_engine_parsed_signals_t signals{};
-    // "ensemble": neural head + low-weight FTRL blend, then the structural
-    // decision layer below (TASK-219; mode is now a required C-API arg).
-    spam_engine_status_t st = spam_engine_classify_rfc822(
+    // One call (TASK-540): parse, "ensemble" scoring, and the structural fold at
+    // the configured profile, the same one policy.cpp thresholds the adjusted
+    // side with, so the flip marks and condemn_offset_fired describe the gate
+    // the label uses. The engine applies the artifact's calibration knot itself.
+    // The milter has no Message-ID DB or sender history, so those counts stay
+    // zero; what it does have is the two transport facts no parse can produce
+    // (TASK-113/387): who actually connected, resolved against DROP from an
+    // address it OBSERVED (condemn-capable only because of that provenance), and
+    // the same hit on an origin behind a trusted relay.
+    spam_engine_caller_state_t caller{};
+    caller.profile = profile;
+    caller.connect_ip_blocked = connect_ip_blocked ? 1 : 0;
+    caller.header_ip_blocked = header_ip_blocked ? 1 : 0;
+    spam_engine_full_result_t full{};
+    spam_engine_status_t st = spam_engine_classify_full(
         handle_,
         raw_email.data(),
         raw_email.size(),
         sender_name.c_str(),
         sender_email.c_str(),
         "ensemble",
-        &result,
-        &signals);
+        &caller,
+        &full);
 
     if (st != SPAM_ENGINE_STATUS_OK) {
         cr.ok = false;
@@ -120,58 +128,14 @@ ClassifyResult ModelRuntime::classify_rfc822(const std::string& raw_email,
     }
 
     cr.ok = true;
-    cr.spam = result.scores.spam;
-    cr.regular = result.scores.regular;
-    cr.marketing = result.scores.marketing;
-    cr.gibberish = result.scores.gibberish;
-
-    // Decision layer (TASK-179): fold the structural offsets onto the spam side,
-    // exactly as the Apple extension does, so the milter's junk decision agrees.
-    // The engine-derived signals (thread headers, free-host/throwaway DKIM signer)
-    // come from `signals`; the local-state offsets (Message-ID DB, sender history)
-    // aren't available to the milter, so they're zero. We read only the adjusted
-    // spam-side (profile-independent); policy.cpp applies the milter's own threshold.
-    // Shared builder fills scores + argmax label + the parsed-signal fields; the
-    // milter has no local Message-ID DB or sender history, so the caller-state
-    // counts stay zero from the value-init (TASK-231).
-    spam_engine_decision_input_t din{};
-    spam_engine_decision_input_from_signals(&din, &result.scores, &signals);
-    din.profile = SPAM_ENGINE_PROFILE_STANDARD;
-    // The one input no parse can produce: who actually connected (TASK-113). The
-    // caller resolved it against the DROP list from an address it OBSERVED; a hit
-    // is condemn-capable, which is only sound because of that provenance.
-    din.connect_ip_blocked = connect_ip_blocked ? 1 : 0;
-    din.header_ip_blocked = header_ip_blocked ? 1 : 0;
-    // The artifact's own spam-side calibration. A successor model's scores do
-    // not sit where public-v0's sit, so it declares a knot and the fold maps it
-    // onto the fixed 0.99 gate BEFORE the offsets are added. Omitting it folds a
-    // calibrated model on the raw scale, which is a different classifier from
-    // the one release qualification measured. spam_engine_classify_full does
-    // this for its own callers; a standalone spam_engine_decide has to do it
-    // here, and 0 (the value-initialised default) is the identity map that every
-    // artifact shipping today wants.
-    spam_engine_model_info_t info{};
-    // model_info is a boolean-style query (1 success, 0 failure), not a
-    // spam_engine_status_t operation. Comparing it with STATUS_OK (0) silently
-    // inverted the branch and left every calibrated artifact on its raw scale.
-    if (spam_engine_model_info(handle_, &info) == 1) {
-        din.spam_side_knot = info.spam_side_calibration_knot;
-    }
-
-    spam_engine_decision_result_t dout{};
-    if (spam_engine_decide(&din, &dout) == SPAM_ENGINE_STATUS_OK) {
-        cr.adjusted_spam = static_cast<float>(dout.adjusted_spam_side);
-        cr.calibrated_spam = static_cast<float>(dout.calibrated_spam_side);
-        cr.structural_condemn = (dout.condemn_offset_fired != 0);
-        cr.fired_offsets = dout.fired_offsets;
-        cr.flipped_by_offset = cr.fired_offsets.find('!') != std::string::npos;
-    } else {
-        // Defensive: fall back to the bare spam-side (spam+gibberish) if the fold
-        // somehow fails — never worse than the pre-TASK-179 behaviour.
-        cr.adjusted_spam = result.scores.spam + result.scores.gibberish;
-        cr.calibrated_spam = cr.adjusted_spam;
-        cr.structural_condemn = false;
-    }
+    cr.spam = full.ensemble_spam;
+    cr.regular = full.neural_scores.regular;
+    cr.marketing = full.neural_scores.marketing;
+    cr.adjusted_spam = static_cast<float>(full.decision.adjusted_spam_side);
+    cr.calibrated_spam = static_cast<float>(full.decision.calibrated_spam_side);
+    cr.structural_condemn = (full.decision.condemn_offset_fired != 0);
+    cr.fired_offsets = full.decision.fired_offsets;
+    cr.flipped_by_offset = cr.fired_offsets.find('!') != std::string::npos;
     return cr;
 }
 

@@ -48,7 +48,7 @@ bool EventStore::open(const std::string& path) {
 
 // Schema version of the CURRENT code. Bump it and add a case to apply_migrations
 // whenever the events/feedback tables change.
-static constexpr int kSchemaVersion = 1;
+static constexpr int kSchemaVersion = 2;
 
 bool EventStore::ensure_schema() {
     const char* ddl = R"SQL(
@@ -146,6 +146,10 @@ bool EventStore::apply_migrations() {
         // than nullable so every historical row reads as "no offsets recorded"
         // instead of NULL, which a reader would have to special-case.
         "ALTER TABLE events ADD COLUMN fired_offsets TEXT NOT NULL DEFAULT '';",
+        // v2: the engine's scores are three classes (TASK-540). The gibberish
+        // score was 0 on every row a three-class model wrote, which is every
+        // row since gen3-v6 reached the box on the store's first days.
+        "ALTER TABLE events DROP COLUMN score_gibberish;",
     };
 
     // Two guards, because a schema migration gets exactly one chance to be wrong.
@@ -158,7 +162,8 @@ bool EventStore::apply_migrations() {
     //     single badly-timed kill would be a permanently dead daemon.
     for (int v = version; v < kSchemaVersion; ++v) {
         const bool already_applied =
-            v == 0 && column_exists(db_, "events", "fired_offsets");
+            (v == 0 && column_exists(db_, "events", "fired_offsets")) ||
+            (v == 1 && !column_exists(db_, "events", "score_gibberish"));
         const std::string step = std::string("BEGIN IMMEDIATE;") +
                                  (already_applied ? "" : migrations[v]) +
                                  "PRAGMA user_version = " + std::to_string(v + 1) +
@@ -180,14 +185,14 @@ bool EventStore::record(const DecisionEvent& event) {
     const char* sql = R"SQL(
 INSERT INTO events (
     ts, queue_id, mail_from, rcpt_count, bytes_seen, truncated,
-    model_version, score_spam, score_regular, score_marketing, score_gibberish,
+    model_version, score_spam, score_regular, score_marketing,
     label, action, latency_ms, status, error_code,
     message_id_header, event_id, policy_reason, fired_offsets
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6,
-    ?7, ?8, ?9, ?10, ?11,
-    ?12, ?13, ?14, ?15, ?16,
-    ?17, ?18, ?19, ?20
+    ?7, ?8, ?9, ?10,
+    ?11, ?12, ?13, ?14, ?15,
+    ?16, ?17, ?18, ?19
 );
 )SQL";
 
@@ -205,16 +210,15 @@ INSERT INTO events (
     sqlite3_bind_double(stmt, 8, static_cast<double>(event.score_spam));
     sqlite3_bind_double(stmt, 9, static_cast<double>(event.score_regular));
     sqlite3_bind_double(stmt, 10, static_cast<double>(event.score_marketing));
-    sqlite3_bind_double(stmt, 11, static_cast<double>(event.score_gibberish));
-    sqlite3_bind_text(stmt, 12, event.label.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 13, event.action.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_double(stmt, 14, event.latency_ms);
-    sqlite3_bind_text(stmt, 15, event.status.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 16, event.error_code.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 17, event.message_id_header.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 18, event.event_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 19, event.policy_reason.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 20, event.fired_offsets.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 11, event.label.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 12, event.action.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 13, event.latency_ms);
+    sqlite3_bind_text(stmt, 14, event.status.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 15, event.error_code.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 16, event.message_id_header.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 17, event.event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 18, event.policy_reason.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 19, event.fired_offsets.c_str(), -1, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -362,7 +366,6 @@ std::string event_to_json(const DecisionEvent& e) {
     o << ",\"score_spam\":" << e.score_spam;
     o << ",\"score_regular\":" << e.score_regular;
     o << ",\"score_marketing\":" << e.score_marketing;
-    o << ",\"score_gibberish\":" << e.score_gibberish;
     o << ",\"label\":\"" << json_escape(e.label) << "\"";
     o << ",\"action\":\"" << json_escape(e.action) << "\"";
     o << std::setprecision(3);

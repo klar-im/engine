@@ -22,7 +22,7 @@ help:
 model:
 	@KLAR_ACCEPT_MODEL_LICENSE="$${KLAR_ACCEPT_MODEL_LICENSE:-}" \
 		postfix/scripts/fetch_model.sh engine/model "$(RELEASED_MANIFEST)"
-	@echo "[model] done — run: make build && ./engine/build/spam_classifier ./engine/model"
+	@echo "[model] done — run: make build && ./engine/build/spam_classifier ./engine/model engine/tests/data/demo-samples/spam.en.eml"
 
 setup:
 	@engine/scripts/setup.sh
@@ -70,7 +70,7 @@ import: import-deps
 		--outfile model/gguf/encoder-f16.gguf --outtype f16
 	llama-quantize engine/model/gguf/encoder-f16.gguf engine/model/gguf/encoder-q4_k_m.gguf Q4_K_M
 	cd engine && $(PYTHON) export_classifier_weights.py --hf-repo $(MODEL) --output-dir model
-	@echo "[import] done — run: make build && ./engine/build/spam_classifier ./engine/model"
+	@echo "[import] done — run: make build && ./engine/build/spam_classifier ./engine/model engine/tests/data/demo-samples/spam.en.eml"
 
 clean:
 	rm -rf engine/build postfix/build

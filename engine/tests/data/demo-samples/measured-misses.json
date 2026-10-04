@@ -1,0 +1,9 @@
+{
+  "_": "Demo samples the released model reads differently by design, keyed on the exact artifact (model_uuid), the value being the engine's decision label. Read by engine/tests (test_demo_samples_decision: a pass is a stale entry, another label a regression) and by integrations/messages-mpa/test_checkv2.py (a listed spam sample is exempt from 'must be flagged' and must not reach Junk). Why each: marketing.fr and marketing.weekend.de read as ham (the weak-language legitimate-mail direction, TRAINING_EXPERIMENT_LOG.md #51); spam.parcel.en lands at spam side 0.98, one grid step under the gate; spam.parcel.fr scores 0.34 and was caught only by the cold-start brand condemn on 'Colis' from an unsigned .top domain, which needs corroboration since TASK-510 (its fix is the model's, TASK-439, or a From-domain shape signal).",
+  "dab55c42-6eb5-464b-9e2a-271fd1867a19": {
+    "marketing.fr.eml": "ham",
+    "marketing.weekend.de.eml": "ham",
+    "spam.parcel.en.eml": "ham",
+    "spam.parcel.fr.eml": "ham"
+  }
+}

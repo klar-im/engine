@@ -10,14 +10,22 @@
 // brand path can never reach it.
 //
 // WHY THESE PREDICATES. Measured with model-lab/scripts/measure_callback_shape.py
-// over 3,621 invoice-ish messages from the founder's four real mailboxes (the
-// ham panel that decides this), 8,000 messages of their ordinary mail, and 7,083
-// invoice-ish messages from the trap corpus:
+// over 2,008 invoice-ish real ham messages, every
+// message once by Message-ID, ham-labelled and prefiltered on the decoded
+// Subject and body (the ham panel that decides this), 8,000 messages of
+// ordinary real ham, and 8,488 invoice-ish messages from the trap corpora
+// (untroubled 7,004, nazario 1,484), re-measured 2026-10-01 on #935 after the
+// reader and the prefilter were fixed (the 2026-08-19 run quoted 3,621
+// invoices: its six sources summed, gmail twice and hotmail three times, and
+// the Apple Mail export read as two blobs; and nazario as 18 messages; the
+// 2026-09-30 re-run quoted 2,054 with the billing regex over the raw header
+// block, where a billing@ Received line matched and an encoded subject did
+// not):
 //
 //   rule                                    trap hits   FP on real invoices
-//   billing + phone                              256          123  (3.4%)
-//   billing + phone + no_link                    203           15  (0.4%)
-//   billing + phone + no_link + no dmarc=pass    203            0
+//   billing + phone                              387           68  (3.4%)
+//   billing + phone_any + no_link                236            8  (0.4%)
+//   billing + phone_any + no_link + no dmarc=pass 228            0
 //   ... + a call-to-cancel phrase                  1            0
 //
 // The asymmetry that makes it work: a real invoice wants you in a portal, so it
@@ -45,9 +53,11 @@
 //
 // VERIFIED AGAINST THE SHIPPED CODE, not only against the Python that chose the
 // rule (`make model-lab/verify-callback-shape`, which drives classify_full over
-// the same panel). On 3,620 invoice-ish messages from the six real mailboxes the
-// shape fires 15 times and 0 of those survive the auth condition, which is what
-// the Python reported to the message. On the fixtures, 7 of 8 fire and the one
+// the same panel: the census's own selection, imported, not a copy). On the
+// 2,008 distinct invoice-ish messages the shape fires 8 times and 0 of those
+// survive the auth condition, which is what the Python reported to the message
+// (re-run 2026-10-01 on the corrected reader and prefilter; the 2026-08 run
+// read 15 and 0 on its summed 3,620). On the fixtures, 7 of 8 fire and the one
 // that does not is the legitimate control.
 //
 // Worth running after any edit here. The two implementations have disagreed
@@ -62,7 +72,7 @@
 //
 // STRENGTH: corroborating, never a solo condemn. kCallbackShape is 0.30, so a
 // message needs to be at 0.69 from the model already before this can carry it
-// over the gate. 0 of 3,621 bounds the true false-positive rate at about 0.08%,
+// over the gate. 0 of 2,008 bounds the true false-positive rate at about 0.15%,
 // not at zero, and an invoice is the single most damaging message to junk.
 //
 // NOT REGEX, and not by preference: the equivalent std::regex scan costs more

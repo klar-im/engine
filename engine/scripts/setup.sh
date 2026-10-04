@@ -90,8 +90,15 @@ if [[ "$OSTYPE" != darwin* ]]; then
             rm -f "$err"
         }
 
-        # .so files from the pre-built release (~30MB)
-        extract "https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_PIN/llama-$LLAMA_PIN-bin-ubuntu-x64.tar.gz" \
+        # .so files from the pre-built release (~30MB), for this machine's
+        # architecture: the release tarballs and the multi-arch image build
+        # natively on x86_64 and arm64.
+        case "$(uname -m)" in
+            x86_64)        LLAMA_ARCH=x64 ;;
+            aarch64|arm64) LLAMA_ARCH=arm64 ;;
+            *) echo "error: llama.cpp $LLAMA_PIN has no prebuilt Linux release for $(uname -m)" >&2; exit 1 ;;
+        esac
+        extract "https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_PIN/llama-$LLAMA_PIN-bin-ubuntu-$LLAMA_ARCH.tar.gz" \
             -C "$LLAMA_INSTALL/lib" --strip-components=1 --wildcards "*/lib*.so*"
         # Every library the engine links (llama.pc below: ggml, ggml-base,
         # llama) plus at least one CPU backend plugin, which ggml loads at

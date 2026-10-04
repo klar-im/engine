@@ -73,6 +73,14 @@ int main(int argc, char* argv[]) {
 
   std::cout << std::fixed << std::setprecision(1);
   std::cout << "load: " << load_ms << "ms\n";
+  // Name the backend and the cap the numbers below were measured under, so a
+  // pasted result can never be read as Metal when Metal silently fell back to
+  // CPU, or as the 128 cap when SPAM_ENGINE_MAX_TOKENS was set.
+  const auto runtime = engine.runtime_info();
+  std::cout << "backend: " << runtime.backend << "\n";
+  std::cout << "device: " << runtime.device << "\n";
+  std::cout << "fallback: " << spam_engine::encoder_fallback_name(runtime.fallback) << "\n";
+  std::cout << "max_tokens: " << runtime.max_tokens << "\n";
 
   // --- Classify ---
   for (const auto& [name, text] : samples) {

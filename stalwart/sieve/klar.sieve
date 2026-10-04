@@ -1,7 +1,7 @@
 # Klar filing rules for Stalwart, as a per-account Sieve script.
 #
 # klar-milterd stamps X-Klar-Label (spam|regular) and X-Klar-Class
-# (regular|marketing|gibberish|spam) on every message Stalwart runs through it
+# (regular|marketing|spam) on every message Stalwart runs through it
 # (stalwart/config/mta-milter.json). Stalwart's own junk decision is a flag its
 # built-in filter sets before milters run, so a header cannot un-junk anything
 # and filing on the milter's verdict has to happen where Stalwart files per

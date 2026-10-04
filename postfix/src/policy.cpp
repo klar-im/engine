@@ -43,11 +43,58 @@ std::string action_to_string(Action a) {
     return "tag";
 }
 
+EffectivePolicy resolve_policy(const Config& cfg, const std::vector<std::string>& rcpt_to) {
+    EffectivePolicy eff;
+    eff.mode = cfg.mode;
+    eff.profile = cfg.profile;
+    eff.spam_threshold_override = cfg.spam_threshold_override;
+    eff.reject_threshold = cfg.reject_threshold;
+    if (rcpt_to.empty() || cfg.domain_policies.empty()) {
+        eff.engine_profile = profile_to_engine(eff.profile);
+        return eff;
+    }
+    bool first_match = true;
+    for (const auto& rcpt : rcpt_to) {
+        const std::string rcpt_domain = extract_domain(to_lower(rcpt));
+        if (rcpt_domain.empty()) continue;
+        const DomainPolicy* dp = nullptr;
+        for (const auto& policy : cfg.domain_policies) {
+            if (to_lower(policy.recipient_domain) == rcpt_domain) {
+                dp = &policy;
+                break;
+            }
+        }
+        if (!dp) continue;
+        if (first_match) {
+            eff.mode = dp->mode;
+            // A domain policy that names no profile inherits the global one;
+            // it used to resolve to "", which every table read as standard.
+            if (!dp->profile.empty()) eff.profile = dp->profile;
+            eff.spam_threshold_override = dp->spam_threshold_override;
+            eff.reject_threshold = dp->reject_threshold;
+            first_match = false;
+        } else {
+            // Merge: strictest mode, minimum thresholds
+            if (mode_severity(dp->mode) > mode_severity(eff.mode)) {
+                eff.mode = dp->mode;
+            }
+            eff.reject_threshold = std::min(eff.reject_threshold, dp->reject_threshold);
+            if (dp->spam_threshold_override >= 0) {
+                eff.spam_threshold_override = eff.spam_threshold_override >= 0
+                    ? std::min(eff.spam_threshold_override, dp->spam_threshold_override)
+                    : dp->spam_threshold_override;
+            }
+        }
+    }
+    eff.engine_profile = profile_to_engine(eff.profile);
+    return eff;
+}
+
 PolicyResult evaluate_policy(
     const Config& cfg,
+    const EffectivePolicy& eff,
     const ClassifyResult& cr,
     const std::string& sender_email,
-    const std::vector<std::string>& rcpt_to,
     bool classify_failed,
     bool bypass_due_overload) {
 
@@ -57,53 +104,11 @@ PolicyResult evaluate_policy(
     std::string sender_lower = to_lower(sender_email);
     std::string sender_domain = extract_domain(sender_lower);
 
-    // 2. Effective policy resolution via recipient domains
-    // Start with global defaults
-    std::string eff_mode = cfg.mode;
-    std::string eff_profile = cfg.profile;
-    double eff_spam_threshold_override = cfg.spam_threshold_override;
-    double eff_reject_threshold = cfg.reject_threshold;
-
-    if (!rcpt_to.empty() && !cfg.domain_policies.empty()) {
-        bool first_match = true;
-
-        for (const auto& rcpt : rcpt_to) {
-            std::string rcpt_domain = extract_domain(to_lower(rcpt));
-            if (rcpt_domain.empty()) continue;
-
-            // Find matching domain policy
-            const DomainPolicy* dp = nullptr;
-            for (const auto& policy : cfg.domain_policies) {
-                if (to_lower(policy.recipient_domain) == rcpt_domain) {
-                    dp = &policy;
-                    break;
-                }
-            }
-
-            if (!dp) continue;
-
-            if (first_match) {
-                eff_mode = dp->mode;
-                eff_profile = dp->profile;
-                eff_spam_threshold_override = dp->spam_threshold_override;
-                eff_reject_threshold = dp->reject_threshold;
-                first_match = false;
-            } else {
-                // Merge: strictest mode, minimum thresholds
-                if (mode_severity(dp->mode) > mode_severity(eff_mode)) {
-                    eff_mode = dp->mode;
-                }
-                eff_reject_threshold = std::min(eff_reject_threshold, dp->reject_threshold);
-                if (dp->spam_threshold_override >= 0) {
-                    if (eff_spam_threshold_override >= 0) {
-                        eff_spam_threshold_override = std::min(eff_spam_threshold_override, dp->spam_threshold_override);
-                    } else {
-                        eff_spam_threshold_override = dp->spam_threshold_override;
-                    }
-                }
-            }
-        }
-    }
+    // 2. The effective policy came in resolved (resolve_policy, per recipient
+    //    domain); the fold already ran at eff.engine_profile.
+    const std::string& eff_mode = eff.mode;
+    const double eff_spam_threshold_override = eff.spam_threshold_override;
+    const double eff_reject_threshold = eff.reject_threshold;
 
     // 3. Allowlist/blocklist precedence
     bool is_blocklisted = false;
@@ -136,31 +141,28 @@ PolicyResult evaluate_policy(
         pr.score_spam = 1.0f;
         pr.score_regular = 0.0f;
         pr.score_marketing = 0.0f;
-        pr.score_gibberish = 0.0f;
         pr.score_spam_adjusted = 1.0f;
         pr.score_spam_calibrated = 1.0f;
     } else if (is_allowlisted) {
         pr.score_spam = 0.0f;
         pr.score_regular = 1.0f;
         pr.score_marketing = 0.0f;
-        pr.score_gibberish = 0.0f;
         pr.score_spam_adjusted = 0.0f;
         pr.score_spam_calibrated = 0.0f;
     } else {
         pr.score_spam = cr.spam;
         pr.score_regular = cr.regular;
         pr.score_marketing = cr.marketing;
-        pr.score_gibberish = cr.gibberish;
         pr.score_spam_adjusted = cr.adjusted_spam;
         pr.score_spam_calibrated = cr.calibrated_spam;
     }
 
-    // klass: 4-class argmax over the resolved scores, the X-Klar-Class companion
+    // klass: 3-class argmax over the resolved scores, the X-Klar-Class companion
     // to the binary label. One pass covers every branch: blocklist forces
     // spam=1, allowlist forces regular=1, ML uses the raw scores.
     const struct { const char* name; float score; } classes[] = {
         {"regular", pr.score_regular}, {"marketing", pr.score_marketing},
-        {"gibberish", pr.score_gibberish}, {"spam", pr.score_spam}};
+        {"spam", pr.score_spam}};
     pr.klass = classes[0].name;
     float best = classes[0].score;
     for (const auto& c : classes) {
@@ -172,7 +174,7 @@ PolicyResult evaluate_policy(
     if (eff_spam_threshold_override >= 0) {
         threshold = eff_spam_threshold_override;
     } else {
-        threshold = profile_to_threshold(eff_profile);
+        threshold = profile_to_threshold(eff.engine_profile);
     }
     pr.effective_threshold = threshold;
 

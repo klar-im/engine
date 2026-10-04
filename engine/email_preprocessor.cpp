@@ -91,35 +91,10 @@ std::string join_with_blank_lines(const std::vector<std::string>& parts) {
   return joined;
 }
 
-// Zero-width / invisible Unicode "format" code points that carry no linguistic
-// content. Email marketers stuff these into preheaders as invisible spacers,
-// and spammers wedge them between letters to break tokenization ("v​i​agra").
-// Left in, a long run dominates the encoder's first 512 tokens and the message
-// reads as gibberish (TASK-167). Not exhaustive — the high-frequency offenders.
-bool is_invisible_format_cp(std::uint32_t cp) {
-  switch (cp) {
-    case 0x00AD:  // soft hyphen
-    case 0x034F:  // combining grapheme joiner
-    case 0x061C:  // arabic letter mark
-    case 0x115F: case 0x1160:  // hangul choseong/jungseong fillers
-    case 0x17B4: case 0x17B5:  // khmer inherent vowels
-    case 0x180E:  // mongolian vowel separator
-    case 0x200B: case 0x200C: case 0x200D: case 0x200E: case 0x200F:  // ZWSP/ZWNJ/ZWJ/LRM/RLM
-    case 0x202A: case 0x202B: case 0x202C: case 0x202D: case 0x202E:  // bidi embeds/overrides
-    case 0x2060: case 0x2061: case 0x2062: case 0x2063: case 0x2064:  // word joiner, invisible ops
-    case 0x2066: case 0x2067: case 0x2068: case 0x2069:  // bidi isolates
-    case 0xFEFF:  // zero-width no-break space / BOM
-    case 0xFFF9: case 0xFFFA: case 0xFFFB:  // interlinear annotation
-      return true;
-    default:
-      return (cp >= 0xFE00 && cp <= 0xFE0F)    // variation selectors
-          || (cp >= 0xE0000 && cp <= 0xE007F); // tag characters
-  }
-}
-
-// Drop invisible-format code points (UTF-8 aware) and collapse the ASCII-space
-// runs their removal leaves behind, so the visible text survives at full token
-// weight. Newlines and other content are preserved.
+// Drop invisible-format code points (brand_names::is_invisible_codepoint,
+// UTF-8 aware) and collapse the ASCII-space runs their removal leaves behind,
+// so the visible text survives at full token weight (TASK-167). Newlines and
+// other content are preserved.
 std::string strip_invisible_chars(const std::string& s) {
   std::string out;
   out.reserve(s.size());
@@ -139,7 +114,7 @@ std::string strip_invisible_chars(const std::string& s) {
       cp = (c & 0x1FU) << 6 | (s[i + 1] & 0x3FU);
       len = 2;
     }
-    if (is_invisible_format_cp(cp)) {
+    if (brand_names::is_invisible_codepoint(cp)) {
       i += len;
       continue;
     }
@@ -992,10 +967,10 @@ PreprocessedEmail preprocess_rfc822(
 
   // Reply-To parity check: legitimate senders rarely need a Reply-To that
   // differs from From; spammers do it to redirect responses to a throwaway
-  // address. Surfaced through CustomerInfo (see engine/PARITY_PLAN.md).
+  // address. Surfaced through SenderInfo (see engine/PARITY_PLAN.md).
   // Compared by the MAILBOX ADDRESSES only (not the rendered string, which
-  // carries the display name): a "Acme Support <billing@acme.com>" Reply-To on a
-  // "Acme <billing@acme.com>" From is the same address and must not flag.
+  // carries the display name): a "Acme Support <billing@acme.example>" Reply-To on a
+  // "Acme <billing@acme.example>" From is the same address and must not flag.
   InternetAddressList* reply_to_list = g_mime_message_get_reply_to(message);
   if (reply_to_list != nullptr && from_list != nullptr) {
     std::set<std::string> reply_to_addrs;
@@ -2848,6 +2823,226 @@ std::string dkim_pass_signing_domain(const std::string& ar) {
   return "";
 }
 
+// An Authentication-Results value with its RFC 5322 comments removed. Comments
+// carry method tokens that are NOT this hop's verdicts: Gmail's
+// `arc=pass (i=1 spf=pass ... dkim=pass ... dmarc=pass fromdomain=...)` restates
+// the previous hop's, and a single header of the form
+// `arc=pass (... dmarc=pass ...); spf=fail; dmarc=fail` read as a DMARC pass
+// before this (untroubled 2025/02 carries that shape). Nesting is legal, so it
+// is a depth count, not a find/rfind pair.
+std::string strip_comments(const std::string& value) {
+  std::string out;
+  out.reserve(value.size());
+  int depth = 0;
+  for (const char c : value) {
+    if (c == '(') { ++depth; continue;
+}
+    if (c == ')' && depth > 0) { --depth; continue;
+}
+    if (depth == 0) { out += c;
+}
+  }
+  return out;
+}
+
+// Every Authentication-Results header, in header order, lowercased, comments
+// stripped.
+std::vector<std::string> authentication_results(GMimeMessage* message) {
+  std::vector<std::string> out;
+  GMimeHeaderList* headers = g_mime_object_get_header_list(GMIME_OBJECT(message));
+  const int count = headers != nullptr ? g_mime_header_list_get_count(headers) : 0;
+  for (int i = 0; i < count; ++i) {
+    GMimeHeader* h = g_mime_header_list_get_header_at(headers, i);
+    const char* name = g_mime_header_get_name(h);
+    if (name == nullptr || g_ascii_strcasecmp(name, "Authentication-Results") != 0) { continue;
+}
+    if (const char* value = g_mime_header_get_value(h)) {
+      out.push_back(strip_comments(to_lower_ascii(value)));
+    }
+  }
+  return out;
+}
+
+// The authserv-id an Authentication-Results value opens with ("mx.google.com;
+// dkim=pass ..." -> mx.google.com), as an org-domain.
+std::string authserv_org(const std::string& ar) {
+  return org_domain(ar.substr(0, ar.find_first_of("; \t")));
+}
+
+// Whether an Authentication-Results value reports `method` ("dkim=pass",
+// "spf=fail", "dmarc=none"): the token starts a result, so it follows ';' or
+// whitespace, which keeps "adkim=r" and "aspf=r" (a DMARC record echoed into a
+// comment) from counting.
+bool reports_method(const std::string& ar, const char* method) {
+  const std::string tag = std::string(method) + '=';
+  for (std::size_t pos = ar.find(tag); pos != std::string::npos; pos = ar.find(tag, pos + 1)) {
+    if (pos == 0 || ar[pos - 1] == ';' || ar[pos - 1] == ' ' || ar[pos - 1] == '\t') { return true;
+}
+  }
+  return false;
+}
+
+constexpr std::array<const char*, 3> kAuthMethods = {"dkim", "spf", "dmarc"};
+
+// Bit i set when `ar` reports kAuthMethods[i].
+unsigned reported_methods(const std::string& ar) {
+  unsigned reported = 0;
+  for (unsigned i = 0; i < kAuthMethods.size(); ++i) {
+    if (reports_method(ar, kAuthMethods[i])) { reported |= 1U << i; }
+  }
+  return reported;
+}
+
+// The receiving MTA's Authentication-Results, as ONE string. Gmail writes one
+// header with every method in it; iCloud's inbound MX writes one header PER
+// METHOD (bimi.icloud.com, arc.icloud.com, dmarc.icloud.com,
+// dkim-verifier.icloud.com, spf.icloud.com), and OpenDKIM then OpenDMARC ahead
+// of the milter (postfix/docker) write one each. Reading only the topmost
+// header saw iCloud's "bimi=none" and nothing else: no DMARC, no signer,
+// DmarcVerdict::Fail, and every brand-named sender to a mac.com mailbox
+// condemned as a spoof. That was 5 of the 20 false positives users had
+// reported by 2026-09-16 (Apple's own noreply@email.apple.com among them).
+//
+// The run is the topmost header plus each following one from the same authserv
+// org-domain; the first header from another authserv ends it, so a sender's
+// own results further down never join. Within the run a method's verdict comes
+// from the FIRST header that reports it: the edge prepends its headers above
+// anything the sender wrote, so a planted dmarc=pass under the edge's
+// dmarc=fail, or a dkim=pass under its dkim=none, is never read. iCloud writes
+// two dkim-verifier headers for two signatures, and dropping the second keeps
+// the first as the signer, which is what one Gmail header carrying both already
+// did (dkim_pass_signing_domain takes the first pass). What the run trusts
+// beyond that is the edge itself: a planted header carrying the edge's own
+// authserv-id for a method the edge never reported would join, and RFC 8601 §5
+// has the edge delete those; the majors do, and postfix/README.md requires the
+// milter to run behind a filter that does. The kb_brand_dmarc_pass note below
+// states the same threat model for the topmost header.
+std::string edge_authentication_results(const std::vector<std::string>& results) {
+  if (results.empty()) { return "";
+}
+  const std::string edge = authserv_org(results.front());
+  std::string joined = results.front();
+  unsigned seen = reported_methods(joined);  // bit i: kAuthMethods[i] already reported
+  for (auto it = results.begin() + 1; it != results.end(); ++it) {
+    if (authserv_org(*it) != edge) { break;
+}
+    const unsigned reported = reported_methods(*it);
+    if ((reported & seen) != 0) { continue;
+}
+    seen |= reported;
+    joined += "; " + *it;
+  }
+  return joined;
+}
+
+// Apple's Hide My Email relay (2026-09-16: a batch of reported false positives
+// were all display_impersonation, two of them through this relay).
+// iCloud+ users hand a brand a per-site alias; Apple then forwards the brand's
+// mail with the From REWRITTEN to
+//   "Moonpig Reminder" <service_at_email_moonpig_com_<alias>_<hash>@privaterelay.appleid.com>
+// so the display name and the local part both carry the brand and the org-domain
+// is appleid.com, which owns no brand: the exact shape the cold-start display
+// condemn exists for, on every brand mail every such user receives.
+//
+// The rewritten local part IS the original From address, encoded by Apple, and
+// nothing the sender wrote: <local>_at_<domain, dots as underscores>_<alias>_<hash>.
+// The relay also verifies the original sender before forwarding and records
+// what it verified, one line per signature:
+//   Authentication-Results: dkim-verifier.icloud.com; dkim=pass header.d=email.moonpig.com ...
+//   Authentication-Results: spf.icloud.com; spf=pass (...) smtp.mailfrom=noreply@wimbledon.tickets
+// The origin is that decoded domain, and it becomes the identity the brand
+// claims are measured against ONLY when an icloud result authenticates it: a
+// dkim=pass whose signer is org-aligned with it, or an spf=pass whose mailfrom
+// is. Alignment is the guard against everything the sender wrote: an ESP's
+// signature line above the brand's own, a stolen alias mailed from a free ESP
+// account, a planted icloud line naming a brand other than the one Apple
+// encoded, all fail it (the test battery has each), and the identity stays
+// appleid.com, condemned as before. A planted line CAN align, when the From
+// itself is spoofed as the brand: Apple encodes the spoofed domain and reports
+// dkim=none or spf=fail on it, and the planted pass below names the same
+// domain. So Apple's verdict on a method closes it: nothing below a non-pass
+// icloud line for that method is read. What remains rests on Apple, which
+// rejects mail that fails its own authentication rather than relaying it.
+//
+// iCloud+ Hide My Email is the same encoding on a different host (2026-09-21:
+// brand mail at spam 1.00 delivered through it into an iCloud mailbox):
+//   Joybuy <contact_at_mail_joybuy_com_<alias>_<hash>@icloud.com>
+// There the receiving edge IS Apple, and its own run of results verifies the
+// original sender (dmarc.icloud.com; dmarc=pass header.from=dhl.com,
+// dkim-verifier.icloud.com; dkim=pass header.d=dhl.com). icloud.com is also a
+// mailbox anyone can register, so the relay's lines are read from that edge
+// run alone, never from further down: an iCloud account named after a brand
+// and mailed directly carries an edge signer of icloud.com, which aligns with
+// nothing it encodes, and a planted line below the edge's own is not in the
+// run. Mail that reaches another provider's edge is not read at all.
+//
+// The facts that are Apple's: the two rewritten From hosts, the authserv
+// org-domain of the relay's own results, and the local-part separator.
+constexpr const char* kAppleRelayHost = "privaterelay.appleid.com";
+constexpr const char* kAppleHideMyEmailHost = "icloud.com";
+constexpr const char* kAppleRelayAuthserv = "icloud.com";
+constexpr const char* kAppleRelayAtToken = "_at_";
+
+std::string apple_relay_original_domain(const std::string& rewritten_local_part) {
+  const std::string local = to_lower_ascii(rewritten_local_part);
+  const std::size_t at = local.rfind(kAppleRelayAtToken);
+  if (at == std::string::npos) { return "";
+}
+  // <domain labels>_<alias>_<hash>: cut Apple's two trailing fields, keep at
+  // least two labels, and the underscores between them are the dots.
+  std::string domain = local.substr(at + std::strlen(kAppleRelayAtToken));
+  const std::size_t hash = domain.rfind('_');
+  const std::size_t alias = hash == std::string::npos || hash == 0 ? std::string::npos
+                                                                     : domain.rfind('_', hash - 1);
+  if (alias == std::string::npos || domain.find('_') == alias) { return "";
+}
+  domain.resize(alias);
+  std::replace(domain.begin(), domain.end(), '_', '.');
+  return domain;
+}
+
+// The verified origin, and by which method: DKIM alignment is what direct mail
+// needs for out.dmarc_aligned, so a relayed origin proven by SPF alone gets the
+// standing SPF-only direct mail gets, no more.
+struct RelayOrigin {
+  std::string domain;  // empty: not through the relay, or nothing Apple verified aligns
+  bool dkim_aligned = false;
+};
+
+RelayOrigin apple_relay_origin(const std::vector<std::string>& results,
+                               const std::string& rewritten_local_part) {
+  const std::string original = org_domain(apple_relay_original_domain(rewritten_local_part));
+  if (original.empty()) { return {};
+}
+  auto const aligned = [&](const std::string& domain) { return org_domain(domain) == original; };
+  bool spf_aligned = false;
+  bool dkim_open = true;  // false once an icloud line reported a non-pass for the method
+  bool spf_open = true;
+  for (const std::string& ar : results) {
+    if (authserv_org(ar) != kAppleRelayAuthserv) { continue;
+}
+    if (dkim_open && reports_method(ar, "dkim")) {
+      if (aligned(dkim_pass_signing_domain(ar))) { return {original, true};
+}
+      dkim_open = ar.find("dkim=pass") != std::string::npos;
+    }
+    if (!spf_open || !reports_method(ar, "spf")) { continue;
+}
+    spf_open = ar.find("spf=pass") != std::string::npos;
+    const std::size_t tag = ar.find("smtp.mailfrom=");
+    if (!spf_open || spf_aligned || tag == std::string::npos) { continue;
+}
+    // smtp.mailfrom is a mailbox, and a bounce address carries '+', '=' and
+    // other characters a domain token stops at: cut the mailbox, then its '@'.
+    const std::size_t v = tag + std::strlen("smtp.mailfrom=");
+    const std::string mailbox = ar.substr(v, ar.find_first_of("; \t", v) - v);
+    const std::size_t mail_at = mailbox.rfind('@');
+    // Keep scanning either way: a DKIM line may follow.
+    spf_aligned = mail_at != std::string::npos && aligned(mailbox.substr(mail_at + 1));
+  }
+  return spf_aligned ? RelayOrigin{original, false} : RelayOrigin{};
+}
+
 // First Reply-To mailbox, split into the identity parts the brand claim-gate reads
 // (display + local part; a BEC reply-hijack sets the brand in the Reply-To display)
 // and the org-domain the multi-field cousin check compares.
@@ -2925,19 +3120,16 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
       }
     }
   }
-  // Topmost Authentication-Results only: g_mime_object_get_header returns the
-  // first occurrence, which is the one the receiving MTA prepended (trusted).
+  // The receiving MTA's Authentication-Results as edge_authentication_results
+  // reads them (the rule and its bounds are in that function's comment).
   // dmarc_pass = the message passed DMARC (aligned via DKIM OR SPF). Distinct from
   // out.dmarc_aligned, which is the stricter DKIM-only alignment; the brand auth-set
   // exoneration uses dmarc_pass so legit brand mail aligned via SPF is not condemned.
   bool dmarc_pass = false;
-  const char* ar = g_mime_object_get_header(GMIME_OBJECT(message), "Authentication-Results");
-  const bool has_ar = ar != nullptr && ar[0] != '\0';
+  const std::vector<std::string> results = authentication_results(message);
+  const std::string ar_lower = edge_authentication_results(results);
+  const bool has_ar = !ar_lower.empty();
   if (has_ar) {
-    // Lowercase the header value once and reuse it for both the DKIM-signer
-    // scan and the DMARC check (method tokens are case-insensitive; the signing
-    // domain is normalised by org_domain regardless).
-    const std::string ar_lower = to_lower_ascii(ar);
     const std::string signer = dkim_pass_signing_domain(ar_lower);
     if (!signer.empty()) {
       out.dkim_signing_fqdn = signer;
@@ -2949,33 +3141,71 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
     out.dmarc_aligned = dmarc_pass && !out.dkim_signing_domain.empty()
                         && out.dkim_signing_domain == out.from_org_domain;
   }
-  // The three-state DMARC verdict that gates the brand-ownership exonerations below. Unknown (no AR
-  // header) is deliberately NOT Fail; see brand_kb::DmarcVerdict for why this is a tri-state.
+  // A DKIM signer org-aligned with the From certifies what dmarc=pass does (only
+  // the domain owner can produce either), and Outlook/Hotmail stamp
+  // `dkim=pass header.d=<domain>` with NO dmarc= token, so the two are read as
+  // one fact wherever a pass is required; see kb_brand_dmarc_pass below for the
+  // history (badoo, ~22 transactional-panel FPs on the literal token).
+  const bool dkim_aligned_pass = !out.dkim_signing_domain.empty()
+                                 && out.dkim_signing_domain == out.from_org_domain;
+
+  // The three-state DMARC verdict every "did the edge pass it" question below reads, derived
+  // once. Pass is dmarc=pass or the aligned signer; Fail is the edge's own word, a dmarc= result
+  // that is not pass (fail, none, temperror); Unknown is an edge that reported no dmarc method,
+  // which no Authentication-Results at all is a case of (both pass flags are false and
+  // reports_method finds nothing in an empty string). Unknown is deliberately NOT Fail (see
+  // brand_kb::DmarcVerdict). Until 2026-09-19 any AR without dmarc=pass read as Fail, which
+  // condemned "Outlook" <outlook@email.microsoft.com> at a 2013 Hotmail edge (`spf=pass;
+  // dkim=permerror`) on the claimed-vs-authenticated path (TASK-337), and read an Outlook edge's
+  // aligned signer as Fail too, so its brand mail was condemned here and rescued by
+  // kb_brand_dmarc_pass.
   const brand_kb::DmarcVerdict dmarc =
-      !has_ar ? brand_kb::DmarcVerdict::Unknown
-              : (dmarc_pass ? brand_kb::DmarcVerdict::Pass : brand_kb::DmarcVerdict::Fail);
+      (dmarc_pass || dkim_aligned_pass) ? brand_kb::DmarcVerdict::Pass
+      : reports_method(ar_lower, "dmarc") ? brand_kb::DmarcVerdict::Fail
+      : brand_kb::DmarcVerdict::Unknown;
+  const bool edge_pass = dmarc == brand_kb::DmarcVerdict::Pass;
+
+  // The org-domain every brand claim below is measured against, and whether it
+  // is DKIM-aligned: the From and out.dmarc_aligned, except behind Apple's Hide
+  // My Email relay, where the origin Apple verified is the identity
+  // (apple_relay_origin). The relay is read only once the receiving MTA's own
+  // results prove the message came through Apple (a DMARC pass for the From, or
+  // an aligned privaterelay.appleid.com signer for an Outlook edge); a
+  // privaterelay From that did not stays on appleid.com. Hide My Email on
+  // icloud.com is read from the edge's own run alone (ar_lower, whose authserv
+  // is the edge's, so another provider's edge yields nothing), for the reason
+  // at kAppleHideMyEmailHost. The auth fields on `out` describe the message as
+  // received.
+  const RelayOrigin relay =
+      !edge_pass ? RelayOrigin{}
+      : from_fqdn == kAppleRelayHost ? apple_relay_origin(results, from_local_part)
+      : from_fqdn == kAppleHideMyEmailHost ? apple_relay_origin({ar_lower}, from_local_part)
+      : RelayOrigin{};
+  const std::string& sender_identity = relay.domain.empty() ? out.from_org_domain : relay.domain;
+  const bool identity_aligned = relay.domain.empty() ? out.dmarc_aligned : relay.dkim_aligned;
 
   // Display-name brand impersonation (TASK-214, doc-12). Computed after auth so a
-  // Tier-2 (dictionary-word) brand can be gated on corroboration. Tier-1
-  // (distinctive) condemns standalone; Tier-2 requires the impersonation shape
-  // (in the match) AND an independent hard spam signal (a throwaway or free-host
-  // DKIM signer), so the common-word FP class (Orange County, Apple Valley) can't
-  // fire on legit aligned mail.
+  // Tier-2 (dictionary-word) brand can be gated on corroboration. A Tier-1
+  // (distinctive) claim condemns through the KB, or on its spelling / a
+  // corroborator when the KB does not key the brand (coldstart_condemns below);
+  // Tier-2 requires the impersonation shape (in the match) AND an independent
+  // hard spam signal (a throwaway or free-host DKIM signer), so the common-word
+  // FP class (Orange County, Apple Valley) can't fire on legit aligned mail.
   // A brand claimed in the display name, or (doc-13 technique #5) in the address
-  // local part ("paypal-support@evil.com") with no brand in the display. Both reuse
-  // the same shape + ownership precision. Skip the local part once the display
-  // already condemns standalone (tier1).
+  // local part ("paypal-support@evil.com"). Both reuse the same shape + ownership
+  // precision, and both are always read: a plain Tier-1 display no longer
+  // condemns by itself (TASK-510), so the local part may carry the perturbed or
+  // KB-keyed claim that does ("Nadia Hilton" <paypa1@...>).
   const brand_names::BrandMatch bm =
-      brand_names::display_impersonates_brand(from_display_name, out.from_org_domain);
+      brand_names::display_impersonates_brand(from_display_name, sender_identity);
   const brand_names::BrandMatch lp =
-      bm.tier1 ? brand_names::BrandMatch{}
-               : brand_names::display_impersonates_brand(from_local_part, out.from_org_domain);
+      brand_names::display_impersonates_brand(from_local_part, sender_identity);
   // Multi-word brand written as separate tokens ("La Poste", "Deutsche Bank") in the
   // display name or a dotted/hyphenated local part, which the single-token matcher
   // can't see. Curated KB + Tranco-distinctive, same ownership exemption (TASK-214).
   const brand_names::BrandMatch jn =
-      brand_kb::display_join_impersonates(from_display_name, out.from_org_domain) |
-      brand_kb::display_join_impersonates(from_local_part, out.from_org_domain);
+      brand_kb::display_join_impersonates(from_display_name, sender_identity) |
+      brand_kb::display_join_impersonates(from_local_part, sender_identity);
   // Brand tokens the sender's presented IDENTITY claims: From display + local part and
   // Reply-To display + local part (a BEC reply-hijack sets the brand there). Single
   // folded tokens plus adjacent 2-3-token joins, mirroring display_join_impersonates,
@@ -3004,6 +3234,39 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
   claim_tokens(from_local_part);
   claim_tokens(reply_to.display);
   claim_tokens(reply_to.local);
+  // An AMBIGUOUS surname-brand (is_ambiguous_brand: boulanger, hilton, kroger,
+  // lowes, marriott, norton) is a CLAIM only when the display shape actually
+  // raised it. claim_tokens is deliberately raw -- every token, no shape, no
+  // ownership -- because its consumers are the domain-shaped paths, and for a
+  // coined brand a raw token is the right input. For a surname it is not: the
+  // shape gate above decides "Ines Marriott" is a person and drops the claim,
+  // and then this set would hand the SAME string to the typosquat gate, which
+  // condemns imarriott.example standalone as one edit from the keyed marriott. That
+  // is the namesake false positive one layer below the gate built to stop it,
+  // and it is how a person whose own domain is built from their own surname
+  // gets junked. "Marriott Bonvoy" <x@imarriott.example> keeps the shape, keeps the
+  // claim, and still condemns.
+  // Reply-To gets the same shape test as the From fields, because `claimed` is
+  // fed from it too. Without these two the erase below would unconditionally
+  // drop an ambiguous brand claimed ONLY in Reply-To, which is precisely the
+  // BEC reply-hijack shape the Reply-To fields are read for ("Some Person"
+  // <x@evil>, Reply-To "Norton Billing" <billing@n0rton-secure>).
+  const brand_names::BrandMatch rd =
+      brand_names::display_impersonates_brand(reply_to.display, sender_identity);
+  const brand_names::BrandMatch rl =
+      brand_names::display_impersonates_brand(reply_to.local, sender_identity);
+  for (auto it = claimed.begin(); it != claimed.end();) {
+    const bool raised = (bm.tier1 && bm.brand == *it) ||
+                        (lp.tier1 && lp.brand == *it) ||
+                        (jn.tier1 && jn.brand == *it) ||
+                        (rd.tier1 && rd.brand == *it) ||
+                        (rl.tier1 && rl.brand == *it);
+    if (brand_names::is_ambiguous_brand(*it) && !raised) {
+      it = claimed.erase(it);
+    } else {
+      ++it;
+    }
+  }
   // The distinctive KB brands among those claims (direct, or via the hyphen-stripped
   // form: a "Credit Agricole" display joins to "creditagricole", the KB SLD is
   // "credit-agricole"). Computed once so the per-domain typosquat claim-gate scans a
@@ -3026,12 +3289,12 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
   // verdict has one form: Tier-1 (morph/combosquat) condemns standalone, Tier-2 (tld-swap /
   // unclaimed typosquat) needs corroboration. The per-scope policy lives in brand_cousin.
   brand_names::BrandMatch cousin =
-      brand_cousin(out.from_org_domain, CousinScope::Sender, claimed_brands, corroborated);
+      brand_cousin(sender_identity, CousinScope::Sender, claimed_brands, corroborated);
   // Reply-To pointing at a brand look-alike (BEC reply-hijack, TASK-237 AC#2): a cloned-template
   // phish often has a clean From but a brand-cousin Reply-To. MultiField scope = the strict morph
   // subset (a legit differing Reply-To -- an ESP, a personal webmail -- is not a morph).
   const std::string reply_to_org = reply_to.org;
-  if (!cousin.tier1 && !reply_to_org.empty() && reply_to_org != out.from_org_domain &&
+  if (!cousin.tier1 && !reply_to_org.empty() && reply_to_org != sender_identity &&
       brand_cousin(reply_to_org, CousinScope::MultiField, claimed_brands, corroborated).tier1) {
     cousin.tier1 = true;
   }
@@ -3053,14 +3316,14 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
   const std::vector<AnchorPair> anchors = anchors_from_message(message);
   if (!cousin.tier1) {
     for (const std::string& d : body_url_domains_from_message(message)) {
-      if (d != out.from_org_domain && is_link_lookalike(d)) { cousin.tier1 = true; break; }
+      if (d != sender_identity && is_link_lookalike(d)) { cousin.tier1 = true; break; }
     }
   }
   if (!cousin.tier1) {
     for (const AnchorPair& a : anchors) {
       const bool href_lookalike = !a.href_domain.empty() &&
-          a.href_domain != out.from_org_domain && is_link_lookalike(a.href_domain);
-      if (href_lookalike || anchor_impersonates_brand(a, out.from_org_domain)) {
+          a.href_domain != sender_identity && is_link_lookalike(a.href_domain);
+      if (href_lookalike || anchor_impersonates_brand(a, sender_identity)) {
         cousin.tier1 = true;
         break;
       }
@@ -3072,7 +3335,7 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
   // password field in mail is itself rare, so this is high-precision.
   if (!cousin.tier1) {
     for (const std::string& d : credential_form_actions_from_message(message)) {
-      if (d.empty() || d == out.from_org_domain) { continue;
+      if (d.empty() || d == sender_identity) { continue;
 }
       if (brand_kb::is_canonical_domain(d) || brand_reputation::is_established_brand(d) ||
           decision::is_shared_sender_platform(d)) { continue;
@@ -3087,7 +3350,7 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
   // a logo-spoof phish is a bare clickable image to a throwaway. Measured FP-neutral on a
   // real-inbox scan (the text floor + established-href exemption clear the newsletter class).
   if (!cousin.tier1) {
-    const std::string d = image_only_offdomain_link(message, out.from_org_domain);
+    const std::string d = image_only_offdomain_link(message, sender_identity);
     if (!d.empty() && !brand_kb::is_canonical_domain(d) &&
         !brand_reputation::is_established_brand(d) &&
         !decision::is_shared_sender_platform(d)) {
@@ -3114,7 +3377,7 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
   // does NOT corroborate a display / local-part Tier-2: common surnames are Tier-2 stems
   // ('Bob Smith' + a gmail Reply-To must stay clean, the FP that reverted the first attempt).
   const bool reply_hijack =
-      !reply_to_org.empty() && reply_to_org != out.from_org_domain &&
+      !reply_to_org.empty() && reply_to_org != sender_identity &&
       (decision::is_shared_sender_platform(reply_to_org) ||
        decision::is_free_host_signed(reply_to_org));
   const bool display_tier2 = bm.tier2 || lp.tier2 || jn.tier2;
@@ -3133,11 +3396,11 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
   // A shared sender platform in the From org-domain does not authenticate as ANY brand (anyone can
   // send from it), so it cannot exempt a brand claim even when it is in the brand's auth/canonical
   // set (TASK-246). Computed once for all three exemptions below.
-  const bool from_shared = decision::is_shared_sender_platform(out.from_org_domain);
+  const bool from_shared = decision::is_shared_sender_platform(sender_identity);
   auto const kb_claim_mismatch = [&](const brand_names::BrandMatch& dm) {
     return (dm.tier1 || dm.tier2) && brand_kb::brand_has_auth_set(dm.brand) &&
-           !brand_kb::authenticated_as_brand(dm.brand, out.from_org_domain, dmarc, from_shared) &&
-           brand_names::domain_stem(out.from_org_domain) != dm.brand;
+           !brand_kb::authenticated_as_brand(dm.brand, sender_identity, dmarc, from_shared) &&
+           brand_names::domain_stem(sender_identity) != dm.brand;
   };
   const bool kb_mismatch = kb_claim_mismatch(bm) || kb_claim_mismatch(lp);
   // The multi-word join is always a curated-KB brand claim (display_join matches the KB set only),
@@ -3148,17 +3411,39 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
   // is a genuine non-owned claim), which is why no stem!=brand guard is needed.
   const bool jn_mismatch = jn.tier1 &&
       !(brand_kb::brand_has_auth_set(jn.brand)
-            ? brand_kb::authenticated_as_brand(jn.brand, out.from_org_domain, dmarc, from_shared)
-            : brand_kb::authenticated_canonical(out.from_org_domain, dmarc, from_shared));
-  // Standalone string-condemn (the Tranco distinctive-coined list), demoted to a COLD-START
-  // crutch (doc-12 long-term, AC#4): the single-token name match condemns on the name alone ONLY
-  // for a distinctive brand the KB cannot adjudicate (no authenticated set). Once a brand enters
-  // the KB, the claimed-vs-authenticated mismatch above is the sole condemn path for it -- the
-  // string match no longer speaks. This is the day-0 fallback for the long tail, not the durable
-  // core. (The multi-word join and cousin/look-alike paths are KB-gated or structural, not this
-  // string list, so they keep their standalone condemn below.)
+            ? brand_kb::authenticated_as_brand(jn.brand, sender_identity, dmarc, from_shared)
+            : brand_kb::authenticated_canonical(sender_identity, dmarc, from_shared));
+  // The cold-start crutch (doc-12 long-term, AC#4): the single-token name match on a
+  // distinctive Tranco stem the KB cannot adjudicate (no authenticated set). Once a brand
+  // enters the KB, the claimed-vs-authenticated mismatch above is the sole condemn path for
+  // it -- the string match no longer speaks. This is the day-0 fallback for the long tail,
+  // not the durable core. (The multi-word join and cousin/look-alike paths are KB-gated or
+  // structural, not this string list, so they keep their standalone condemn below.)
+  //
+  // Until TASK-510 the crutch condemned on the name alone (a person surnamed Hilton
+  // replying to the user, "Proxmox VE" from a self-hoster: most of the reported
+  // false positives then). Now it
+  // condemns on one of:
+  //   - a PERTURBED spelling (BrandMatch::tier1_perturbed), since no person,
+  //     product or self-hosted install spells its name that way;
+  //   - the corroboration every Tier-2 claim needs (a throwaway or free-host
+  //     signer);
+  //   - a privaterelay.appleid.com From the receiving edge positively FAILED
+  //     (relay_forged): nobody but Apple's relay sends from that host, so a forged
+  //     one is itself the spoof. Fail is the edge's word (the dmarc verdict above);
+  //     an archive without results, an edge that reports no dmarc method, or a
+  //     relay message the edge passed but whose origin does not decode, is unknown.
+  // Measured on the five brand panels: make model-lab/brand-panels writes
+  // qualification/brand-panels/<label>.json, and before.json / after.json /
+  // rejected-dmarc-fail-corroborator.json hold the numbers this rule and the KB
+  // keys of 2026-09-19 were chosen on (TASK-510 has the summary). What stays
+  // uncaught is the unsigned lure from a fresh domain with a
+  // plain claim (the demo's spam.parcel.fr): a From-domain shape signal is the next
+  // structural read, not a wider crutch.
+  const bool relay_forged = from_fqdn == kAppleRelayHost && dmarc == brand_kb::DmarcVerdict::Fail;
   auto const coldstart_condemns = [&](const brand_names::BrandMatch& dm) {
-    return dm.tier1 && !brand_kb::brand_has_auth_set(dm.brand);
+    return dm.tier1 && !brand_kb::brand_has_auth_set(dm.brand) &&
+           (dm.tier1_perturbed || corroborated || relay_forged);
   };
   const bool coldstart_condemn = coldstart_condemns(bm) || coldstart_condemns(lp);
   // A KB identity mismatch of EITHER tier (fires on the mismatch alone -- the clean-infra phish a
@@ -3171,10 +3456,10 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
   // a brand, even when the domain is in the brand's canonical set (TASK-246); also exclude free-host
   // signers from the established clause. A cousin/throwaway domain is not established, so phish fires.
   const bool reputable_aligned =
-      out.dmarc_aligned && !from_shared &&
-      (brand_kb::is_canonical_domain(out.from_org_domain) ||
-       (brand_reputation::is_established_brand(out.from_org_domain) &&
-        !decision::is_free_host_signed(out.from_org_domain)));
+      identity_aligned && !from_shared &&
+      (brand_kb::is_canonical_domain(sender_identity) ||
+       (brand_reputation::is_established_brand(sender_identity) &&
+        !decision::is_free_host_signed(sender_identity)));
   out.display_impersonation =
       !reputable_aligned &&
       (coldstart_condemn ||                  // non-KB distinctive coined: day-0 string crutch
@@ -3195,17 +3480,16 @@ ExtractedAuthFeatures extract_auth_features_from_message(GMimeMessage* message) 
   // token, so demanding the literal token drops legit brand mail (badoo, ~22 of
   // the transactional panel FPs). Unknown/unauthenticated still does NOT qualify
   // -- this gates a strong ham rescue, not a condemn -- so AR-less trap corpora
-  // are untouched. Threat model note: this trusts the topmost AR like every auth
-  // signal here, but a forged AR now buys DELIVERY (-0.90), not just an
-  // un-condemn. Acceptable because the majors (Gmail/Outlook/iCloud -- our Apple
-  // Mail base) strip unauthorized ARs on ingress (RFC 8601 s1.6); revisit if we
-  // ever classify for receivers that do not sanitize.
-  const bool dkim_aligned_pass = !out.dkim_signing_domain.empty()
-                                 && out.dkim_signing_domain == out.from_org_domain;
+  // are untouched. Threat model note: this trusts the edge's AR like every auth
+  // signal here (edge_authentication_results says what bounds that), but a
+  // forged AR now buys DELIVERY (-0.90), not just an un-condemn. Acceptable
+  // because the majors (Gmail/Outlook/iCloud -- our Apple Mail base) strip
+  // unauthorized ARs on ingress (RFC 8601 s1.6); revisit if we ever classify
+  // for receivers that do not sanitize.
   out.kb_brand_dmarc_pass =
-      (dmarc_pass || dkim_aligned_pass) && !from_shared &&
-      (brand_kb::is_canonical_domain(out.from_org_domain) ||
-       brand_kb::is_auth_set_domain(out.from_org_domain));
+      edge_pass && !from_shared &&
+      (brand_kb::is_canonical_domain(sender_identity) ||
+       brand_kb::is_auth_set_domain(sender_identity));
 
   return out;
 }

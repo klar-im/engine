@@ -7,16 +7,50 @@ extern "C" {
 #endif
 
 // Training ABI (premium feature).
-// Requires a loaded engine handle from the base ABI.
+// Requires a loaded engine handle from the base ABI. Same two sections as
+// spam_engine_c_api.h: what Klar Plus calls, then what only model-lab and the
+// tests call.
 
-// Train on plain text with a correct label.
+// ════ Product ABI ═══════════════════════════════════════════════════════════
+
+// Queue one RFC822 sample for later incremental training.
 // Labels: 0=gibberish, 1=marketing, 2=regular, 3=spam
-// Returns the training loss value in out_loss (can be NULL if not needed).
-spam_engine_status_t spam_engine_train(
+// sender_name / sender_email semantics match spam_engine_train_rfc822.
+spam_engine_status_t spam_engine_add_training_sample(
     spam_engine_handle_t* handle,
-    const char* text,
-    int correct_label,
-    float* out_loss);
+    const char* raw_email,
+    size_t raw_email_len,
+    const char* sender_name,
+    const char* sender_email,
+    int correct_label);
+
+// Which online learner receives a queued correction.
+//
+// FTRL is folded escalate-only at classification time, so FTRL_ONLY can learn
+// personalized spam evidence but can never lower the frozen neural spam side.
+// HEAD_AND_FTRL preserves the existing Klar Plus behavior.
+typedef enum spam_engine_training_mode {
+  SPAM_ENGINE_TRAIN_HEAD_AND_FTRL = 0,
+  SPAM_ENGINE_TRAIN_FTRL_ONLY = 1,
+} spam_engine_training_mode_t;
+
+// Train queued samples with an explicit learner role. FTRL_ONLY returns an
+// average loss of 0 because the FTRL update has no neural cross-entropy loss.
+// Queue/error semantics match spam_engine_train_incremental.
+spam_engine_status_t spam_engine_train_incremental_mode(
+    spam_engine_handle_t* handle,
+    spam_engine_training_mode_t mode,
+    float* out_avg_loss,
+    size_t* out_trained_count);
+
+// Alias for spam_engine_save, keeps naming aligned with training workflow.
+spam_engine_status_t spam_engine_save_model(
+    spam_engine_handle_t* handle,
+    const char* model_path);
+
+// ════ Measurement ABI ═══════════════════════════════════════════════════════
+// Called only by model-lab and the engine's tests (make engine/shape lists who
+// calls what).
 
 // Train on raw RFC822 email data with a correct label.
 // Labels: 0=gibberish, 1=marketing, 2=regular, 3=spam
@@ -40,42 +74,12 @@ spam_engine_status_t spam_engine_train_rfc822(
     int correct_label,
     float* out_loss);
 
-// Queue one RFC822 sample for later incremental training.
-// Labels: 0=gibberish, 1=marketing, 2=regular, 3=spam
-// sender_name / sender_email semantics match spam_engine_train_rfc822.
-spam_engine_status_t spam_engine_add_training_sample(
-    spam_engine_handle_t* handle,
-    const char* raw_email,
-    size_t raw_email_len,
-    const char* sender_name,
-    const char* sender_email,
-    int correct_label);
-
 // Train queued samples. On success the queue is empty. If one sample fails,
 // already-applied prefix updates are reported in out_trained_count, the failing
 // sample is dropped from the native queue, and the untried tail remains queued
 // for the next call. out_avg_loss and out_trained_count can be NULL.
 spam_engine_status_t spam_engine_train_incremental(
     spam_engine_handle_t* handle,
-    float* out_avg_loss,
-    size_t* out_trained_count);
-
-// Which online learner receives a queued correction.
-//
-// FTRL is folded escalate-only at classification time, so FTRL_ONLY can learn
-// personalized spam evidence but can never lower the frozen neural spam side.
-// HEAD_AND_FTRL preserves the existing Klar Plus behavior.
-typedef enum spam_engine_training_mode {
-  SPAM_ENGINE_TRAIN_HEAD_AND_FTRL = 0,
-  SPAM_ENGINE_TRAIN_FTRL_ONLY = 1,
-} spam_engine_training_mode_t;
-
-// Train queued samples with an explicit learner role. FTRL_ONLY returns an
-// average loss of 0 because the FTRL update has no neural cross-entropy loss.
-// Queue/error semantics match spam_engine_train_incremental.
-spam_engine_status_t spam_engine_train_incremental_mode(
-    spam_engine_handle_t* handle,
-    spam_engine_training_mode_t mode,
     float* out_avg_loss,
     size_t* out_trained_count);
 
@@ -104,19 +108,6 @@ spam_engine_status_t spam_engine_head_optimizer_steps(
 spam_engine_status_t spam_engine_save(
     spam_engine_handle_t* handle,
     const char* model_path);
-
-// Alias for spam_engine_save, keeps naming aligned with training workflow.
-spam_engine_status_t spam_engine_save_model(
-    spam_engine_handle_t* handle,
-    const char* model_path);
-
-// Convert label string to int.
-// Returns -1 if unknown.
-int spam_engine_label_from_string(const char* label);
-
-// Convert label int to string.
-// Returns NULL if unknown.
-const char* spam_engine_label_to_string(int label);
 
 #ifdef __cplusplus
 }

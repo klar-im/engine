@@ -135,7 +135,10 @@ int main() {
     check(store.record(sample_event("new-event-1", "connect_ip_drop!", "structural")),
           "a post-migration write succeeds against an upgraded legacy db");
   }
-  check(int_query(legacy, "PRAGMA user_version;") == 1, "legacy db is migrated to version 1");
+  check(int_query(legacy, "PRAGMA user_version;") == 2, "legacy db is migrated to version 2");
+  check(int_query(legacy,
+        "SELECT COUNT(*) FROM pragma_table_info('events') WHERE name='score_gibberish';") == 0,
+        "v2 drops the gibberish score: the engine's scores are three classes (TASK-540)");
   check(int_query(legacy, "SELECT COUNT(*) FROM events;") == 2,
         "the pre-existing row survived the migration");
   check(text_query(legacy,
@@ -151,7 +154,31 @@ int main() {
     check(store.open(legacy), "an already-migrated db re-opens");
     check(store.record(sample_event("new-event-2", "", "ml")), "and still accepts writes");
   }
-  check(int_query(legacy, "PRAGMA user_version;") == 1, "version is unchanged on re-open");
+  check(int_query(legacy, "PRAGMA user_version;") == 2, "version is unchanged on re-open");
+
+  // 2a. Same for the v2 step: the column already dropped, the version still 1.
+  const std::string half_v2 = "/tmp/klar_event_store_half_v2.sqlite3";
+  write_legacy_db(half_v2);
+  {
+    sqlite3* db = nullptr;
+    sqlite3_open(half_v2.c_str(), &db);
+    sqlite3_exec(db,
+                 "ALTER TABLE events ADD COLUMN fired_offsets TEXT NOT NULL DEFAULT '';"
+                 "ALTER TABLE events DROP COLUMN score_gibberish;"
+                 "PRAGMA user_version = 1;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_close(db);
+  }
+  {
+    klar::EventStore store;
+    const bool opened = store.open(half_v2);
+    check(opened, "a half-applied v2 migration does not wedge startup");
+    if (opened) {
+      check(store.record(sample_event("post-v2-crash", "", "ml")),
+            "and the store works afterwards");
+    }
+  }
+  check(int_query(half_v2, "PRAGMA user_version;") == 2, "the half-applied v2 db heals to 2");
 
   // 2b. A crash between the ALTER and the version bump must not wedge startup.
   //     Simulate it: apply the ALTER by hand, leave user_version at 0, and require
@@ -186,7 +213,7 @@ int main() {
     check(store.record(sample_event("fresh-1", "sender_auth!", "structural")),
           "fresh db accepts a write");
   }
-  check(int_query(fresh, "PRAGMA user_version;") == 1, "fresh db is at the current version");
+  check(int_query(fresh, "PRAGMA user_version;") == 2, "fresh db is at the current version");
   check(text_query(fresh, "SELECT fired_offsets FROM events WHERE event_id='fresh-1';") ==
         "sender_auth!", "fresh db records the offset");
 
