@@ -59,7 +59,7 @@ ENV LD_LIBRARY_PATH=/opt/klar/bin
 USER klarmilter
 VOLUME /var/lib/klar
 EXPOSE 8891 8892
-# The first start downloads the ~400 MB model into the volume before /readyz can
+# The first start downloads the ~315 MB model into the volume before /readyz can
 # answer, so the start period covers a slow link (1 MB/s is ~7 min), not just
 # the model load. Failures inside it do not count towards the retries.
 # stalwart/scripts/test_e2e.sh reads this number for its own --wait-timeout.

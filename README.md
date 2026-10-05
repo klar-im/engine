@@ -50,10 +50,17 @@ This repo is the open-core of [Klar](https://klar.im), licensed AGPLv3 (see
 - `stalwart/` is the Stalwart wiring: config fragments, `apply.py` over
   `stalwart-cli`, the filing Sieve, a compose end-to-end stack.
 - `install.sh` is the one-line installer for the release binaries.
+- `AGENTS.md` is for an AI agent doing the install for you: what to check, what
+  to run, and that the model licence stays your decision.
 
 ## Run it behind your mail server
 
-![Your mail server hands the message to klar-milterd at DATA; the engine classifies it on the same box and answers with X-Klar headers; the server delivers and a rule files on the verdict.](postfix/docs/klar-milter.png)
+![Your mail server hands the message to klar-milterd at DATA; the engine classifies it on the same box and answers with X-Klar headers; the server delivers and a rule files on the verdict. The milter keeps no message, only metadata in its event store.](postfix/docs/klar-milter.png)
+
+The message never leaves your server: Klar reads it there and writes its
+verdict into the headers. (The figure is an Excalidraw scene,
+[`postfix/docs/klar-milter.excalidraw`](postfix/docs/klar-milter.excalidraw);
+open it at excalidraw.com to edit it.)
 
 - **Stalwart**: [`stalwart/README.md`](stalwart/README.md). Four objects
   applied through `stalwart-cli` (`stalwart/scripts/apply.py`, idempotent), a

@@ -6,7 +6,10 @@ to `klar-milterd` over the milter protocol, the engine classifies it on your
 box (nothing leaves the server), and a per-mailbox Sieve rule files on the
 verdict.
 
-![Stalwart hands the message to klar-milterd at DATA; the engine classifies it on your box; the milter adds X-Klar headers; the account's Sieve files on them. Stalwart's own filter keeps scoring and its verdict is recorded, never acted on.](docs/klar-stalwart.png)
+![Stalwart hands the message to klar-milterd at DATA; the engine classifies it on your box; the milter adds X-Klar headers; the account's Sieve files on them. Stalwart's own filter keeps scoring and its verdict is recorded, never acted on. The milter keeps no message, only metadata in its event store.](docs/klar-stalwart.png)
+
+Klar decides. In shadow mode, Stalwart's own verdict is written into every
+message and never acted on.
 
 ## Why the built-in filter has to stop deciding
 
@@ -15,8 +18,9 @@ outcome as a per-recipient flag that decides Junk filing at delivery
 (`crates/smtp/src/inbound/data.rs`: filter, flag, `run_milters`, in that
 order, at `:531`/`:566`/`:602` in 0.16.18 and `:525`/`:559`/`:595` in
 0.16.22; `crates/email/src/message/ingest.rs:357` files on the flag in both).
-A header the milter adds cannot clear that flag, so two filters would run and
-the built-in one would win every disagreement. Turning it off is the whole
+A header the milter adds cannot clear that flag, so with both deciding, a
+message the built-in filter flagged and Klar read as regular would still go to
+Junk. Turning it off is the whole
 point, not a side effect. (Since 0.16.22 a user Sieve `fileinto` also clears
 the flag, `crates/email/src/sieve/ingest.rs`; the shipped `klar.sieve` files spam
 and marketing and lets regular mail fall through to the implicit keep, so it
@@ -106,11 +110,12 @@ deployment. Two settings differ from a Postfix install and both matter:
   (`inet:8891@0.0.0.0`); the Dockerfile does this.
 
 Sizing: about 700 MB of RSS with the model loaded, one classification at a
-time. Speed is the CPU's: on a 2-vCPU VPS (AMD EPYC 7281, shared with the
-mail server and a website) the median is 6 s per message and the 90th
-percentile 12 s, measured over a day of real mail; a desktop CPU is several times faster
-and Apple Silicon classifies in tens of milliseconds. Stalwart waits 60 s for
-the milter (`timeoutData`) and delivers unclassified past that, never defers.
+time. Speed is the CPU's (the release carries llama.cpp's CPU backends only,
+no GPU backend): on a 2-vCPU VPS (AMD EPYC 7281, shared with the mail server
+and a website) the median is 6 s per message and the 90th percentile 12 s,
+measured over a day of real mail. For scale, the same model on an Apple M1
+Pro's CPU with Metal off took about 200 ms a message (8,200 messages, the
+2026-09-13 release evaluation). Stalwart waits 60 s for the milter (`timeoutData`) and delivers unclassified past that, never defers.
 `postfix/README.md` has the detail; the milter is the same daemon Postfix
 users run.
 

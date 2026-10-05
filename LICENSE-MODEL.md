@@ -14,11 +14,16 @@ by `fetch_model.sh` from Klar's download bucket) is distributed under
 model, [`icosha/spam-xlmr-v1`](https://huggingface.co/icosha/spam-xlmr-v1)
 (XLM-RoBERTa-large), carries the same terms.
 
-- **Non-commercial use is free**, with attribution to Klar: use it for personal
-  self-hosting, research, and evaluation under the CC-BY-NC-4.0 terms.
-- **Commercial use** (production filtering as a business, hosting a paid service,
-  or any use primarily for commercial advantage) requires a separate paid
-  licence. **Contact hello@klar.im** for commercial terms.
+- **Non-commercial use is free**, with attribution to Klar, under the
+  CC-BY-NC-4.0 terms. For us that covers a personal or family home server, a
+  hobby project, and academic research.
+- **Commercial use** requires a separate paid licence: filtering mail for a
+  company (its own staff included, a trial on real staff mail included),
+  hosting a paid service, or any use primarily for commercial advantage.
+  **Contact hello@klar.im** for commercial terms; a company trial is easy to
+  agree in writing.
+- **When in doubt, ask us at hello@klar.im before you deploy.** We answer in
+  plain words, and a yes from us in writing is a permission you can keep.
 - The commercial relationship is also where any opt-in contribution arrangement
   (sharing anonymised correction signal to improve the shared model) is agreed;
   it is never automatic and never part of the free tier.

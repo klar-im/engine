@@ -280,12 +280,15 @@ all funnel through one classify mutex around a single llama.cpp context (the
 context is not thread-safe), so scoring is effectively one-at-a-time per
 daemon. This is by design, not a Postfix limitation: the milter protocol is
 synchronous (Postfix waits for the verdict at end-of-data), and the serial
-point is ours, not Postfix's. Measured wall-clock per message: ~0.6s on an
-Apple-silicon core, ~4s on a shared 2-vCPU cloud instance. Plan capacity as
+point is ours, not Postfix's. Measured wall-clock per message with the
+current model (gen3-v6), CPU only as the release ships: a median of 6 s
+(12 s at the 90th percentile) on a shared 2-vCPU VPS over a day of real mail,
+and about 200 ms on an Apple M1 Pro's CPU with Metal off (8,200 messages,
+2026-09-13 release evaluation). Plan capacity as
 messages/hour ≈ 3600 / seconds-per-message, per daemon. There is no async
 single-context path, because the bottleneck is model inference, not I/O. The
 planned way to use more cores is a pool of llama.cpp contexts over one shared
-model (the model is ~400 MB read-only and shared; each extra context is only
+model (the model is ~315 MB read-only and shared; each extra context is only
 ~10 MB of KV/compute buffers), which beats running multiple daemons that each
 reload the model (TASK-295). Until that lands, scale by running multiple
 daemons behind separate sockets and splitting traffic.
@@ -309,7 +312,7 @@ Guidance:
 - Rate-limit upstream of the milter (postscreen, `smtpd_client_*_rate_limit`,
   or your edge MTA's limits) so a spam blast queues at the SMTP layer, not
   inside the milter.
-- The engine memory-maps the encoder (~400 MB for q4_k_m); leave that much
+- The engine memory-maps the encoder (304 MB for the released q8_0); leave that much
   page-cache headroom or classification latency degrades sharply.
 
 ## Monitoring

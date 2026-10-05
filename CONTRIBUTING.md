@@ -21,7 +21,7 @@ Consequences:
   exist and are deliberately closed. A change that needs them is a
   conversation first: open an issue.
 - Tests you cannot run here (the Postfix E2E needs Docker; the Stalwart E2E
-  needs docker compose and ~400 MB of model) run in CI on your PR.
+  needs docker compose and ~315 MB of model) run in CI on your PR.
 
 ## What a good change looks like
 

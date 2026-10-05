@@ -234,7 +234,7 @@ jobs:
   # image built from this tree with no weights, the model fetched into its
   # volume on first start, upstream's Stalwart image beside it, both modes
   # (shadow and final) driven over SMTP and read back over JMAP. Needs docker
-  # compose, which ubuntu-latest has, and ~400 MB from Klar's public bucket.
+  # compose, which ubuntu-latest has, and ~315 MB from Klar's public bucket.
   # Built through buildx with the Actions layer cache shared with the amd64
   # half of `image` (scope amd64), so the release rebuild is cache hits.
   stalwart-e2e:

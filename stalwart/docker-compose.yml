@@ -8,7 +8,7 @@
 # admin password is set here for a test stack; a real deployment sets its own
 # and publishes its real ports. klar-milterd is built from this tree
 # (postfix/docker/Dockerfile) and fetches the model into its volume on first
-# start, which is the only slow step (~400 MB, once).
+# start, which is the only slow step (~315 MB, once).
 #
 # The two containers talk over the compose network: Stalwart's MtaMilter object
 # points at klar-milterd:8891 (stalwart/scripts/apply.py --milter-host

@@ -86,7 +86,7 @@ EOF
 chmod +x "$CLI_WRAP"
 cli() { "$CLI_WRAP" "$@"; }
 
-say "starting the stack (first run fetches the model, ~400 MB)"
+say "starting the stack (first run fetches the model, ~315 MB)"
 # KLAR_MILTERD_IMAGE set = an image built elsewhere (CI, with a layer cache);
 # otherwise compose builds it from this tree.
 BUILD_FLAG="--build"
