@@ -12,3 +12,6 @@ engine/model/ftrl_baseline.bin
 # Secrets
 .secrets/
 *_token
+
+# An AI harness's per-repo state (session counters, caches)
+.claude/
