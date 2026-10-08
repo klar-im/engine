@@ -1,9 +1,8 @@
 #include "spam_engine_training_c_api.h"
 
-#include <exception>
-#include <string>
-#include <system_error>
 #include <iterator>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -58,13 +57,7 @@ spam_engine_status_t spam_engine_train_rfc822(
     const char* sender_email,
     int correct_label,
     float* out_loss) {
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
-
-  try {
-    std::scoped_lock const lock(handle->mutex);
-
+  return guarded(handle, "spam_engine_train_rfc822", [&] {
     if (const auto validation_status = validate_rfc822_training_input_locked(
             handle, raw_email, raw_email_len, correct_label);
         validation_status != SPAM_ENGINE_STATUS_OK) {
@@ -81,16 +74,7 @@ spam_engine_status_t spam_engine_train_rfc822(
       *out_loss = loss;
     }
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle,
-        SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-        "Unknown runtime error in spam_engine_train_rfc822");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_add_training_sample(
@@ -100,13 +84,7 @@ spam_engine_status_t spam_engine_add_training_sample(
     const char* sender_name,
     const char* sender_email,
     int correct_label) {
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
-
-  try {
-    std::scoped_lock const lock(handle->mutex);
-
+  return guarded(handle, "spam_engine_add_training_sample", [&] {
     if (const auto validation_status = validate_rfc822_training_input_locked(
             handle, raw_email, raw_email_len, correct_label);
         validation_status != SPAM_ENGINE_STATUS_OK) {
@@ -122,15 +100,7 @@ spam_engine_status_t spam_engine_add_training_sample(
             correct_label,
         });
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-        "Unknown runtime error in spam_engine_add_training_sample");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_train_incremental_mode(
@@ -146,8 +116,7 @@ spam_engine_status_t spam_engine_train_incremental_mode(
     return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
   }
 
-  try {
-    std::scoped_lock const lock(handle->mutex);
+  return guarded(handle, "spam_engine_train_incremental", [&] {
     clear_error_locked(handle);
 
     if (out_avg_loss != nullptr) {
@@ -197,7 +166,13 @@ spam_engine_status_t spam_engine_train_incremental_mode(
       if (out_avg_loss != nullptr && processed > 0) {
         *out_avg_loss = loss_sum / static_cast<float>(processed);
       }
-      throw;  // outer handler sets last_error + RUNTIME_ERROR
+      // guarded() sets last_error + RUNTIME_ERROR under the lock; a std
+      // exception keeps the prefix it always had.
+      try {
+        throw;
+      } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("train_incremental failed: ") + e.what());
+      }
     }
 
     if (out_trained_count != nullptr) {
@@ -207,18 +182,7 @@ spam_engine_status_t spam_engine_train_incremental_mode(
       *out_avg_loss = loss_sum / static_cast<float>(processed);
     }
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(
-        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-        std::string("train_incremental failed: ") + e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle,
-        SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-        "Unknown runtime error in spam_engine_train_incremental");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_train_incremental(
@@ -236,12 +200,7 @@ spam_engine_status_t spam_engine_head_drift(
     spam_engine_handle_t* handle,
     float* out_saturation,
     float* out_relative_drift) {
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
-
-  try {
-    std::scoped_lock const lock(handle->mutex);
+  return guarded(handle, "spam_engine_head_drift", [&] {
     clear_error_locked(handle);
 
     if (out_saturation != nullptr) {
@@ -251,59 +210,32 @@ spam_engine_status_t spam_engine_head_drift(
       *out_relative_drift = handle->engine.head_relative_drift();
     }
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-        "Unknown runtime error in spam_engine_head_drift");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_head_optimizer_steps(
     spam_engine_handle_t* handle,
     size_t* out_steps) {
-  if (handle == nullptr || out_steps == nullptr) {
+  if (out_steps == nullptr) {
     return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
   }
-  try {
-    std::scoped_lock const lock(handle->mutex);
+  return guarded(handle, "spam_engine_head_optimizer_steps", [&] {
     clear_error_locked(handle);
     *out_steps = static_cast<size_t>(handle->engine.head_optimizer_steps());
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-        "Unknown runtime error in spam_engine_head_optimizer_steps");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_save(
     spam_engine_handle_t* handle,
     const char* model_path) {
-  if (handle == nullptr) {
-    return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
-  }
-
-  try {
-    std::scoped_lock const lock(handle->mutex);
+  return guarded(handle, "spam_engine_save", [&] {
     clear_error_locked(handle);
 
     const std::string path = (model_path != nullptr) ? model_path : "";
     handle->engine.save(path);
     return SPAM_ENGINE_STATUS_OK;
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
-  } catch (const std::exception& e) {
-    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
-  } catch (...) {
-    return set_error_locked(
-        handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, "Unknown runtime error in spam_engine_save");
-  }
+  });
 }
 
 spam_engine_status_t spam_engine_save_model(

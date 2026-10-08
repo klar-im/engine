@@ -10,8 +10,10 @@
 
 #include <sqlite3.h>
 
+#include <chrono>
 #include <cstdio>
 #include <string>
+#include <thread>
 
 namespace {
 int g_fail = 0, g_checks = 0;
@@ -135,12 +137,17 @@ int main() {
     check(store.record(sample_event("new-event-1", "connect_ip_drop!", "structural")),
           "a post-migration write succeeds against an upgraded legacy db");
   }
-  check(int_query(legacy, "PRAGMA user_version;") == 2, "legacy db is migrated to version 2");
+  check(int_query(legacy, "PRAGMA user_version;") == 3, "legacy db is migrated to version 3");
   check(int_query(legacy,
         "SELECT COUNT(*) FROM pragma_table_info('events') WHERE name='score_gibberish';") == 0,
         "v2 drops the gibberish score: the engine's scores are three classes (TASK-540)");
   check(int_query(legacy, "SELECT COUNT(*) FROM events;") == 2,
         "the pre-existing row survived the migration");
+  check(int_query(legacy,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='events' "
+        "AND name IN ('idx_events_ts','idx_events_action','idx_events_status',"
+        "'idx_events_policy_reason','idx_events_event_id');") == 5,
+        "v2's table rebuild recreates every index, the unique event_id one included");
   check(text_query(legacy,
         "SELECT fired_offsets FROM events WHERE event_id='old-event-1';").empty(),
         "a historical row reads as empty, not NULL");
@@ -154,7 +161,7 @@ int main() {
     check(store.open(legacy), "an already-migrated db re-opens");
     check(store.record(sample_event("new-event-2", "", "ml")), "and still accepts writes");
   }
-  check(int_query(legacy, "PRAGMA user_version;") == 2, "version is unchanged on re-open");
+  check(int_query(legacy, "PRAGMA user_version;") == 3, "version is unchanged on re-open");
 
   // 2a. Same for the v2 step: the column already dropped, the version still 1.
   const std::string half_v2 = "/tmp/klar_event_store_half_v2.sqlite3";
@@ -178,7 +185,8 @@ int main() {
             "and the store works afterwards");
     }
   }
-  check(int_query(half_v2, "PRAGMA user_version;") == 2, "the half-applied v2 db heals to 2");
+  check(int_query(half_v2, "PRAGMA user_version;") == 3,
+        "the half-applied v2 db heals to the current version");
 
   // 2b. A crash between the ALTER and the version bump must not wedge startup.
   //     Simulate it: apply the ALTER by hand, leave user_version at 0, and require
@@ -204,6 +212,28 @@ int main() {
     }
   }
 
+  // 2c. A second process holding the write lock while this one migrates (two
+  //     milter instances, the stress rig) makes the open wait, not fail: the
+  //     store would otherwise run with no event store until the next restart.
+  const std::string contended = "/tmp/klar_event_store_contended.sqlite3";
+  write_legacy_db(contended);
+  {
+    sqlite3* other = nullptr;
+    sqlite3_open(contended.c_str(), &other);
+    sqlite3_exec(other, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
+    std::thread release([other] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      sqlite3_exec(other, "COMMIT;", nullptr, nullptr, nullptr);
+    });
+    klar::EventStore store;
+    const bool opened = store.open(contended);
+    release.join();
+    sqlite3_close(other);
+    check(opened, "a migration that meets another writer's lock waits for it");
+  }
+  check(int_query(contended, "PRAGMA user_version;") == 3,
+        "and the contended db reaches the current version");
+
   // 3. A fresh database must land on the SAME schema by the SAME path, so the two
   //    cannot drift.
   std::remove(fresh.c_str());
@@ -213,7 +243,22 @@ int main() {
     check(store.record(sample_event("fresh-1", "sender_auth!", "structural")),
           "fresh db accepts a write");
   }
-  check(int_query(fresh, "PRAGMA user_version;") == 2, "fresh db is at the current version");
+  check(int_query(fresh, "PRAGMA user_version;") == 3, "fresh db is at the current version");
+  {
+    klar::EventStore store;
+    check(store.open(fresh), "fresh db re-opens");
+    auto ev = sample_event("fresh-from", "", "ml");
+    ev.from_email = "news@shop.example";
+    check(store.record(ev), "a decision with a From address is recorded");
+  }
+  check(text_query(fresh, "SELECT from_email FROM events WHERE event_id='fresh-from';") ==
+        "news@shop.example", "v3 records the From address a correction is keyed by (TASK-547)");
+  check(int_query(fresh,
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_feedback_reporter';") == 1,
+        "v3 indexes feedback by reporter");
+  check(int_query(legacy,
+        "SELECT COUNT(*) FROM events WHERE event_id='old-event-1' AND from_email='';") == 1,
+        "a historical row reads an empty From, not NULL");
   check(text_query(fresh, "SELECT fired_offsets FROM events WHERE event_id='fresh-1';") ==
         "sender_auth!", "fresh db records the offset");
 

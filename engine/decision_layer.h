@@ -1,7 +1,7 @@
 #pragma once
 
 // Structural decision layer — the C++ source of truth for the soft-offset fold
-// + filtering-profile threshold that turns the 4-class model scores into a
+// + filtering-profile threshold that turns the three-class model scores into a
 // final spam/ham verdict.
 //
 // WHY THIS EXISTS (TASK-179): the fold + thresholds historically lived ONLY in
@@ -134,6 +134,15 @@ inline constexpr double kOriginIpDropHeader = 0.30;  // spam-ward: a DROP-listed
                                   // sibling of kOriginIpDrop: same evidence, worse
                                   // provenance, so it corroborates and can never
                                   // solo-condemn. See the block below.
+inline constexpr double kCorrectedSenderSpam = 0.50;  // spam-ward: the recipient
+                                  // moved this exact From address into Junk
+                                  // more often than out (TASK-547). Bounded: it
+                                  // junks what the model already puts at or
+                                  // above 0.49 and never a sender the model
+                                  // clearly likes, and it never authorizes a
+                                  // bounce. Unmeasured (tatiana's correction
+                                  // stream holds no spam correction), so the
+                                  // milter leaves it off by default.
 inline constexpr double kAttachmentDisguisedExecutableExperimental = 0.99;
                                   // spam-ward: executable/script bytes presented
                                   // as a harmless file, direct or one archive
@@ -612,10 +621,11 @@ inline Verdict fold(const Scores& scores,
       return true;
     }
     // These two priors are cheap and spoofable: an attacker can forge thread
-    // headers or a From address that happens to be in local sender history.
-    // The bypass-resistant thread_history lookup and authenticated KB-brand
-    // rescue have stronger preconditions and intentionally retain their own
-    // policies.
+    // headers or a From address that happens to be in local sender history
+    // (a sender the recipient rescued from Junk is read as sender history too,
+    // TASK-547). The bypass-resistant thread_history lookup and authenticated
+    // KB-brand rescue have stronger preconditions and intentionally retain
+    // their own policies.
     return o.classifier_id != "thread_headers" &&
            o.classifier_id != "sender_history";
   };

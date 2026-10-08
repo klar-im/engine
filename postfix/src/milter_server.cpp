@@ -317,11 +317,31 @@ static sfsistat xxfi_eom(SMFICTX* ctx) {
     // The policy in force for these recipients, resolved once: the engine
     // folds at its profile and evaluate_policy thresholds the label at it.
     const EffectivePolicy eff = resolve_policy(*cfg, session->rcpt_to);
+    // The From address, lowercased: recorded on the decision so a later Junk
+    // move names a sender, and the key a recipient's corrections are read by.
+    const std::string from_email =
+        to_lower(truncate_header_value(session->from_header_email, 320));
+    // Corrections are one mailbox's, and one verdict is stamped for every
+    // recipient, so only a single-recipient message reads them. The key is the
+    // RCPT TO address as the MTA handed it over, and the memory was written
+    // under the mailbox login (Dovecot's USER, the JMAP account), so the two
+    // meet only where the login is the delivery address.
+    // ponytail: a multi-recipient message gets no memory (per-recipient verdicts
+    // would need the MTA to split the message), and neither does an alias
+    // (sales@ -> alice@), a plus-tagged recipient, or a login that is not an
+    // address; resolving those needs the MTA's alias map, which a milter does
+    // not see. Zeros, never a wrong mailbox's memory.
+    CorrectionMemory corrections;
+#ifdef KLAR_CORRECTION_MEMORY
+    if (cfg->correction_memory && session->rcpt_to.size() == 1) {
+        corrections = lookup_corrections(cfg->event_store_path, session->rcpt_to.front(), from_email);
+    }
+#endif
     ClassifyResult cr = g_runtime->classify_rfc822(
         session->raw_rfc822,
         session->from_header_name,
         session->mail_from,
-        connect_ip_blocked, header_ip_blocked, eff.engine_profile);
+        connect_ip_blocked, header_ip_blocked, eff.engine_profile, corrections);
 
     // Evaluate policy
     PolicyResult pr = evaluate_policy(
@@ -356,6 +376,7 @@ static sfsistat xxfi_eom(SMFICTX* ctx) {
     ev.message_id_header = truncate_header_value(session->message_id_header, 1024);
     ev.policy_reason  = pr.policy_reason;
     ev.fired_offsets  = cr.fired_offsets;
+    ev.from_email     = from_email;
 
     // Record & log
     g_store->record(ev);

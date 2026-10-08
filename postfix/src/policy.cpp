@@ -7,13 +7,6 @@ namespace klar {
 
 namespace {
 
-std::string to_lower(const std::string& s) {
-    std::string out = s;
-    std::transform(out.begin(), out.end(), out.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return out;
-}
-
 std::string extract_domain(const std::string& email) {
     auto pos = email.find('@');
     if (pos == std::string::npos) return {};

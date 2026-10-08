@@ -7,9 +7,9 @@ process, or read anything a message should not give access to, we want to
 hear about it before anyone else does.
 
 Write to **security@klar.im**. Say what you found, how to reproduce it, and
-which version (`klar-milterd --version`, or the image tag). You will get an
-acknowledgement within three working days and a fix or a reasoned answer
-within thirty. We credit reporters in the release notes unless you ask us
+which version (`klar-milterd --version`, or the image tag). Klar is built by
+one person, so these are goals, not guarantees: an acknowledgement within
+three working days, and a fix or a reasoned answer within thirty. We credit reporters in the release notes unless you ask us
 not to.
 
 Please do not open a public issue for a vulnerability. Everything else (a
@@ -24,8 +24,9 @@ false positive, a build failure, a question) is a normal issue on the tracker.
   classifier accuracy: a spam that gets through is a report for the issue
   tracker, a way to make every spam get through is a report for this address).
 
-Out of scope: klar.im itself, the Apple apps, and any server you run this on
-(report those to their operators).
+Out of scope: any server you run this on (report that to its operator).
+klar.im and the Apple apps take the same address; their policy is
+https://klar.im/security.
 
 ## Two things to know before deploying
 

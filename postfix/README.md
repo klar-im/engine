@@ -37,7 +37,7 @@ Inbound SMTP filter for Postfix that classifies RFC822 messages using the Klar s
 5. `X-Klar-Label`, `X-Klar-Class`, `X-Klar-Score-*`, `X-Klar-Event-ID` headers added
 6. Postfix delivers via LMTP to Dovecot
 7. Dovecot Sieve files spam to Junk (`X-Klar-Label`) and marketing to
-   Marketing (`X-Klar-Class`, 4-class argmax; spam label wins)
+   Marketing (`X-Klar-Class`, 3-class argmax; spam label wins)
 8. User moves message to/from Junk → imapsieve records feedback
 
 ### Two Modes

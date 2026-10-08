@@ -34,6 +34,11 @@ bool EventStore::open(const std::string& path) {
         return false;
     }
 
+    // Wait for another writer (a second milter instance, the stress rig)
+    // instead of failing the open on SQLITE_BUSY, which would leave this
+    // process with no event store until it restarts.
+    sqlite3_busy_timeout(db_, 5000);
+
     // Enable WAL mode for better concurrent read performance.
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
 
@@ -48,9 +53,12 @@ bool EventStore::open(const std::string& path) {
 
 // Schema version of the CURRENT code. Bump it and add a case to apply_migrations
 // whenever the events/feedback tables change.
-static constexpr int kSchemaVersion = 2;
+static constexpr int kSchemaVersion = 3;
 
 bool EventStore::ensure_schema() {
+    // No score_gibberish here, though v2 drops it: a fresh database then skips
+    // v2's DROP COLUMN, which SQLite before 3.35 (Debian 11, YunoHost 11)
+    // refuses, and which would leave a fresh install with no event store.
     const char* ddl = R"SQL(
 CREATE TABLE IF NOT EXISTS events (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +72,6 @@ CREATE TABLE IF NOT EXISTS events (
     score_spam       REAL    NOT NULL,
     score_regular    REAL    NOT NULL,
     score_marketing  REAL    NOT NULL,
-    score_gibberish  REAL    NOT NULL,
     label            TEXT    NOT NULL,
     action           TEXT    NOT NULL,
     latency_ms       REAL    NOT NULL,
@@ -91,6 +98,11 @@ CREATE TABLE IF NOT EXISTS feedback (
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_event_id ON feedback(event_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_ts       ON feedback(ts);
+-- One mailbox's corrections read back (TASK-547). NOCASE, because the lookup
+-- compares `reporter = ? COLLATE NOCASE` (Dovecot hands the login as typed)
+-- and SQLite uses an index only under the comparison's own collation: a
+-- BINARY index here is a full scan of feedback on every message.
+CREATE INDEX IF NOT EXISTS idx_feedback_reporter ON feedback(reporter COLLATE NOCASE);
 )SQL";
 
     char* err_msg = nullptr;
@@ -110,22 +122,27 @@ CREATE INDEX IF NOT EXISTS idx_feedback_ts       ON feedback(ts);
 // there. Hence the version ladder — and hence the DDL above deliberately does NOT
 // carry the new columns, so a fresh database and an upgraded one reach an
 // IDENTICAL schema by the same path instead of two paths that can drift.
-// True if `table` already has `column`. Used to make a step idempotent, so a
-// database left half-migrated by an older build (or any interrupted run) heals on
-// the next open instead of failing forever on "duplicate column name".
-static bool column_exists(sqlite3* db, const char* table, const char* column) {
+// 1 if `table` already has `column`, 0 if not, -1 if SQLite could not say. Used
+// to make a step idempotent, so a database left half-migrated by an older build
+// (or any interrupted run) heals on the next open instead of failing forever on
+// "duplicate column name". An error is not an answer: v2 reads "absent" as
+// "already dropped", so reading an error as absent would bump the version over
+// a column still there, and every later INSERT would fail on its NOT NULL.
+static int column_exists(sqlite3* db, const char* table, const char* column) {
     const std::string sql = std::string("PRAGMA table_info(") + table + ");";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
-    bool found = false;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return -1;
+    int found = 0;
+    int rc = SQLITE_ROW;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const unsigned char* name = sqlite3_column_text(stmt, 1);  // 1 = column name
         if (name != nullptr && std::strcmp(reinterpret_cast<const char*>(name), column) == 0) {
-            found = true;
+            found = 1;
             break;
         }
     }
     sqlite3_finalize(stmt);
+    if (found == 0 && rc != SQLITE_DONE) return -1;
     return found;
 }
 
@@ -148,9 +165,55 @@ bool EventStore::apply_migrations() {
         "ALTER TABLE events ADD COLUMN fired_offsets TEXT NOT NULL DEFAULT '';",
         // v2: the engine's scores are three classes (TASK-540). The gibberish
         // score was 0 on every row a three-class model wrote, which is every
-        // row since gen3-v6 reached the box on the store's first days.
-        "ALTER TABLE events DROP COLUMN score_gibberish;",
+        // row since gen3-v6 reached the box on the store's first days. A table
+        // rebuild, not DROP COLUMN: SQLite before 3.35 (Debian 11, YunoHost 11)
+        // refuses DROP COLUMN, and the milter links the system libsqlite3.
+        R"SQL(
+CREATE TABLE events_v2 (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts               TEXT    NOT NULL,
+    queue_id         TEXT    NOT NULL,
+    mail_from        TEXT    NOT NULL,
+    rcpt_count       INTEGER NOT NULL,
+    bytes_seen       INTEGER NOT NULL,
+    truncated        INTEGER NOT NULL,
+    model_version    TEXT    NOT NULL,
+    score_spam       REAL    NOT NULL,
+    score_regular    REAL    NOT NULL,
+    score_marketing  REAL    NOT NULL,
+    label            TEXT    NOT NULL,
+    action           TEXT    NOT NULL,
+    latency_ms       REAL    NOT NULL,
+    status           TEXT    NOT NULL,
+    error_code       TEXT    NOT NULL,
+    message_id_header TEXT   NOT NULL,
+    event_id         TEXT    NOT NULL,
+    policy_reason    TEXT    NOT NULL,
+    fired_offsets    TEXT    NOT NULL DEFAULT ''
+);
+INSERT INTO events_v2 SELECT
+    id, ts, queue_id, mail_from, rcpt_count, bytes_seen, truncated, model_version,
+    score_spam, score_regular, score_marketing, label, action, latency_ms, status,
+    error_code, message_id_header, event_id, policy_reason, fired_offsets
+FROM events;
+DROP TABLE events;
+ALTER TABLE events_v2 RENAME TO events;
+CREATE INDEX idx_events_ts            ON events(ts);
+CREATE INDEX idx_events_action        ON events(action);
+CREATE INDEX idx_events_status        ON events(status);
+CREATE INDEX idx_events_policy_reason ON events(policy_reason);
+CREATE UNIQUE INDEX idx_events_event_id ON events(event_id);
+)SQL",
+        // v3: the From address, so a feedback row (which names its decision by
+        // event_id) says which sender the user corrected (TASK-547). The
+        // reporter index is in the DDL above with the other indexes: IF NOT
+        // EXISTS on every open, so it needs no version.
+        "ALTER TABLE events ADD COLUMN from_email TEXT NOT NULL DEFAULT '';",
     };
+    // The column each step adds (applied when present) or drops (applied when
+    // absent), read for the idempotency check below.
+    const char* step_column[] = {"fired_offsets", "score_gibberish", "from_email"};
+    const bool step_adds[] = {true, false, true};
 
     // Two guards, because a schema migration gets exactly one chance to be wrong.
     // (1) Each step runs in a transaction WITH its version bump: SQLite's DDL is
@@ -160,12 +223,20 @@ bool EventStore::apply_migrations() {
     //     -- by an older build, or any interrupted run -- heals on the next open
     //     instead of failing on "duplicate column name" forever. Without (2) a
     //     single badly-timed kill would be a permanently dead daemon.
+    // (3) The idempotency check runs inside the write transaction, so a second
+    //     process opening the same file cannot migrate between check and step
+    //     (open()'s busy timeout makes it wait for the first).
     for (int v = version; v < kSchemaVersion; ++v) {
-        const bool already_applied =
-            (v == 0 && column_exists(db_, "events", "fired_offsets")) ||
-            (v == 1 && !column_exists(db_, "events", "score_gibberish"));
-        const std::string step = std::string("BEGIN IMMEDIATE;") +
-                                 (already_applied ? "" : migrations[v]) +
+        if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+            return false;
+        }
+        const int present = column_exists(db_, "events", step_column[v]);
+        if (present < 0) {  // never guessed: the open fails and is retried
+            sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+            return false;
+        }
+        const bool already_applied = step_adds[v] ? present == 1 : present == 0;
+        const std::string step = std::string(already_applied ? "" : migrations[v]) +
                                  "PRAGMA user_version = " + std::to_string(v + 1) +
                                  ";COMMIT;";
         char* err_msg = nullptr;
@@ -187,12 +258,12 @@ INSERT INTO events (
     ts, queue_id, mail_from, rcpt_count, bytes_seen, truncated,
     model_version, score_spam, score_regular, score_marketing,
     label, action, latency_ms, status, error_code,
-    message_id_header, event_id, policy_reason, fired_offsets
+    message_id_header, event_id, policy_reason, fired_offsets, from_email
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6,
     ?7, ?8, ?9, ?10,
     ?11, ?12, ?13, ?14, ?15,
-    ?16, ?17, ?18, ?19
+    ?16, ?17, ?18, ?19, ?20
 );
 )SQL";
 
@@ -219,6 +290,7 @@ INSERT INTO events (
     sqlite3_bind_text(stmt, 17, event.event_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 18, event.policy_reason.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 19, event.fired_offsets.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 20, event.from_email.c_str(), -1, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);

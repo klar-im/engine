@@ -41,6 +41,22 @@ struct ClassifyResult {
     std::string error;
 };
 
+// A recipient's own Junk corrections for this message's sender (TASK-547): the
+// net count (+1 per move out of Junk, -1 per move into it) for the exact From
+// address and for its domain. Handed to the engine as two caller-state fields.
+struct CorrectionMemory {
+    int sender = 0;
+    int domain = 0;
+};
+
+// Reads that memory from the event store: (its path, recipient address, From
+// address). Defined in correction_memory.cpp, which ships closed; the milter
+// calls it only when cmake/closed.cmake defines KLAR_CORRECTION_MEMORY, so a
+// build without the file looks nothing up and hands the engine zeros.
+CorrectionMemory lookup_corrections(const std::string& event_store_path,
+                                    const std::string& recipient,
+                                    const std::string& from_email);
+
 class ModelRuntime {
 public:
     ModelRuntime();
@@ -64,7 +80,8 @@ public:
                                    const std::string& sender_email,
                                    bool connect_ip_blocked,
                                    bool header_ip_blocked,
-                                   spam_engine_profile_t profile);
+                                   spam_engine_profile_t profile,
+                                   CorrectionMemory corrections = {});
     std::string loaded_model_version() const;
     uint64_t generation() const;
     bool is_loaded() const;

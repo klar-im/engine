@@ -30,14 +30,18 @@ struct DecisionEvent {
     // message with a near-zero content score is explainable after the fact
     // instead of reading as an inexplicable "ml" decision.
     std::string fired_offsets;
+    // The From header's address, lowercased (TASK-547). A feedback row names
+    // its decision by event_id, so this is what turns a user's Junk move into
+    // a correction about a sender.
+    std::string from_email;
 };
 
 struct FeedbackEvent {
     std::string ts;
     std::string event_id;    // references DecisionEvent.event_id
     std::string verdict;     // "spam" or "ham"
-    std::string source;      // "sieve", "cli", "api"
-    std::string reporter;    // IMAP username or empty
+    std::string source;      // "sieve", "cli", "api", "jmap"
+    std::string reporter;    // the mailbox that moved it (IMAP/JMAP login) or empty
 };
 
 class EventStore {

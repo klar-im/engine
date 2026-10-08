@@ -55,20 +55,27 @@ inline void clear_error_locked(spam_engine_handle_t* handle) {
 // is past validation, and returns its status. `where` names the entry point in
 // the message for a non-std exception.
 //
-// A std::system_error reports no message on purpose: the likeliest one is the
-// lock itself failing, which means the handle may be invalid and must not be
-// touched. A body that can throw one for another reason (load's filesystem
-// errors) catches it itself and reports it while the lock is still held.
+// The lock is declared outside the try so every handler still holds it when it
+// writes last_error: with the lock inside the try, unwinding released it first
+// and a concurrent call on the same handle (the Mail extension shares one)
+// raced the std::string write. A std::system_error reports no message only
+// when the lock itself failed (owns_lock() false), since the handle may then be
+// invalid; one the body threw (an encoder thread, a filesystem error) keeps
+// its message like any other exception.
 template <class F>
 spam_engine_status_t guarded(spam_engine_handle_t* handle, const char* where, const F& body) {
   if (handle == nullptr) {
     return SPAM_ENGINE_STATUS_INVALID_ARGUMENT;
   }
+  std::unique_lock lock(handle->mutex, std::defer_lock);
   try {
-    std::scoped_lock const lock(handle->mutex);
+    lock.lock();
     return body();
-  } catch (const std::system_error&) {
-    return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
+  } catch (const std::system_error& e) {
+    if (!lock.owns_lock()) {
+      return SPAM_ENGINE_STATUS_RUNTIME_ERROR;
+    }
+    return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
   } catch (const std::exception& e) {
     return set_error_locked(handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR, e.what());
   } catch (...) {

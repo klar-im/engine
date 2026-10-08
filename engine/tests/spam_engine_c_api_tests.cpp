@@ -3710,6 +3710,77 @@ void test_reply_to_our_own_mail_vetoes_impersonation() {
       "a vetoed impersonation claim carries no condemn authority");
 }
 
+// TASK-547: a recipient's own Junk corrections, net per exact From address and
+// per domain, folded as bounded offsets. Every row is model-free.
+void test_correction_memory_is_bounded() {
+  struct Ctx { float spam; int sender; int domain; int dmarc; int sends; int impersonation; };
+  auto const decide = [](Ctx c) {
+    spam_engine_decision_input_t in{};
+    in.scores = {0.0F, 1.0F - c.spam, c.spam};
+    in.ml_label = c.spam > 0.5F ? "spam" : "regular";  // neural_decision's rule here
+    in.ml_confidence = c.spam > 0.5F ? c.spam : 1.0 - c.spam;
+    in.corrected_sender = c.sender;
+    in.corrected_domain = c.domain;
+    in.dmarc_pass = c.dmarc;
+    in.exact_send_count = c.sends;
+    in.display_impersonation = c.impersonation;
+    in.profile = SPAM_ENGINE_PROFILE_STANDARD;
+    spam_engine_decision_result_t out{};
+    spam_engine_decide(&in, &out);
+    return out;
+  };
+  auto const label = [&](Ctx c) { return std::string(decide(c).label); };
+  auto const fired = [&](Ctx c) { return std::string(decide(c).fired_offsets); };
+
+  // Zero memory is the open build and the default: nothing new fires.
+  test_support::check(label({0.995F, 0, 0, 1, 0, 0}) == "spam" &&
+                          fired({0.995F, 0, 0, 1, 0, 0}).find("corrected") == std::string::npos,
+      "no memory, no correction offset");
+
+  // A rescue earns the repeat tier on an authenticated message, and only
+  // there, under the sender_history id: a corrected sender IS sender history.
+  test_support::check(label({0.995F, 1, 0, 1, 0, 0}) == "ham" &&
+                          fired({0.995F, 1, 0, 1, 0, 0}) == "sender_history!",
+      "a sender taken out of Junk, authenticated, is rescued as sender_history");
+  test_support::check(label({0.995F, 1, 0, 0, 0, 0}) == "spam",
+      "without dmarc=pass the From is assertable: no rescue");
+  // Never past the tier: outbound history at the repeat tier leaves nothing to add.
+  test_support::check(fired({0.995F, 1, 0, 1, 2, 0}) == "sender_history!" &&
+                          std::abs(decide({0.995F, 1, 0, 1, 2, 0}).adjusted_spam_side -
+                                   decide({0.995F, 0, 0, 1, 2, 0}).adjusted_spam_side) < 1e-9,
+      "a corrected sender does not stack on sender_history past the repeat tier");
+  // Never a hard allow: a near-certain spam from a rescued sender still meets the model.
+  test_support::check(label({0.9995F, 3, 0, 1, 0, 0}) == "spam",
+      "the rescue is ceiling-gated like sender_history");
+
+  // A verified rescued sender vetoes the display-impersonation flag, like a
+  // sender written to twice; unauthenticated it does not.
+  test_support::check(label({0.45F, 1, 0, 1, 0, 1}) != "spam",
+      "a rescued, authenticated sender vetoes display_impersonation");
+  test_support::check(label({0.45F, 1, 0, 0, 0, 1}) == "spam",
+      "an unauthenticated rescued From does not veto");
+
+  // A junk is a bounded spam-ward push with no bounce authority.
+  test_support::check(label({0.50F, -1, 0, 0, 0, 0}) == "spam" &&
+                          fired({0.50F, -1, 0, 0, 0, 0}) == "corrected_sender!",
+      "a junked sender the model doubts goes to Junk");
+  test_support::check(decide({0.50F, -1, 0, 0, 0, 0}).condemn_offset_fired == 0,
+      "a correction never authorizes a bounce");
+  test_support::check(label({0.10F, -5, 0, 1, 0, 0}) != "spam",
+      "a junked sender the model clearly likes is not junked by memory alone");
+
+  // Domain memory: the weak tier, only when the exact address has none, never spam-ward.
+  test_support::check(fired({0.995F, 0, 1, 1, 0, 0}) == "sender_history!" &&
+                          std::abs(decide({0.995F, 0, 1, 1, 0, 0}).adjusted_spam_side - 0.945) < 1e-6,
+      "a rescued domain earns the domain tier");
+  test_support::check(fired({0.995F, 0, 1, 0, 0, 0}).empty(),
+      "an unauthenticated domain earns nothing");
+  test_support::check(fired({0.50F, 0, -3, 0, 0, 0}).empty(),
+      "a junked domain does nothing");
+  test_support::check(fired({0.995F, -1, 2, 1, 0, 0}) == "corrected_sender",
+      "exact memory decides; domain memory is not added on top");
+}
+
 // TASK-232 AC#4: the claimed-vs-authenticated KB mismatch is the primary path for KNOWN
 // brands; the bare Tranco string-condemn is demoted to a cold-start crutch scoped to brands
 // the KB cannot adjudicate. Pin the split so neither half silently regresses.
@@ -4784,10 +4855,17 @@ void test_abi_sizes_are_self_reported() {
   // own field lists, so the three sides cross-check rather than restate.
   // (Went 15 -> 16 on 2026-09-24 with caller_state_replied_to_own_sent, and
   // this assertion is what noticed. Stayed 16 in TASK-540: decision_input left
-  // the ABI and caller_state_header_ip_blocked joined it.)
-  test_support::check(sizes.field_count == 16, "field_count is every uint32_t after itself");
-  test_support::check(sizeof(spam_engine_abi_sizes_t) == 17 * sizeof(uint32_t),
-                      "the struct is field_count plus sixteen fields");
+  // the ABI and caller_state_header_ip_blocked joined it. 16 -> 18 in
+  // TASK-547 with the two correction-memory offsets.)
+  test_support::check(sizes.field_count == 18, "field_count is every uint32_t after itself");
+  test_support::check(sizeof(spam_engine_abi_sizes_t) == 19 * sizeof(uint32_t),
+                      "the struct is field_count plus eighteen fields");
+  test_support::check(
+      sizes.caller_state_corrected_sender ==
+              offsetof(spam_engine_caller_state_t, corrected_sender) &&
+          sizes.caller_state_corrected_domain ==
+              offsetof(spam_engine_caller_state_t, corrected_domain),
+      "appended correction-memory offsets are reported");
   test_support::check(sizes.runtime_info == sizeof(spam_engine_runtime_info_t),
         "runtime_info size is reported correctly");
   test_support::check(
@@ -5352,11 +5430,34 @@ void test_decision_ml_label_matches_engine_decision() {
         "the decision label, not the argmax, sets train_ml on a spam-ward condemn (C5)");
 }
 
+// guarded() holds the handle's lock through its catch arms, so a
+// std::system_error thrown by a body (the encoder's threads, a filesystem
+// error) is reported with its message; before, the lock lived inside the try,
+// was released by unwinding, and the arm returned an empty last_error to avoid
+// touching the handle unlocked (/code-review of #989).
+void test_guarded_reports_body_system_error() {
+  spam_engine_handle_t* handle = spam_engine_create();
+  test_support::check(handle != nullptr, "spam_engine_create should return a handle");
+  const spam_engine_status_t status = guarded(handle, "test_body", [&]() -> spam_engine_status_t {
+    clear_error_locked(handle);
+    throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                            "encoder thread");
+  });
+  const char* err = spam_engine_get_last_error(handle);
+  test_support::check(status == SPAM_ENGINE_STATUS_RUNTIME_ERROR,
+                      "a body system_error should be a runtime error");
+  test_support::check(err != nullptr && std::string(err).find("encoder thread") != std::string::npos,
+                      "a body system_error should keep its message in last_error");
+  spam_engine_destroy(handle);
+}
+
 }  // namespace
 
 int main() {
   int failures = 0;
   failures += test_support::run_test("create and destroy", test_create_and_destroy);
+  failures += test_support::run_test("guarded() reports a body system_error",
+                                     test_guarded_reports_body_system_error);
   failures += test_support::run_test("load/classify/unload flow", test_load_classify_unload_flow);
   failures += test_support::run_test(
       "mode required + ensemble + classify_full (TASK-219)",
@@ -5526,6 +5627,9 @@ int main() {
   failures += test_support::run_test(
       "impersonation: a verified reply to our own mail vetoes the condemn",
       test_reply_to_our_own_mail_vetoes_impersonation);
+  failures += test_support::run_test(
+      "correction memory folds as bounded offsets (TASK-547)",
+      test_correction_memory_is_bounded);
   failures += test_support::run_test(
       "impersonation: Tier-2 From combosquat, typosquat excluded (TASK-232 AC#7)",
       test_tier2_from_combosquat);

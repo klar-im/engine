@@ -86,7 +86,8 @@ ClassifyResult ModelRuntime::classify_rfc822(const std::string& raw_email,
                                               const std::string& sender_email,
                                               bool connect_ip_blocked,
                                               bool header_ip_blocked,
-                                              spam_engine_profile_t profile) {
+                                              spam_engine_profile_t profile,
+                                              CorrectionMemory corrections) {
     std::lock_guard<std::mutex> lock(mutex_);
     ClassifyResult cr;
 
@@ -109,6 +110,8 @@ ClassifyResult ModelRuntime::classify_rfc822(const std::string& raw_email,
     caller.profile = profile;
     caller.connect_ip_blocked = connect_ip_blocked ? 1 : 0;
     caller.header_ip_blocked = header_ip_blocked ? 1 : 0;
+    caller.corrected_sender = corrections.sender;
+    caller.corrected_domain = corrections.domain;
     spam_engine_full_result_t full{};
     spam_engine_status_t st = spam_engine_classify_full(
         handle_,

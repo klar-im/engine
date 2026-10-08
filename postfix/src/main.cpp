@@ -180,6 +180,16 @@ int main(int argc, char* argv[]) {
         log_msg(cfg->log_json, "info",
                 "event store opened at " + cfg->event_store_path);
     }
+    // Said at startup, because the switch is otherwise invisible: a build
+    // without the closed lookup classifies with zeros whatever the TOML says.
+    if (cfg->correction_memory) {
+#ifdef KLAR_CORRECTION_MEMORY
+        log_msg(cfg->log_json, "info", "correction memory: on (TASK-547)");
+#else
+        log_msg(cfg->log_json, "warn",
+                "correction_memory = true, but this build has no correction lookup: ignored");
+#endif
+    }
 
     // --- Set global state for milter callbacks ---
     klar::ServerState state;

@@ -128,5 +128,24 @@ int main() {
     }
   }
 
+  // TASK-547: correction_memory is a config key like every other milter
+  // switch, off by default (log #69: the spam-ward half is unmeasured).
+  {
+    const std::string path = "/tmp/klar_config_tests_correction_memory.toml";
+    if (std::FILE* f = std::fopen(path.c_str(), "w")) {
+      std::fputs("correction_memory = true\n", f);
+      std::fclose(f);
+    }
+    const bool off_by_default = !Config{}.correction_memory;
+    const bool read_from_toml = klar::load_config(path).correction_memory;
+    std::remove(path.c_str());
+    if (off_by_default && read_from_toml) {
+      std::printf("[PASS] correction_memory: off by default, on from the TOML\n");
+    } else {
+      std::printf("[FAIL] correction_memory: default=%d toml=%d\n", !off_by_default, read_from_toml);
+      ++g_failures;
+    }
+  }
+
   return g_failures == 0 ? 0 : 1;
 }

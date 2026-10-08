@@ -484,6 +484,8 @@ typedef struct spam_engine_abi_sizes {
   uint32_t runtime_info;  // appended (TASK-505 L); counted in field_count
   uint32_t caller_state_replied_to_own_sent;  // appended 2026-09-24
   uint32_t caller_state_header_ip_blocked;    // appended (TASK-540)
+  uint32_t caller_state_corrected_sender;     // appended (TASK-547)
+  uint32_t caller_state_corrected_domain;     // appended (TASK-547)
 } spam_engine_abi_sizes_t;
 
 // Fills *out with sizeof() for each ABI struct, as this build sees them.
@@ -590,6 +592,20 @@ typedef struct spam_engine_caller_state {
                            // TASK-387). Its own field with a weaker offset, so
                            // header evidence can never be laundered into
                            // connect_ip_blocked's condemn. APPENDED (TASK-540).
+  int corrected_sender;    // the recipient's own Junk corrections for the
+                           // exact From address, net: +1 per move out of Junk,
+                           // -1 per move into it (TASK-547). Positive earns the
+                           // sender-history repeat tier on an authenticated
+                           // message (dmarc_pass), never past it, and vetoes the
+                           // display-impersonation flag like a sender written to
+                           // twice; negative is a bounded spam-ward push that
+                           // can never authorize a bounce. 0 when unknown.
+                           // APPENDED.
+  int corrected_domain;    // the same net count for the From domain; positive
+                           // earns the domain tier on an authenticated message
+                           // when the exact address has no memory. A caller
+                           // leaves it 0 for a shared mail host, where one
+                           // address says nothing about another. APPENDED.
 } spam_engine_caller_state_t;
 
 typedef struct spam_engine_full_result {

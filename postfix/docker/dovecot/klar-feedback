@@ -29,22 +29,24 @@ done
 # Drain remaining stdin
 cat > /dev/null
 
-# If no event ID, this is not a klar-processed message
-if [ -z "$EVENT_ID" ]; then
-    exit 0
-fi
+# If no event ID, this is not a klar-processed message. The header is carried
+# by the message, so anything but a UUID is refused before it reaches SQL.
+case "$EVENT_ID" in
+    ''|*[!0-9a-fA-F-]*) exit 0 ;;
+esac
 
-# Create feedback table if it doesn't exist and insert record
+# The mailbox that moved it: Pigeonhole runs pipe programs with USER set to the
+# login. A correction is that mailbox's memory (TASK-547), so the login must be
+# the address mail arrives for; anything outside a plain address is dropped.
+REPORTER="${USER:-}"
+case "$REPORTER" in
+    *[!A-Za-z0-9@._+-]*) REPORTER="" ;;
+esac
+
+# The table is the milter's (src/event_store.cpp owns the DDL): a message
+# with an event id was classified, so the store and the table exist.
 TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 sqlite3 "$EVENT_STORE" <<SQL
-CREATE TABLE IF NOT EXISTS feedback (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts        TEXT NOT NULL,
-    event_id  TEXT NOT NULL,
-    verdict   TEXT NOT NULL,
-    source    TEXT NOT NULL,
-    reporter  TEXT NOT NULL
-);
 INSERT INTO feedback (ts, event_id, verdict, source, reporter)
-VALUES ('$TS', '$EVENT_ID', '$VERDICT', 'sieve', '');
+VALUES ('$TS', '$EVENT_ID', '$VERDICT', 'sieve', '$REPORTER');
 SQL

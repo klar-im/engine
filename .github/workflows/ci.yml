@@ -230,6 +230,62 @@ jobs:
         if: failure()
         run: sudo journalctl -u klar-milterd -n 100 --no-pager
 
+  # The upgrade an operator actually runs: the latest published release, put on
+  # with the one-liner exactly as the README says, then this tree's tarball over
+  # it. Asserts the new VERSION is the one running, the operator's config edit
+  # survived and the service is ready. install-smoke above covers a fresh box;
+  # this covers the box that already has Klar (re-running the command is the
+  # documented upgrade). The model comes from the same cache as install-smoke's,
+  # so the released download itself is exercised by release-smoke, on a tag.
+  upgrade-smoke:
+    needs: package
+    timeout-minutes: 20
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-x86_64
+          path: dist
+
+      - name: Restore the released model
+        uses: actions/cache/restore@v5
+        with:
+          path: engine/model
+          key: engine-model-${{ hashFiles('postfix/model/released-manifest.json') }}
+      - name: Seed /var/lib/klar/model from the cache
+        run: |
+          if [ -f engine/model/MANIFEST.json ]; then
+            sudo mkdir -p /var/lib/klar/model && sudo cp -a engine/model/. /var/lib/klar/model/
+          fi
+
+      - name: The latest release, with the one-liner
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh" \
+            | sudo KLAR_ACCEPT_MODEL_LICENSE=1 sh
+          test "$(curl -fsS http://127.0.0.1:8892/readyz)" = ok
+          cat /opt/klar/share/VERSION | tee /tmp/old-version
+          echo '# operator edit' | sudo tee -a /etc/klar/klar-milterd.toml >/dev/null
+          sha256sum /etc/klar/klar-milterd.toml | tee /tmp/old-config
+
+      - name: This tree over it
+        run: |
+          tarball="$(ls dist/klar-milterd-*.tar.gz)"
+          sudo KLAR_ACCEPT_MODEL_LICENSE=1 KLAR_TARBALL="$PWD/$tarball" sh install.sh
+          test "$(curl -fsS http://127.0.0.1:8892/readyz)" = ok
+          new="$(tar -xzOf "$tarball" --wildcards '*share/VERSION')"
+          echo "upgraded $(cat /tmp/old-version) -> $(cat /opt/klar/share/VERSION)"
+          test "$(cat /opt/klar/share/VERSION)" = "$new"
+          # On main at the tag commit the tree IS the latest release: that run
+          # proves the re-run, not an upgrade, and says so rather than failing.
+          [ "$(cat /tmp/old-version)" != "$new" ] || echo "::notice::same version as the latest release, so this run exercised a re-run, not an upgrade"
+          sha256sum -c /tmp/old-config
+
+      - name: Service log
+        if: failure()
+        run: sudo journalctl -u klar-milterd -n 100 --no-pager
+
   # Stalwart + klar-milterd, end to end (stalwart/scripts/test_e2e.sh): the
   # image built from this tree with no weights, the model fetched into its
   # volume on first start, upstream's Stalwart image beside it, both modes

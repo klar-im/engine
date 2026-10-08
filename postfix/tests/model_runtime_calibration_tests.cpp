@@ -137,8 +137,16 @@ int main() {
         "the observed connecting-IP hit reaches the fold, and only that one");
   check(g_caller.phase2_match == 0 && g_caller.exact_send_count == 0 &&
             g_caller.domain_send_count == 0 && g_caller.replied_to_own_sent == 0 &&
-            g_caller.attachment_risk_enabled == 0,
+            g_caller.attachment_risk_enabled == 0 && g_caller.corrected_sender == 0 &&
+            g_caller.corrected_domain == 0,
         "the milter claims no local history it does not have");
+
+  // A recipient's correction memory reaches the fold as the two appended
+  // caller-state fields, each in its own slot (TASK-547).
+  runtime.classify_rfc822("Subject: c\r\n\r\nbody", "S", "s@example.test", false, false,
+                          SPAM_ENGINE_PROFILE_STANDARD, klar::CorrectionMemory{2, -1});
+  check(g_caller.corrected_sender == 2 && g_caller.corrected_domain == -1,
+        "correction memory reaches caller_state unswapped");
   check(std::abs(result.spam - 0.80f) < 1e-6f,
         "spam reports the ensemble spam side, not the pre-blend neural score");
   check(std::abs(result.regular - 0.20f) < 1e-6f &&

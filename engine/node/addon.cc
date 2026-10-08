@@ -309,10 +309,12 @@ class ClassifyWorker : public Napi::AsyncWorker {
     Napi::Env env = Env();
     // The spam slot is the ensemble spam side the fold started from (== the
     // neural score unless warm FTRL escalated); the others are raw neural.
+    // regular, marketing, spam: the order postfix/src/policy.cpp and
+    // spamd/src/policy.cpp use, so a tie names the same class everywhere.
     const spam_engine_scores_t& neural = full_.neural_scores;
     const struct { const char* name; float score; } classes[] = {
-        {"marketing", neural.marketing},
         {"regular", neural.regular},
+        {"marketing", neural.marketing},
         {"spam", full_.ensemble_spam},
     };
     Napi::Object scores = Napi::Object::New(env);

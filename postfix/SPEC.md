@@ -280,7 +280,8 @@ Validation:
 
 ## 7. Event store
 
-SQLite with two tables:
+SQLite with two tables (schema version 3, `PRAGMA user_version`; the DDL and
+the migrations are in `src/event_store.cpp`):
 
 ```sql
 CREATE TABLE IF NOT EXISTS events (
@@ -293,16 +294,24 @@ CREATE TABLE IF NOT EXISTS events (
   label TEXT NOT NULL, action TEXT NOT NULL,
   latency_ms REAL NOT NULL, status TEXT NOT NULL,
   error_code TEXT NOT NULL, message_id_header TEXT NOT NULL,
-  event_id TEXT NOT NULL, policy_reason TEXT NOT NULL
+  event_id TEXT NOT NULL, policy_reason TEXT NOT NULL,
+  fired_offsets TEXT NOT NULL DEFAULT '',   -- the decision layer's ids, "!" on the decisive one
+  from_email TEXT NOT NULL DEFAULT ''       -- the From header's address, lowercased (v3)
 );
 
 CREATE TABLE IF NOT EXISTS feedback (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts TEXT NOT NULL, event_id TEXT NOT NULL,
-  verdict TEXT NOT NULL, source TEXT NOT NULL,
-  reporter TEXT NOT NULL
+  ts TEXT NOT NULL, event_id TEXT NOT NULL,   -- events.event_id
+  verdict TEXT NOT NULL,                      -- "spam" or "ham"
+  source TEXT NOT NULL,                       -- "sieve" (Dovecot imapsieve), "jmap" (Stalwart poller), "cli", "api"
+  reporter TEXT NOT NULL                      -- the mailbox that moved it (its IMAP or JMAP login), or ''
 );
+CREATE INDEX IF NOT EXISTS idx_feedback_reporter ON feedback(reporter COLLATE NOCASE);
 ```
+
+A feedback row joined to its event by `event_id` says which sender one
+mailbox corrected; that join, per recipient, is what `correction_memory`
+reads back.
 
 JSON log line emitted to stdout for every decision.
 
@@ -360,9 +369,9 @@ if header :is "X-Klar-Label" "spam" {
 ```
 
 The spam label takes precedence: a message the milter labels `spam` is always
-filed to Junk even if its 4-class argmax was `marketing`. Non-spam mail whose
+filed to Junk even if its 3-class argmax was `marketing`. Non-spam mail whose
 dominant class is `marketing` is filed to a Marketing folder; everything else
-(regular, gibberish) is left in INBOX. The Marketing mailbox must exist and be
+(regular) is left in INBOX. The Marketing mailbox must exist and be
 auto-subscribed (`mailbox Marketing { auto = subscribe }` in the namespace).
 
 ### 10.3 Feedback via imapsieve

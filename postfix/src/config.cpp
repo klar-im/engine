@@ -21,12 +21,6 @@ static std::string trim(const std::string& s) {
     return s.substr(start, end - start + 1);
 }
 
-static std::string to_lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return s;
-}
-
 // ---------------------------------------------------------------------------
 // Minimal TOML value types
 // ---------------------------------------------------------------------------
@@ -331,6 +325,7 @@ static void apply_root(const TomlTable& root, Config& cfg) {
     set_string(root, "blocklist_action", cfg.blocklist_action);
 
     set_string(root, "event_store_path", cfg.event_store_path);
+    set_bool(root, "correction_memory", cfg.correction_memory);
 }
 
 static DomainPolicy parse_domain_policy(const TomlTable& t) {

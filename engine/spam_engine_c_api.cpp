@@ -169,17 +169,10 @@ spam_engine_status_t spam_engine_load_ggml(
     config.gguf_model_path = (gguf_model_path != nullptr) ? gguf_model_path : "";
     config.learning_rate = learning_rate;
     config.ftrl_path = (ftrl_path != nullptr) ? ftrl_path : "";
-    try {
-      handle->engine.load(config);
-    } catch (const std::system_error& e) {
-      // Thrown from inside load (e.g. std::filesystem_error when a ggml backend
-      // plugin dir is unreadable under the Mail-extension sandbox) while we still
-      // hold the lock, so reporting it is safe. Without this the status reaches
-      // Swift as an empty last_error -> "Unknown error", hiding the real cause.
-      return set_error_locked(
-          handle, SPAM_ENGINE_STATUS_RUNTIME_ERROR,
-          std::string("system error during model load: ") + e.what());
-    }
+    // A std::system_error from inside load (a std::filesystem_error when a ggml
+    // backend plugin dir is unreadable under the Mail-extension sandbox) keeps
+    // its message: guarded() reports it under the lock.
+    handle->engine.load(config);
     handle->pending_training_samples.clear();
     return SPAM_ENGINE_STATUS_OK;
   });
@@ -949,6 +942,10 @@ void spam_engine_get_abi_sizes(spam_engine_abi_sizes_t* out) {
       static_cast<uint32_t>(offsetof(spam_engine_caller_state_t, replied_to_own_sent));
   out->caller_state_header_ip_blocked =
       static_cast<uint32_t>(offsetof(spam_engine_caller_state_t, header_ip_blocked));
+  out->caller_state_corrected_sender =
+      static_cast<uint32_t>(offsetof(spam_engine_caller_state_t, corrected_sender));
+  out->caller_state_corrected_domain =
+      static_cast<uint32_t>(offsetof(spam_engine_caller_state_t, corrected_domain));
 }
 
 int spam_engine_decide(const spam_engine_decision_input_t* in,
@@ -975,10 +972,30 @@ int spam_engine_decide(const spam_engine_decision_input_t* in,
   if (in->phase2_match != 0) {
     offsets.push_back({"thread_history", dl::kPhase2Match, dl::Direction::Ham});
   }
+  // The recipient's own Junk corrections (TASK-547), net per exact address and
+  // per domain, read as sender history the way Klar Plus reads them
+  // (senderHistoryMagnitude: a corrected sender is a sender written to twice,
+  // a corrected domain one written to once; log #54): on an authenticated
+  // message a rescued address is the repeat tier and a rescued domain the
+  // domain tier when the exact address has no memory, never past either, and
+  // the one sender_history id carries it, ceiling-gated in fold() like any
+  // sender history, so a rescued sender that turns hostile still meets the
+  // model. A junk is a bounded spam-ward push: it carries a message the model
+  // already doubts over the gate, cannot junk one the model clearly likes, and
+  // is not on the authoritative list, so it never authorizes a bounce. A
+  // domain junk does nothing: one newsletter junked at an ESP's domain says
+  // nothing about the rest of it.
+  const bool corrected_rescue = in->dmarc_pass != 0 && in->corrected_sender > 0;
+  const int exact_history = std::max(in->exact_send_count, corrected_rescue ? 2 : 0);
+  const int domain_history = std::max(
+      in->domain_send_count,
+      (in->dmarc_pass != 0 && in->corrected_sender == 0 && in->corrected_domain > 0) ? 1 : 0);
   offsets.push_back({"sender_history",
-                     dl::sender_history_magnitude(in->exact_send_count,
-                                                  in->domain_send_count),
+                     dl::sender_history_magnitude(exact_history, domain_history),
                      dl::Direction::Ham});
+  offsets.push_back({"corrected_sender",
+                     in->corrected_sender < 0 ? dl::kCorrectedSenderSpam : 0.0,
+                     dl::Direction::Spam});
   const std::string signer =
       in->dkim_signing_org_domain != nullptr ? in->dkim_signing_org_domain : "";
   offsets.push_back({"sender_auth",
@@ -1020,8 +1037,12 @@ int spam_engine_decide(const spam_engine_decision_input_t* in,
   // WE classified as ham, and an attacker manufactures that by sending one
   // benign message and replying to their own thread, which would hand them a
   // switch for the strongest condemn the engine has. Caught by Codex on #888.
+  //
+  // exact_history, not exact_send_count: a sender the recipient took out of
+  // Junk counts as written to twice (above), and the user's own verdict on a
+  // receiver-verified address is no weaker than having written to it.
   const bool replied_to_our_own_mail =
-      in->dmarc_pass != 0 && (in->replied_to_own_sent != 0 || in->exact_send_count >= 2);
+      in->dmarc_pass != 0 && (in->replied_to_own_sent != 0 || exact_history >= 2);
   offsets.push_back({"display_impersonation",
                      (in->display_impersonation != 0 && !replied_to_our_own_mail)
                          ? dl::kDisplayImpersonation : 0.0,
@@ -1311,6 +1332,8 @@ spam_engine_status_t spam_engine_classify_full(
       din.connect_ip_blocked = caller_state->connect_ip_blocked;
       din.header_ip_blocked = caller_state->header_ip_blocked;
       din.attachment_risk_enabled = caller_state->attachment_risk_enabled;
+      din.corrected_sender = caller_state->corrected_sender;
+      din.corrected_domain = caller_state->corrected_domain;
     }
     spam_engine_decide(&din, &out->decision);
     return SPAM_ENGINE_STATUS_OK;

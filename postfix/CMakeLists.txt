@@ -142,7 +142,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tests/event_store_tests.cpp")
     )
     target_include_directories(event_store_tests PRIVATE src ${SQLITE3_INCLUDE_DIRS})
     target_link_directories(event_store_tests PRIVATE ${SQLITE3_LIBRARY_DIRS})
-    target_link_libraries(event_store_tests PRIVATE ${SQLITE3_LIBRARIES})
+    target_link_libraries(event_store_tests PRIVATE ${SQLITE3_LIBRARIES} Threads::Threads)
     add_test(NAME event_store_tests COMMAND event_store_tests)
 endif()
 
@@ -201,4 +201,13 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tests/model_runtime_calibration_tests.cpp")
     target_link_libraries(model_runtime_calibration_tests PRIVATE nlohmann_json::nlohmann_json)
     add_test(NAME model_runtime_calibration_tests
              COMMAND model_runtime_calibration_tests)
+endif()
+
+# Sources that ship only with the closed distribution, as in engine/: absent
+# from the public mirror by design, and nothing above depends on them. A
+# checkout carrying the closed publish lists without this file is a monorepo
+# checkout missing it, which fails here rather than building a smaller milter.
+include("${CMAKE_SOURCE_DIR}/cmake/closed.cmake" OPTIONAL RESULT_VARIABLE KLAR_CLOSED_INCLUDED)
+if(EXISTS "${ENGINE_DIR}/publish/closed.txt" AND NOT KLAR_CLOSED_INCLUDED)
+    message(FATAL_ERROR "postfix/cmake/closed.cmake is missing from a closed checkout")
 endif()

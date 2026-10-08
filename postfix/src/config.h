@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -88,6 +90,10 @@ struct Config {
 
     // Storage
     std::string event_store_path = "/var/lib/klar/events.sqlite3";
+    // Hand the engine a mailbox's Junk corrections (TASK-547). Off by default,
+    // and a no-op (main.cpp warns) unless the build carries the closed lookup
+    // (lookup_corrections in model_runtime.h, cmake/closed.cmake).
+    bool correction_memory = false;
 
     // Per-domain overrides
     std::vector<DomainPolicy> domain_policies;
@@ -108,5 +114,14 @@ std::string validate_config(const Config& cfg);
 // so validation and binding can never disagree on what an address means.
 bool split_host_port(const std::string& addr, std::string& host,
                      std::string& port);
+
+// ASCII lowercase. Inline here, the one header the config parser, the policy
+// and the milter all include, because policy_tests links policy.cpp alone and
+// config_tests config.cpp alone.
+inline std::string to_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
 
 } // namespace klar
